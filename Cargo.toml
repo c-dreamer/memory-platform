@@ -1,0 +1,94 @@
+[package]
+name = "memory-platform"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "Apache-2.0"
+description = "Memory platform — Rust rewrite of the Python memory-manager"
+
+[[bin]]
+name = "memory-platform"
+path = "src/main.rs"
+
+[[bin]]
+name = "mcp-server"
+path = "src/bin/mcp-server.rs"
+
+[lib]
+name = "memory_platform"
+path = "src/lib.rs"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tracing", "matched-path", "original-uri"] }
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate", "derive", "macros"] }
+redis = { version = "0.32", default-features = false, features = ["tokio-comp", "aio", "connection-manager"] }
+neo4rs = { version = "0.9.0-rc.10", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "request-id"] }
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+futures = "0.3"
+md-5 = "0.10"
+sha2 = "0.10"
+regex = "1"
+walkdir = "2"
+pulldown-cmark = { version = "0.13", optional = true }
+fastembed = { version = "5", optional = true }
+once_cell = "1"
+async-trait = "0.1"
+lru = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+mockito = { version = "1.4", default-features = false }
+
+[features]
+default = ["neo4j", "markdown"]
+neo4j = ["dep:neo4rs"]
+fastembed = ["dep:fastembed"]
+markdown = ["dep:pulldown-cmark"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+debug = "line-tables-only"
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+codegen-units = 256
+split-debuginfo = "unpacked"
+
+# Relaxed lint rules for scaffolding phase — will be tightened in later todos
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+non_ascii_idents = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Allow todo!/unimplemented! for scaffolding stubs
+todo = "allow"
+unimplemented = "allow"
+# Allow unwrap/expect in scaffolding (will deny in later phases)
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+# Stylistic relaxations
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
