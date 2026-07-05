@@ -1,0 +1,337 @@
+//! Embedding service — local model (fastembed) or NVIDIA NIM API.
+//!
+//! Provides async embedding generation with:
+//! - Local ONNX model (all-MiniLM-L6-v2, 384-dim)
+//! - NVIDIA NIM API fallback
+//! - LRU cache (1000 entries)
+
+use crate::models::embedding::Embedding;
+use anyhow::{Context, Result};
+#[cfg(feature = "fastembed")]
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use lru::LruCache;
+use reqwest::Client;
+use std::fmt;
+use std::future::Future;
+use std::num::NonZeroUsize;
+use std::pin::Pin;
+use std::sync::Arc;
+#[cfg(feature = "fastembed")]
+use std::sync::Mutex as BlockingMutex;
+use tokio::sync::Mutex;
+
+/// Embedding service trait.
+pub trait EmbeddingService: Send + Sync {
+    /// Generate embedding for a single text string.
+    fn embed(&self, text: &str) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>>;
+}
+
+/// Configuration for embedding service.
+#[derive(Debug, Clone)]
+pub struct EmbeddingConfig {
+    /// Embedding model backend: "local" or "nvidia".
+    pub model: String,
+    /// NVIDIA NIM API URL.
+    pub nvidia_api_url: Option<String>,
+    /// NVIDIA API key.
+    pub nvidia_api_key: Option<String>,
+}
+
+#[cfg(feature = "fastembed")]
+/// Local embedding backend using fastembed.
+pub struct LocalEmbedding {
+    model: Arc<BlockingMutex<TextEmbedding>>,
+    cache: Arc<Mutex<LruCache<String, Embedding>>>,
+}
+
+#[cfg(feature = "fastembed")]
+impl fmt::Debug for LocalEmbedding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalEmbedding")
+            .field(
+                "cache_size",
+                &self.cache.try_lock().map(|c| c.len()).unwrap_or(0),
+            )
+            .finish()
+    }
+}
+
+#[cfg(feature = "fastembed")]
+impl LocalEmbedding {
+    /// Create a new local embedding backend.
+    pub async fn new() -> Result<Self> {
+        let cache = Arc::new(Mutex::new(LruCache::new(
+            NonZeroUsize::new(1000).expect("1000 > 0"),
+        )));
+
+        // Initialize model in a blocking task
+        let model = tokio::task::spawn_blocking(|| -> Result<TextEmbedding> {
+            let mut opts = InitOptions::default();
+            opts.model_name = EmbeddingModel::AllMiniLML6V2;
+            opts.show_download_progress = true;
+            TextEmbedding::try_new(opts).context("Failed to initialize fastembed model")
+        })
+        .await
+        .context("Failed to spawn blocking task for model init")??;
+
+        Ok(Self {
+            model: Arc::new(BlockingMutex::new(model)),
+            cache,
+        })
+    }
+}
+
+#[cfg(feature = "fastembed")]
+impl EmbeddingService for LocalEmbedding {
+    fn embed(&self, text: &str) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send>> {
+        let text = text.to_string();
+        let model = Arc::clone(&self.model);
+        let cache = Arc::clone(&self.cache);
+        Box::pin(async move {
+            if text.trim().is_empty() {
+                return Ok(Embedding::new(vec![0.0; 384]));
+            }
+
+            // Check cache first
+            {
+                let mut cache = cache.lock().await;
+                if let Some(cached) = cache.get(&text) {
+                    return Ok(cached.clone());
+                }
+            }
+
+            // Run ONNX inference in spawn_blocking
+            let text_clone = text.clone();
+            let model_inner = Arc::clone(&model);
+            let embedding = tokio::task::spawn_blocking(move || {
+                let mut model_lock = model_inner.lock().unwrap();
+                model_lock
+                    .embed(vec![text_clone], None)
+                    .map(|embs| embs.into_iter().next())
+                    .context("Failed to generate embedding")
+            })
+            .await
+            .context("Failed to spawn blocking task for embedding")??;
+
+            let embedding = Embedding::new(embedding.unwrap_or_else(|| vec![0.0; 384]));
+
+            // Update cache
+            {
+                let mut cache = cache.lock().await;
+                cache.put(text, embedding.clone());
+            }
+
+            Ok(embedding)
+        })
+    }
+}
+
+/// NVIDIA NIM embedding backend (HTTP API).
+#[derive(Debug, Clone)]
+pub struct NvidiaNimEmbedding {
+    client: Client,
+    api_url: String,
+    api_key: String,
+    cache: Arc<Mutex<LruCache<String, Embedding>>>,
+}
+
+impl NvidiaNimEmbedding {
+    /// Create a new NVIDIA NIM embedding backend.
+    pub fn new(api_url: String, api_key: String) -> Self {
+        Self {
+            client: Client::new(),
+            api_url,
+            api_key,
+            cache: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(1000).expect("1000 > 0"),
+            ))),
+        }
+    }
+}
+
+impl EmbeddingService for NvidiaNimEmbedding {
+    fn embed(&self, text: &str) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send>> {
+        let text = text.to_string();
+        let client = self.client.clone();
+        let api_url = self.api_url.clone();
+        let api_key = self.api_key.clone();
+        let cache = Arc::clone(&self.cache);
+        Box::pin(async move {
+            if text.trim().is_empty() {
+                return Ok(Embedding::new(vec![0.0; 384]));
+            }
+
+            // Check cache first
+            {
+                let mut cache = cache.lock().await;
+                if let Some(cached) = cache.get(&text) {
+                    return Ok(cached.clone());
+                }
+            }
+
+            // Call NVIDIA NIM API
+            let resp = client
+                .post(&api_url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&serde_json::json!({
+                    "input": text,
+                    "model": "nv-embed-qa",
+                }))
+                .send()
+                .await
+                .context("Failed to send request to NVIDIA NIM API")?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let error_text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("NVIDIA NIM API error ({}): {}", status, error_text);
+            }
+
+            let data: serde_json::Value = resp
+                .json()
+                .await
+                .context("Failed to parse NVIDIA NIM API response")?;
+
+            let embedding: Vec<f32> = data["data"][0]["embedding"]
+                .as_array()
+                .context("Invalid embedding format in NVIDIA NIM API response")?
+                .iter()
+                .map(|v| v.as_f64().unwrap_or_default() as f32)
+                .collect();
+
+            // Ensure dimension is 384 (truncate/pad if needed)
+            let len = embedding.len();
+            let mut embedding = if len > 384 {
+                embedding.into_iter().take(384).collect()
+            } else if len < 384 {
+                embedding
+                    .into_iter()
+                    .chain(std::iter::repeat(0.0).take(384 - len))
+                    .collect()
+            } else {
+                embedding
+            };
+
+            // Normalize embedding
+            let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                embedding.iter_mut().for_each(|x| *x /= norm);
+            }
+
+            let embedding = Embedding::new(embedding);
+
+            // Update cache
+            {
+                let mut cache = cache.lock().await;
+                cache.put(text, embedding.clone());
+            }
+
+            Ok(embedding)
+        })
+    }
+}
+
+/// Factory for embedding service.
+pub enum EmbeddingServiceFactory {
+    #[cfg(feature = "fastembed")]
+    Local(LocalEmbedding),
+    Nvidia(NvidiaNimEmbedding),
+}
+
+impl fmt::Debug for EmbeddingServiceFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            #[cfg(feature = "fastembed")]
+            Self::Local(_) => f.debug_tuple("Local").finish(),
+            Self::Nvidia(_) => f.debug_tuple("Nvidia").finish(),
+        }
+    }
+}
+
+impl EmbeddingServiceFactory {
+    /// Create an embedding service based on configuration.
+    pub async fn new(config: EmbeddingConfig) -> Result<Self> {
+        match config.model.as_str() {
+            "local" => {
+                #[cfg(feature = "fastembed")]
+                {
+                    Ok(Self::Local(LocalEmbedding::new().await?))
+                }
+                #[cfg(not(feature = "fastembed"))]
+                {
+                    let _ = config;
+                    anyhow::bail!("Local embedding requires 'fastembed' feature")
+                }
+            }
+            "nvidia" => {
+                let api_url = config
+                    .nvidia_api_url
+                    .context("NVIDIA API URL is required for NVIDIA backend")?;
+                let api_key = config
+                    .nvidia_api_key
+                    .context("NVIDIA API key is required for NVIDIA backend")?;
+                Ok(Self::Nvidia(NvidiaNimEmbedding::new(api_url, api_key)))
+            }
+            _ => anyhow::bail!("Unknown embedding model: {}", config.model),
+        }
+    }
+}
+
+impl EmbeddingService for EmbeddingServiceFactory {
+    fn embed(&self, text: &str) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>> {
+        let text = text.to_string();
+        match self {
+            #[cfg(feature = "fastembed")]
+            Self::Local(service) => {
+                let text = text.clone();
+                Box::pin(async move { service.embed(&text).await })
+            }
+            Self::Nvidia(service) => Box::pin(async move { service.embed(&text).await }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[cfg(feature = "fastembed")]
+    async fn test_local_embedding() {
+        let service = LocalEmbedding::new()
+            .await
+            .expect("Failed to create local embedding");
+        let embedding = service.embed("test").await.expect("Failed to embed");
+        assert_eq!(embedding.as_vec().len(), 384);
+        assert!(embedding.as_vec().iter().any(|&x| x != 0.0));
+    }
+
+    #[tokio::test]
+    async fn test_nvidia_embedding() {
+        let mut server = mockito::Server::new();
+        let mock_response = serde_json::json!({
+            "data": [{"embedding": vec![0.1_f64; 384]}]
+        });
+
+        let _m = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(mock_response.to_string())
+            .create();
+
+        let service = NvidiaNimEmbedding::new(server.url(), "fake-api-key".to_string());
+
+        let embedding = service.embed("test").await.expect("Failed to embed");
+        assert_eq!(embedding.as_vec().len(), 384);
+    }
+
+    #[tokio::test]
+    async fn test_empty_text() {
+        let service =
+            NvidiaNimEmbedding::new("http://fake.url".to_string(), "fake-api-key".to_string());
+        let embedding = service.embed("").await.expect("Failed to embed");
+        assert_eq!(embedding.as_vec().len(), 384);
+        assert!(embedding.as_vec().iter().all(|&x| x == 0.0));
+    }
+}
