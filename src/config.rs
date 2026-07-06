@@ -61,6 +61,11 @@ pub struct Config {
     pub decay_half_life_days: f64,
     pub decay_min_score: f64,
     pub decay_apply_to_search: bool,
+    // Coherence-weighted scoring weights (α, β, γ)
+    pub coherence_weight_recency: f64,
+    pub coherence_weight_frequency: f64,
+    pub coherence_weight_semantic: f64,
+    pub coherence_frequency_threshold: f64,
 
     // --- Chunking ---
     pub chunk_size: usize,
@@ -131,6 +136,10 @@ impl Config {
             decay_half_life_days: parse_env("DECAY_HALF_LIFE_DAYS", 90.0)?,
             decay_min_score: parse_env("DECAY_MIN_SCORE", 0.1)?,
             decay_apply_to_search: parse_bool("DECAY_APPLY_TO_SEARCH", true)?,
+            coherence_weight_recency: parse_env("COHERENCE_WEIGHT_RECENCY", 0.3)?,
+            coherence_weight_frequency: parse_env("COHERENCE_WEIGHT_FREQUENCY", 0.2)?,
+            coherence_weight_semantic: parse_env("COHERENCE_WEIGHT_SEMANTIC", 0.5)?,
+            coherence_frequency_threshold: parse_env("COHERENCE_FREQUENCY_THRESHOLD", 5.0)?,
 
             // --- Chunking ---
             chunk_size: parse_env("CHUNK_SIZE", 512)?,
@@ -175,6 +184,10 @@ impl Default for Config {
             decay_half_life_days: 90.0,
             decay_min_score: 0.1,
             decay_apply_to_search: true,
+            coherence_weight_recency: 0.3,
+            coherence_weight_frequency: 0.2,
+            coherence_weight_semantic: 0.5,
+            coherence_frequency_threshold: 5.0,
             chunk_size: 512,
             chunk_overlap: 64,
             max_chunks_per_doc: 100,
@@ -567,6 +580,10 @@ mod tests {
                 ("DECAY_HALF_LIFE_DAYS", "45.0"),
                 ("DECAY_MIN_SCORE", "0.05"),
                 ("DECAY_APPLY_TO_SEARCH", "0"),
+                ("COHERENCE_WEIGHT_RECENCY", "0.4"),
+                ("COHERENCE_WEIGHT_FREQUENCY", "0.1"),
+                ("COHERENCE_WEIGHT_SEMANTIC", "0.5"),
+                ("COHERENCE_FREQUENCY_THRESHOLD", "3.0"),
                 ("CHUNK_SIZE", "256"),
                 ("CHUNK_OVERLAP", "32"),
                 ("MAX_CHUNKS_PER_DOC", "50"),
@@ -600,6 +617,10 @@ mod tests {
                 assert!((cfg.decay_half_life_days - 45.0).abs() < f64::EPSILON);
                 assert!((cfg.decay_min_score - 0.05).abs() < f64::EPSILON);
                 assert!(!cfg.decay_apply_to_search);
+                assert!((cfg.coherence_weight_recency - 0.4).abs() < f64::EPSILON);
+                assert!((cfg.coherence_weight_frequency - 0.1).abs() < f64::EPSILON);
+                assert!((cfg.coherence_weight_semantic - 0.5).abs() < f64::EPSILON);
+                assert!((cfg.coherence_frequency_threshold - 3.0).abs() < f64::EPSILON);
                 assert_eq!(cfg.chunk_size, 256);
                 assert_eq!(cfg.chunk_overlap, 32);
                 assert_eq!(cfg.max_chunks_per_doc, 50);

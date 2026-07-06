@@ -26,6 +26,7 @@ const DECAY_HALF_LIFE_DAYS: f64 = 30.0;
 const DECAY_MIN_SCORE: f64 = 0.1;
 
 /// Service for experience retrieval, recording, and confidence management.
+#[derive(Debug)]
 pub struct ExperienceService {
     pool: PgPool,
     search: Arc<SearchEngine>,

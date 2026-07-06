@@ -74,8 +74,8 @@ impl Migrator {
             let sql = fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read migration file: {}", path.display()))?;
 
-            // Execute the migration
-            sqlx::query(&sql)
+            // Execute the migration (raw_sql supports multi-statement SQL)
+            sqlx::raw_sql(&sql)
                 .execute(pool)
                 .await
                 .with_context(|| format!("Failed to execute migration: {}", version))?;

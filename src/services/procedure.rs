@@ -22,6 +22,7 @@ pub struct ProcedureResult {
 /// Procedure service.
 ///
 /// Detects relevant procedures from context and executes them.
+#[derive(Debug)]
 pub struct ProcedureService {
     db: Arc<PostgresDb>,
 }

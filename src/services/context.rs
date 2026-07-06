@@ -17,6 +17,7 @@ use crate::search::SearchEngine;
 ///
 /// Aggregates related data from multiple tables to build a rich
 /// context for an agent interaction.
+#[derive(Debug)]
 pub struct ContextService {
     db: Arc<PostgresDb>,
     search: Arc<SearchEngine>,

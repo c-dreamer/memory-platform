@@ -2,25 +2,90 @@
 //!
 //! Implements the Model Context Protocol over stdin/stdout.
 
+use std::sync::Arc;
+
+use memory_platform::config::Config;
+use memory_platform::db::postgres::PostgresDb;
 use memory_platform::mcp;
+use memory_platform::migrations::Migrator;
+use memory_platform::search::SearchEngine;
+use memory_platform::services::context::ContextService;
+use memory_platform::services::decay::DecayEngine;
+use memory_platform::services::embedding::{EmbeddingConfig, EmbeddingService, EmbeddingServiceFactory};
+use memory_platform::services::experience::ExperienceService;
+use memory_platform::services::procedure::ProcedureService;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Initialize logging
     tracing_subscriber::fmt()
         .with_target(false)
-        .with_writer(std::io::stderr) // stdout is for MCP protocol
+        .with_writer(std::io::stderr)
         .init();
 
-    tracing::info!("MCP server starting (scaffolding phase)");
+    tracing::info!("MCP server starting");
 
-    // Placeholder: MCP server will process stdin/stdout here
-    let _server = mcp::McpServer::new();
+    // Load config from environment
+    let config = Arc::new(Config::from_env()?);
+    tracing::info!("Loaded config");
 
-    tracing::info!("MCP server ready (no tools implemented yet)");
+    // Connect to PostgreSQL
+    let db = Arc::new(PostgresDb::connect(config.as_ref()).await?);
+    tracing::info!("Connected to PostgreSQL");
 
-    // Keep alive until stdin closes
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("MCP server shutting down.");
+    // Run migrations
+    Migrator::run(&db.pool).await?;
+    tracing::info!("Database migrations completed");
+
+    // Clone pool for services that need PgPool directly
+    let pool = db.pool.clone();
+
+    // Initialize services
+    let search = Arc::new(SearchEngine::new(Arc::clone(&db), Arc::clone(&config)));
+
+    // Embedding service is optional — tools fall back to keyword search if unavailable
+    let embedding_service: Option<Arc<dyn EmbeddingService>> = {
+        let embedding_config = EmbeddingConfig {
+            model: config.embedding_model.clone(),
+            nvidia_api_url: Some(config.nvidia_api_key.clone()),
+            nvidia_api_key: Some(config.nvidia_api_key.clone()),
+        };
+        match EmbeddingServiceFactory::new(embedding_config).await {
+            Ok(svc) => Some(Arc::new(svc)),
+            Err(e) => {
+                tracing::warn!("Embedding service unavailable (keyword-only fallback): {e}");
+                None
+            }
+        }
+    };
+
+    let context_service = Arc::new(ContextService::new(pool.clone(), Arc::clone(&search)));
+    let decay_engine = Arc::new(DecayEngine::new(Arc::clone(&config)));
+    let experience_service = Arc::new(ExperienceService::new(pool.clone(), Arc::clone(&search)));
+    let procedure_service = Arc::new(ProcedureService::new(pool.clone()));
+
+    // Build AppState
+    let state = Arc::new(memory_platform::AppState {
+        config: (*config).clone(),
+        db: Arc::clone(&db),
+        search,
+        neo4j_client: None,
+        redis_cache: None,
+        context_service: Some(context_service),
+        contradiction_detector: None,
+        decay_engine: Some(decay_engine),
+        embedding_service,
+        experience_service: Some(experience_service),
+        ingestion_service: None,
+        procedure_service: Some(procedure_service),
+    });
+
+    // Create MCP server
+    let server = mcp::McpServer::new(state);
+    tracing::info!("MCP server ready");
+
+    // Enter JSON-RPC listen loop
+    server.listen(tokio::io::stdin(), tokio::io::stdout()).await?;
 
     Ok(())
 }

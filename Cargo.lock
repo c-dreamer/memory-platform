@@ -1991,6 +1991,7 @@ dependencies = [
  "dotenvy",
  "fastembed",
  "futures",
+ "hex",
  "lru",
  "md-5",
  "mockito",

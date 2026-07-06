@@ -51,6 +51,7 @@ const NEGATION_PAIRS: &[(&str, &str)] = &[
 ///
 /// Uses vector similarity search to find memories with high cosine similarity,
 /// then checks for opposing signals in their content using negation pairs.
+#[derive(Debug)]
 pub struct ContradictionDetector {
     db: Arc<PostgresDb>,
 }

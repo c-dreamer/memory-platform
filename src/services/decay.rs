@@ -1,23 +1,34 @@
-//! Memory decay engine.
+//! Memory decay engine with coherence-weighted scoring.
 //!
-//! Implements Ebbinghaus-inspired half-life decay computed at query time.
-//! Formula: score = max(min_score, 2^(-days_since / half_life))
-//! apply_decay(rrf_score, days_since) = rrf_score * decay_factor
+//! Implements a weighted formula combining recency (Ebbinghaus), usage
+//! frequency, and semantic coherence (cosine similarity):
+//!
+//! ```text
+//! score = α · recency_score + β · frequency_score + γ · coherence_score
+//!
+//! recency_score   = max(min_score, 2^(-days_since / half_life))
+//! frequency_score = min(access_count / threshold, 1.0)
+//! coherence_score = semantic similarity (passed in from caller)
+//! ```
+//!
+//! Weights α, β, γ and frequency threshold are configurable via `Config`.
 
 use std::sync::Arc;
 
-/// Memory decay engine.
+/// Memory decay engine with coherence-weighted scoring.
 ///
-/// Reads configuration from `Config` and computes decay factors at query time.
-/// If `enabled` is false, decay is always 1.0 (no-op).
+/// Combines recency (Ebbinghaus), frequency, and semantic coherence into
+/// a single relevance score. Uses the existing `Config` for all parameters.
+/// When `enabled` is false, `score()` returns 1.0 (no-op).
 #[derive(Debug, Clone)]
 pub struct DecayEngine {
-    /// Half-life in days for the Ebbinghaus decay formula.
     half_life_days: f64,
-    /// Minimum score allowed after decay.
     min_score: f64,
-    /// Whether decay is enabled.
     enabled: bool,
+    recency_weight: f64,
+    frequency_weight: f64,
+    semantic_weight: f64,
+    frequency_threshold: f64,
 }
 
 impl DecayEngine {
@@ -28,33 +39,78 @@ impl DecayEngine {
             half_life_days: config.decay_half_life_days,
             min_score: config.decay_min_score,
             enabled: config.decay_enabled,
+            recency_weight: config.coherence_weight_recency,
+            frequency_weight: config.coherence_weight_frequency,
+            semantic_weight: config.coherence_weight_semantic,
+            frequency_threshold: config.coherence_frequency_threshold,
         }
     }
 
-    /// Compute the decay factor for a given number of days since access.
+    /// Compute the recency score (Ebbinghaus decay).
     ///
-    /// Formula: 2^(-days_since / half_life_days)
+    /// Formula: `max(min_score, 2^(-days_since / half_life))`
     /// Returns the decay factor, clamped to `min_score`.
     #[must_use]
-    pub fn compute_decay(&self, days_since_access: f64) -> f64 {
+    pub fn compute_recency(&self, days_since_access: f64) -> f64 {
         if !self.enabled {
             return 1.0;
         }
-
-        let decay_factor = 2.0f64.powf(-days_since_access / self.half_life_days);
-        decay_factor.max(self.min_score)
+        let factor = 2.0f64.powf(-days_since_access / self.half_life_days);
+        factor.max(self.min_score)
     }
 
-    /// Apply decay to an RRF score.
+    /// Compute the frequency score.
     ///
-    /// Returns: rrf_score * decay_factor
+    /// Formula: `min(access_count / threshold, 1.0)`
+    /// Normalised access count, capped at 1.0.
+    #[must_use]
+    pub fn compute_frequency(&self, access_count: f64) -> f64 {
+        if !self.enabled {
+            return 1.0;
+        }
+        (access_count / self.frequency_threshold).min(1.0)
+    }
+
+    /// Compute the combined coherence score.
+    ///
+    /// Formula: `α · recency + β · frequency + γ · coherence`
+    ///
+    /// When disabled, always returns 1.0.
+    #[must_use]
+    pub fn score(&self, days_since_access: f64, access_count: f64, coherence: f64) -> f64 {
+        if !self.enabled {
+            return 1.0;
+        }
+        let recency = self.compute_recency(days_since_access);
+        let frequency = self.compute_frequency(access_count);
+        recency * self.recency_weight
+            + frequency * self.frequency_weight
+            + coherence * self.semantic_weight
+    }
+
+    /// Apply the combined coherence score to an existing relevance score.
+    ///
+    /// Returns: `relevance_score * score(days_since, access_count, coherence)`
+    /// When disabled, returns `relevance_score` unchanged.
+    #[must_use]
+    pub fn apply(&self, relevance_score: f64, days_since: f64, access_count: f64, coherence: f64) -> f64 {
+        if !self.enabled {
+            return relevance_score;
+        }
+        relevance_score * self.score(days_since, access_count, coherence)
+    }
+
+    // Legacy API compatibility — kept for callers not yet migrated.
+    /// Compute the legacy decay factor.
+    #[must_use]
+    pub fn compute_decay(&self, days_since_access: f64) -> f64 {
+        self.compute_recency(days_since_access)
+    }
+
+    /// Apply legacy decay to a score.
     #[must_use]
     pub fn apply_decay(&self, rrf_score: f64, days_since: f64) -> f64 {
-        if !self.enabled {
-            return rrf_score;
-        }
-
-        rrf_score * self.compute_decay(days_since)
+        rrf_score * self.compute_recency(days_since)
     }
 }
 

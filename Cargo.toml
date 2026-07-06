@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "mcp-server"
 path = "src/bin/mcp-server.rs"
 
+[[bin]]
+name = "vault-sync"
+path = "src/bin/vault-sync.rs"
+
 [lib]
 name = "memory_platform"
 path = "src/lib.rs"
@@ -34,11 +38,12 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "request-id"] }
 thiserror = "2"
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
 futures = "0.3"
 md-5 = "0.10"
 sha2 = "0.10"
+hex = "0.4"
 regex = "1"
 walkdir = "2"
 pulldown-cmark = { version = "0.13", optional = true }

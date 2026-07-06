@@ -13,6 +13,7 @@
 
 pub mod bm25;
 pub mod rrf;
+pub mod rsf;
 pub mod vector;
 
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use crate::db::postgres::PostgresDb;
 
 use self::bm25::Bm25Search;
 use self::rrf::RrfFusion;
+use self::rsf::RsfFusion;
 use self::vector::VectorSearch;
 
 // ---------------------------------------------------------------------------
@@ -67,6 +69,7 @@ pub struct SearchResult {
 /// `hybrid_search` entry-point that dispatches to vector-only,
 /// keyword-only, or full hybrid (RRF-fused) search depending on the
 /// requested mode.
+#[derive(Debug)]
 pub struct SearchEngine {
     db: Arc<PostgresDb>,
     config: Arc<Config>,
@@ -124,6 +127,32 @@ impl SearchEngine {
         match mode {
             "vector" => VectorSearch::search(&self.db, table, embedding, limit, 0.0).await,
             "keyword" => Bm25Search::search(&self.db, table, query, limit).await,
+            "rsf" => {
+                let fetch_limit = limit * 2;
+
+                let (vec_results, kw_results) = tokio::try_join!(
+                    VectorSearch::search(&self.db, table, embedding, fetch_limit, 0.0),
+                    Bm25Search::search(&self.db, table, query, fetch_limit),
+                )?;
+
+                let mut fused = RsfFusion::fuse(
+                    vec_results,
+                    kw_results,
+                    self.config.rrf_vector_weight,
+                    self.config.rrf_keyword_weight,
+                    0.1,
+                );
+
+                if self.config.decay_enabled
+                    && self.config.decay_apply_to_search
+                    && table == "memories"
+                {
+                    self.apply_decay(&mut fused).await?;
+                }
+
+                fused.truncate(limit as usize);
+                Ok(fused)
+            }
             "hybrid" | _ => {
                 // Fetch more candidates than needed so RRF has a richer pool.
                 let fetch_limit = limit * 2;

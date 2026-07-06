@@ -129,6 +129,7 @@ pub struct ContextPackage {
 ///
 /// Wraps a `sqlx::PgPool` and exposes async methods for every table
 /// in the memory platform schema.
+#[derive(Debug)]
 pub struct PostgresDb {
     pub pool: PgPool,
 }

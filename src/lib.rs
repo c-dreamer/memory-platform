@@ -45,3 +45,22 @@ pub struct AppState {
     pub ingestion_service: Option<Arc<IngestionService>>,
     pub procedure_service: Option<Arc<ProcedureService>>,
 }
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("config", &self.config)
+            .field("db", &self.db)
+            .field("search", &self.search)
+            .field("neo4j_client", &self.neo4j_client.as_ref().map(|_| "(GraphClient)"))
+            .field("redis_cache", &self.redis_cache.as_ref().map(|_| "(RedisCache)"))
+            .field("context_service", &self.context_service)
+            .field("contradiction_detector", &self.contradiction_detector)
+            .field("decay_engine", &self.decay_engine)
+            .field("embedding_service", &self.embedding_service.as_ref().map(|_| "(EmbeddingService)"))
+            .field("experience_service", &self.experience_service)
+            .field("ingestion_service", &self.ingestion_service.as_ref().map(|_| "(IngestionService)"))
+            .field("procedure_service", &self.procedure_service)
+            .finish()
+    }
+}
