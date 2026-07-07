@@ -15,6 +15,9 @@ fi
 echo "[bootstrap] building memory platform binaries"
 cargo build --release --features transport-http --bin memory-platform --bin mcp-server --bin ingest --bin stats
 
+echo "[bootstrap] checking tracked files for secret leaks"
+"$SCRIPT_DIR/check_secrets.sh"
+
 echo "[bootstrap] rehydrating local store from Neon and live sources"
 "$SCRIPT_DIR/rehydrate_local.sh"
 
