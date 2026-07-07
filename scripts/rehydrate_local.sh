@@ -13,11 +13,15 @@ if [[ -f "$REPO_DIR/.env" ]]; then
 fi
 
 LOCAL_URL="${LOCAL_URL:-${DATABASE_URL:-postgresql://memory:YAft44tZyrG4DET0WeigY8BpZ%2BcqGgPtTXsPK4XFgXc%3D@127.0.0.1:5433/memory}}"
-NEON_URL="${NEON_URL:-${NEON_DATABASE_URL:-postgres://neondb_owner:npg_Z38efMRscSXT@ep-mute-wind-at1qqxxb.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require}}"
+NEON_URL="${NEON_URL:-${NEON_DATABASE_URL:-}}"
+
+if [[ -z "$NEON_URL" ]]; then
+  echo "[rehydrate] ERROR: NEON_URL or NEON_DATABASE_URL must be set"
+  exit 1
+fi
 
 echo "[rehydrate] restoring local store from Neon into: $LOCAL_URL"
 docker run --rm \
-  -e PGPASSWORD="${NEON_PASSWORD:-}" \
   postgres:18 \
   pg_dump "$NEON_URL" --clean --if-exists --no-owner --no-acl \
   | psql "$LOCAL_URL" -v ON_ERROR_STOP=1 >/dev/null

@@ -14,7 +14,12 @@ if [[ -f "$(dirname "$0")/.env" ]]; then
 fi
 
 LOCAL_URL="${LOCAL_URL:-${DATABASE_URL:-postgres://memory:YAft44tZyrG4DET0WeigY8BpZ%252BcqGgPtTXsPK4XFgXc%253D@127.0.0.1:5433/memory}}"
-NEON_DIRECT="${NEON_DIRECT:-${NEON_DATABASE_URL:-postgres://neondb_owner:npg_Z38efMRscSXT@ep-mute-wind-at1qqxxb.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require}}"
+NEON_DIRECT="${NEON_DIRECT:-${NEON_DATABASE_URL:-}}"
+
+if [[ -z "$NEON_DIRECT" ]]; then
+  echo "[sync-to-neon] ERROR: NEON_DIRECT or NEON_DATABASE_URL must be set"
+  exit 1
+fi
 TABLES=(
   documents
   memories
