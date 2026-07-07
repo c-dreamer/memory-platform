@@ -13,7 +13,7 @@ if [[ -f "$REPO_DIR/.env" ]]; then
 fi
 
 echo "[bootstrap] building memory platform binaries"
-cargo build --release --bin mcp-server --bin ingest --bin stats
+cargo build --release --features transport-http --bin memory-platform --bin mcp-server --bin ingest --bin stats
 
 echo "[bootstrap] rehydrating local store from Neon and live sources"
 "$SCRIPT_DIR/rehydrate_local.sh"

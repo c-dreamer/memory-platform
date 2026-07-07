@@ -24,6 +24,7 @@ echo "[rehydrate] restoring local store from Neon into: $LOCAL_URL"
 docker run --rm \
   postgres:18 \
   pg_dump "$NEON_URL" --clean --if-exists --no-owner --no-acl \
+  | sed '/pg_session_jwt/d' \
   | psql "$LOCAL_URL" -v ON_ERROR_STOP=1 >/dev/null
 
 echo "[rehydrate] ingesting current local source files"

@@ -1,0 +1,15 @@
+[Unit]
+Description=Memory platform HTTP daemon
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/humanoracle26/memory-platform-rust
+EnvironmentFile=-/home/humanoracle26/memory-platform-rust/.env
+Environment=RUST_LOG=info
+ExecStart=/home/humanoracle26/memory-platform-rust/target/release/memory-platform
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

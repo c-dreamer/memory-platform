@@ -84,6 +84,20 @@ This will:
 3. Re-ingest the live vault, OpenCode sessions, Codex sessions, config, and logs.
 4. Verify backup coverage, including the Numerai model backup under `gdrive:backups/numerai/models`.
 
+### Persistent MCP
+
+OpenCode should point to the HTTP MCP endpoint served by the main daemon:
+
+- Build with `transport-http` enabled.
+- Run `memory-platform` as a persistent user service.
+- Point OpenCode at `http://127.0.0.1:8000/mcp`.
+
+Recommended service control:
+
+```bash
+systemctl --user enable --now memory-platform.service
+```
+
 ### Configuration
 
 All configuration is via environment variables (see `.env.example`):
