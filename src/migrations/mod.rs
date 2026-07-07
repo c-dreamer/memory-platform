@@ -101,8 +101,10 @@ mod tests {
     use std::env;
 
     #[tokio::test]
+    #[ignore = "requires a reachable Postgres instance"]
     async fn test_migrations_table_creation() {
-        let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let database_url = env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://memory:password@127.0.0.1:5434/memory".to_string());
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(&database_url)

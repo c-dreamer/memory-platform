@@ -35,6 +35,8 @@ pub struct EmbeddingConfig {
     pub nvidia_api_url: Option<String>,
     /// NVIDIA API key.
     pub nvidia_api_key: Option<String>,
+    /// LRU cache size (number of entries).
+    pub cache_size: usize,
 }
 
 #[cfg(feature = "fastembed")]
@@ -59,9 +61,9 @@ impl fmt::Debug for LocalEmbedding {
 #[cfg(feature = "fastembed")]
 impl LocalEmbedding {
     /// Create a new local embedding backend.
-    pub async fn new() -> Result<Self> {
+    pub async fn new(cache_size: usize) -> Result<Self> {
         let cache = Arc::new(Mutex::new(LruCache::new(
-            NonZeroUsize::new(1000).expect("1000 > 0"),
+            NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(1000).unwrap()),
         )));
 
         // Initialize model in a blocking task
@@ -137,15 +139,45 @@ pub struct NvidiaNimEmbedding {
 
 impl NvidiaNimEmbedding {
     /// Create a new NVIDIA NIM embedding backend.
-    pub fn new(api_url: String, api_key: String) -> Self {
+    pub fn new(api_url: String, api_key: String, cache_size: usize) -> Self {
         Self {
             client: Client::new(),
             api_url,
             api_key,
             cache: Arc::new(Mutex::new(LruCache::new(
-                NonZeroUsize::new(1000).expect("1000 > 0"),
+                NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(1000).unwrap()),
             ))),
         }
+    }
+
+    fn parse_embedding_response(data: serde_json::Value) -> Result<Embedding> {
+        let embedding: Vec<f32> = data["data"][0]["embedding"]
+            .as_array()
+            .context("Invalid embedding format in NVIDIA NIM API response")?
+            .iter()
+            .map(|v| v.as_f64().unwrap_or_default() as f32)
+            .collect();
+
+        // Ensure dimension is 384 (truncate/pad if needed)
+        let len = embedding.len();
+        let mut embedding = if len > 384 {
+            embedding.into_iter().take(384).collect()
+        } else if len < 384 {
+            embedding
+                .into_iter()
+                .chain(std::iter::repeat(0.0).take(384 - len))
+                .collect()
+        } else {
+            embedding
+        };
+
+        // Normalize embedding
+        let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            embedding.iter_mut().for_each(|x| *x /= norm);
+        }
+
+        Ok(Embedding::new(embedding))
     }
 }
 
@@ -192,33 +224,7 @@ impl EmbeddingService for NvidiaNimEmbedding {
                 .await
                 .context("Failed to parse NVIDIA NIM API response")?;
 
-            let embedding: Vec<f32> = data["data"][0]["embedding"]
-                .as_array()
-                .context("Invalid embedding format in NVIDIA NIM API response")?
-                .iter()
-                .map(|v| v.as_f64().unwrap_or_default() as f32)
-                .collect();
-
-            // Ensure dimension is 384 (truncate/pad if needed)
-            let len = embedding.len();
-            let mut embedding = if len > 384 {
-                embedding.into_iter().take(384).collect()
-            } else if len < 384 {
-                embedding
-                    .into_iter()
-                    .chain(std::iter::repeat(0.0).take(384 - len))
-                    .collect()
-            } else {
-                embedding
-            };
-
-            // Normalize embedding
-            let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                embedding.iter_mut().for_each(|x| *x /= norm);
-            }
-
-            let embedding = Embedding::new(embedding);
+            let embedding = Self::parse_embedding_response(data)?;
 
             // Update cache
             {
@@ -251,11 +257,12 @@ impl fmt::Debug for EmbeddingServiceFactory {
 impl EmbeddingServiceFactory {
     /// Create an embedding service based on configuration.
     pub async fn new(config: EmbeddingConfig) -> Result<Self> {
+        let cache_size = config.cache_size;
         match config.model.as_str() {
             "local" => {
                 #[cfg(feature = "fastembed")]
                 {
-                    Ok(Self::Local(LocalEmbedding::new().await?))
+                    Ok(Self::Local(LocalEmbedding::new(cache_size).await?))
                 }
                 #[cfg(not(feature = "fastembed"))]
                 {
@@ -270,7 +277,9 @@ impl EmbeddingServiceFactory {
                 let api_key = config
                     .nvidia_api_key
                     .context("NVIDIA API key is required for NVIDIA backend")?;
-                Ok(Self::Nvidia(NvidiaNimEmbedding::new(api_url, api_key)))
+                Ok(Self::Nvidia(NvidiaNimEmbedding::new(
+                    api_url, api_key, cache_size,
+                )))
             }
             _ => anyhow::bail!("Unknown embedding model: {}", config.model),
         }
@@ -308,28 +317,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_nvidia_embedding() {
-        let mut server = mockito::Server::new();
-        let mock_response = serde_json::json!({
+        let response = serde_json::json!({
             "data": [{"embedding": vec![0.1_f64; 384]}]
         });
 
-        let _m = server
-            .mock("POST", "/")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(mock_response.to_string())
-            .create();
-
-        let service = NvidiaNimEmbedding::new(server.url(), "fake-api-key".to_string());
-
-        let embedding = service.embed("test").await.expect("Failed to embed");
+        let embedding = NvidiaNimEmbedding::parse_embedding_response(response)
+            .expect("Failed to parse embedding");
         assert_eq!(embedding.as_vec().len(), 384);
+        assert!(embedding.as_vec().iter().all(|x| x.is_finite()));
     }
 
     #[tokio::test]
     async fn test_empty_text() {
-        let service =
-            NvidiaNimEmbedding::new("http://fake.url".to_string(), "fake-api-key".to_string());
+        let service = NvidiaNimEmbedding::new(
+            "http://fake.url".to_string(),
+            "fake-api-key".to_string(),
+            1000,
+        );
         let embedding = service.embed("").await.expect("Failed to embed");
         assert_eq!(embedding.as_vec().len(), 384);
         assert!(embedding.as_vec().iter().all(|&x| x == 0.0));

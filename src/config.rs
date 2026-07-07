@@ -5,6 +5,7 @@
 //! sensible defaults matching the Docker Compose development setup.
 
 use std::env;
+use std::fmt;
 
 /// Errors that can occur during configuration loading.
 #[derive(Debug, thiserror::Error)]
@@ -17,11 +18,14 @@ pub enum ConfigError {
     },
 }
 
+/// Default embedding dimension used as fallback when Config is not available.
+pub const DEFAULT_EMBEDDING_DIM: usize = 384;
+
 /// Application configuration loaded from environment variables.
 ///
 /// Every field maps to an environment variable (see `.env.example`).
 /// Defaults are provided for local development with Docker Compose.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     // --- Database ---
     pub database_url: String,
@@ -31,12 +35,13 @@ pub struct Config {
     pub neo4j_password: String,
 
     // --- API ---
-    pub api_key: String,
+    pub(crate) api_key: String,
     pub api_port: u16,
 
     // --- Embeddings ---
     pub embedding_model: String,
     pub embedding_dim: usize,
+    pub nvidia_api_url: String,
     pub nvidia_api_key: String,
     pub openai_api_key: String,
 
@@ -77,6 +82,33 @@ pub struct Config {
 
     // --- Logging ---
     pub rust_log: String,
+
+    // --- Embedding Cache ---
+    pub embedding_cache_size: usize,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("database_url", &self.database_url)
+            .field("redis_url", &self.redis_url)
+            .field("neo4j_uri", &self.neo4j_uri)
+            .field("neo4j_user", &self.neo4j_user)
+            .field("neo4j_password", &self.neo4j_password)
+            .field("api_key", &"***redacted***")
+            .field("api_port", &self.api_port)
+            .field("embedding_model", &self.embedding_model)
+            .field("embedding_dim", &self.embedding_dim)
+            .field("nvidia_api_key", &"***redacted***")
+            .field("openai_api_key", &"***redacted***")
+            .field("vault_path", &self.vault_path)
+            .field("obsidian_api_key", &"***redacted***")
+            .field("cache_ttl_short", &self.cache_ttl_short)
+            .field("search_default_mode", &self.search_default_mode)
+            .field("decay_enabled", &self.decay_enabled)
+            .field("embedding_cache_size", &self.embedding_cache_size)
+            .finish()
+    }
 }
 
 impl Config {
@@ -111,6 +143,8 @@ impl Config {
             // --- Embeddings ---
             embedding_model: env_var("EMBEDDING_MODEL").unwrap_or_else(|| "local".into()),
             embedding_dim: parse_env("EMBEDDING_DIM", 384)?,
+            nvidia_api_url: env_var("NVIDIA_API_URL")
+                .unwrap_or_else(|| "https://api.nvcf.nvidia.com/v2/nvcf/pexec/functions".into()),
             nvidia_api_key: env_var("NVIDIA_API_KEY").unwrap_or_default(),
             openai_api_key: env_var("OPENAI_API_KEY").unwrap_or_default(),
 
@@ -152,6 +186,9 @@ impl Config {
 
             // --- Logging ---
             rust_log: env_var("RUST_LOG").unwrap_or_else(|| "info".into()),
+
+            // --- Embedding Cache ---
+            embedding_cache_size: parse_env("EMBEDDING_CACHE_SIZE", 1000)?,
         })
     }
 }
@@ -168,6 +205,7 @@ impl Default for Config {
             api_port: 8000,
             embedding_model: "local".into(),
             embedding_dim: 384,
+            nvidia_api_url: "https://api.nvcf.nvidia.com/v2/nvcf/pexec/functions".into(),
             nvidia_api_key: String::new(),
             openai_api_key: String::new(),
             vault_path: "/vault".into(),
@@ -193,6 +231,7 @@ impl Default for Config {
             max_chunks_per_doc: 100,
             nvidia_embedding_model: "nvidia/nv-embed-qa-4".into(),
             rust_log: "info".into(),
+            embedding_cache_size: 1000,
         }
     }
 }
@@ -246,7 +285,11 @@ fn parse_bool(key: &'static str, default: bool) -> Result<bool, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+    use std::path::PathBuf;
     use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Serialise env-var mutation so tests don't race.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
@@ -257,7 +300,13 @@ mod tests {
     where
         F: FnOnce(),
     {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let original_cwd = env::current_dir().expect("current dir");
+        let temp_cwd = unique_temp_dir();
+        fs::create_dir_all(&temp_cwd).expect("create temp dir");
+        env::set_current_dir(&temp_cwd).expect("set temp cwd");
 
         // Save originals
         let saved: Vec<(String, Option<String>)> = vars
@@ -270,7 +319,7 @@ mod tests {
             env::set_var(k, v);
         }
 
-        f();
+        let result = catch_unwind(AssertUnwindSafe(f));
 
         // Restore originals
         for (k, orig) in saved {
@@ -279,6 +328,27 @@ mod tests {
                 None => env::remove_var(&k),
             }
         }
+
+        env::set_current_dir(&original_cwd).expect("restore cwd");
+        let _ = fs::remove_dir_all(&temp_cwd);
+
+        if let Err(panic) = result {
+            resume_unwind(panic);
+        }
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        let mut dir = env::temp_dir();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        dir.push(format!(
+            "memory_platform_config_test_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        dir
     }
 
     // ------------------------------------------------------------------
@@ -321,6 +391,7 @@ mod tests {
         assert_eq!(cfg.max_chunks_per_doc, 100);
         assert_eq!(cfg.nvidia_embedding_model, "nvidia/nv-embed-qa-4");
         assert_eq!(cfg.rust_log, "info");
+        assert_eq!(cfg.embedding_cache_size, 1000);
     }
 
     // ------------------------------------------------------------------
@@ -329,69 +400,19 @@ mod tests {
 
     #[test]
     fn from_env_uses_defaults_when_no_vars_set() {
-        // Remove every config-related var so we test pure defaults.
-        let all_keys = [
-            "DATABASE_URL",
-            "REDIS_URL",
-            "NEO4J_URI",
-            "NEO4J_USER",
-            "NEO4J_PASSWORD",
-            "API_KEY",
-            "API_PORT",
-            "EMBEDDING_MODEL",
-            "EMBEDDING_DIM",
-            "NVIDIA_API_KEY",
-            "OPENAI_API_KEY",
-            "VAULT_PATH",
-            "OBSIDIAN_API_URL",
-            "OBSIDIAN_API_KEY",
-            "CACHE_TTL_SHORT",
-            "CACHE_TTL_MEDIUM",
-            "CACHE_TTL_LONG",
-            "SEARCH_DEFAULT_MODE",
-            "RRF_K",
-            "RRF_VECTOR_WEIGHT",
-            "RRF_KEYWORD_WEIGHT",
-            "DECAY_ENABLED",
-            "DECAY_HALF_LIFE_DAYS",
-            "DECAY_MIN_SCORE",
-            "DECAY_APPLY_TO_SEARCH",
-            "CHUNK_SIZE",
-            "CHUNK_OVERLAP",
-            "MAX_CHUNKS_PER_DOC",
-            "NVIDIA_EMBEDDING_MODEL",
-            "RUST_LOG",
-        ];
-
-        let _guard = ENV_MUTEX.lock().unwrap();
-        let saved: Vec<(String, Option<String>)> = all_keys
-            .iter()
-            .map(|k| ((*k).to_string(), env::var(k).ok()))
-            .collect();
-        for k in &all_keys {
-            env::remove_var(k);
-        }
-
-        let cfg = Config::from_env().expect("from_env should succeed with no vars");
-
-        // Restore
-        for (k, orig) in saved {
-            match orig {
-                Some(val) => env::set_var(&k, val),
-                None => env::remove_var(&k),
-            }
-        }
-
-        let default = Config::default();
-        assert_eq!(cfg.database_url, default.database_url);
-        assert_eq!(cfg.api_port, default.api_port);
-        assert_eq!(cfg.embedding_dim, default.embedding_dim);
-        assert_eq!(cfg.cache_ttl_short, default.cache_ttl_short);
-        assert_eq!(cfg.rrf_k, default.rrf_k);
-        assert!((cfg.rrf_vector_weight - default.rrf_vector_weight).abs() < f64::EPSILON);
-        assert_eq!(cfg.decay_enabled, default.decay_enabled);
-        assert_eq!(cfg.chunk_size, default.chunk_size);
-        assert_eq!(cfg.rust_log, default.rust_log);
+        with_env_vars(&[], || {
+            let cfg = Config::from_env().expect("from_env should succeed with no vars");
+            let default = Config::default();
+            assert_eq!(cfg.database_url, default.database_url);
+            assert_eq!(cfg.api_port, default.api_port);
+            assert_eq!(cfg.embedding_dim, default.embedding_dim);
+            assert_eq!(cfg.cache_ttl_short, default.cache_ttl_short);
+            assert_eq!(cfg.rrf_k, default.rrf_k);
+            assert!((cfg.rrf_vector_weight - default.rrf_vector_weight).abs() < f64::EPSILON);
+            assert_eq!(cfg.decay_enabled, default.decay_enabled);
+            assert_eq!(cfg.chunk_size, default.chunk_size);
+            assert_eq!(cfg.rust_log, default.rust_log);
+        });
     }
 
     // ------------------------------------------------------------------
@@ -589,6 +610,7 @@ mod tests {
                 ("MAX_CHUNKS_PER_DOC", "50"),
                 ("NVIDIA_EMBEDDING_MODEL", "nvidia/custom"),
                 ("RUST_LOG", "trace"),
+                ("EMBEDDING_CACHE_SIZE", "500"),
             ],
             || {
                 let cfg = Config::from_env().expect("from_env should succeed");
@@ -626,6 +648,7 @@ mod tests {
                 assert_eq!(cfg.max_chunks_per_doc, 50);
                 assert_eq!(cfg.nvidia_embedding_model, "nvidia/custom");
                 assert_eq!(cfg.rust_log, "trace");
+                assert_eq!(cfg.embedding_cache_size, 500);
             },
         );
     }

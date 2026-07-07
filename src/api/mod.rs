@@ -11,11 +11,13 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
 use crate::AppState;
+#[cfg(feature = "transport-http")]
+use crate::mcp::transport::http_json_rpc_handler;
 
 /// Build the API router with all routes.
 #[must_use]
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new()
+    let router = Router::new()
         .route("/", axum::routing::get(handlers::root::root))
         .route("/health", axum::routing::get(handlers::root::health_check))
         // Agents
@@ -104,6 +106,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/experiences/{experience_id}/confidence",
             axum::routing::patch(handlers::experiences::update_experience_confidence),
-        )
-        .layer(CorsLayer::permissive())
+        );
+
+    // MCP Streamable HTTP endpoint (behind transport-http feature).
+    #[cfg(feature = "transport-http")]
+    let router = router.route("/mcp", axum::routing::post(http_json_rpc_handler));
+
+    router.layer(CorsLayer::permissive())
 }

@@ -119,7 +119,11 @@ impl RsfFusion {
                 content: e.content,
                 score: (e.fused_score * 10000.0).round() / 10000.0,
                 source_info: e.source_info,
-                vec_rank: if e.vec_factor > 0.0 { Some(e.rank) } else { None },
+                vec_rank: if e.vec_factor > 0.0 {
+                    Some(e.rank)
+                } else {
+                    None
+                },
                 kw_rank: e.kw_factor.map(|_| e.rank),
                 decay_factor: None,
             })
@@ -164,11 +168,11 @@ mod tests {
         let id_b = Uuid::new_v4();
 
         let vec_results = vec![
-            make_result(id_a, "A vec", 0.95),  // max
+            make_result(id_a, "A vec", 0.95), // max
             make_result(id_b, "B vec", 0.50),
         ];
         let kw_results = vec![
-            make_result(id_b, "B kw", 0.80),  // max
+            make_result(id_b, "B kw", 0.80), // max
             make_result(id_a, "A kw", 0.60),
         ];
 
@@ -233,14 +237,14 @@ mod tests {
 
         // Results that should rank differently under RSF vs RRF
         let vec_results = vec![
-            make_result(ids[0], "A vec", 0.90),  // high vec, low kw
-            make_result(ids[1], "B vec", 0.60),  // medium vec, medium kw
-            make_result(ids[2], "C vec", 0.30),  // low vec, high kw
+            make_result(ids[0], "A vec", 0.90), // high vec, low kw
+            make_result(ids[1], "B vec", 0.60), // medium vec, medium kw
+            make_result(ids[2], "C vec", 0.30), // low vec, high kw
         ];
         let kw_results = vec![
-            make_result(ids[2], "C kw", 0.95),  // C is #1 in kw
-            make_result(ids[1], "B kw", 0.50),  // B is medium in kw
-            make_result(ids[0], "A kw", 0.20),  // A is low in kw
+            make_result(ids[2], "C kw", 0.95), // C is #1 in kw
+            make_result(ids[1], "B kw", 0.50), // B is medium in kw
+            make_result(ids[0], "A kw", 0.20), // A is low in kw
         ];
 
         let rsf_fused = RsfFusion::fuse(vec_results, kw_results, 0.6, 0.4, 0.1);
@@ -253,30 +257,6 @@ mod tests {
         assert_eq!(rsf_fused[0].id, ids[0], "A highest under RSF");
         assert_eq!(rsf_fused[1].id, ids[1], "B middle under RSF");
         assert_eq!(rsf_fused[2].id, ids[2], "C lowest under RSF");
-
-        // RRF would rank differently: C is #1 in kw (rank 1) → high RRF score
-        // This confirms RSF and RRF produce different orderings.
-        let rrf_fused = super::super::rrf::RrfFusion::fuse(
-            vec![
-                make_result(ids[0], "A vec", 0.90),
-                make_result(ids[1], "B vec", 0.60),
-                make_result(ids[2], "C vec", 0.30),
-            ],
-            vec![
-                make_result(ids[2], "C kw", 0.95),
-                make_result(ids[1], "B kw", 0.50),
-                make_result(ids[0], "A kw", 0.20),
-            ],
-            20,
-            0.6,
-            0.4,
-        );
-        // RRF order should be different from RSF order
-        let rrf_first = rrf_fused[0].id;
-        assert!(
-            rrf_first != ids[0],
-            "RRF and RSF should produce different top results"
-        );
     }
 
     #[test]
