@@ -22,3 +22,7 @@ Thumbs.db
 
 # Evidence directory (build artifacts)
 .omo/evidence/
+
+# Local agent scratch and Python bytecode
+.omo/
+scripts/__pycache__/

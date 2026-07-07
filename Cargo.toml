@@ -18,6 +18,10 @@ path = "src/bin/mcp-server.rs"
 name = "vault-sync"
 path = "src/bin/vault-sync.rs"
 
+[[bin]]
+name = "ingest"
+path = "src/bin/ingest.rs"
+
 [lib]
 name = "memory_platform"
 path = "src/lib.rs"
@@ -54,11 +58,13 @@ lru = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 mockito = { version = "1.4", default-features = false }
 
+
 [features]
 default = ["neo4j", "markdown"]
 neo4j = ["dep:neo4rs"]
 fastembed = ["dep:fastembed"]
 markdown = ["dep:pulldown-cmark"]
+transport-http = []
 
 [profile.release]
 opt-level = 3

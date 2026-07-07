@@ -47,8 +47,9 @@ async fn main() -> anyhow::Result<()> {
     let embedding_service: Option<Arc<dyn EmbeddingService>> = {
         let embedding_config = EmbeddingConfig {
             model: config.embedding_model.clone(),
-            nvidia_api_url: Some(config.nvidia_api_key.clone()),
+            nvidia_api_url: Some(config.nvidia_api_url.clone()),
             nvidia_api_key: Some(config.nvidia_api_key.clone()),
+            cache_size: config.embedding_cache_size,
         };
         match EmbeddingServiceFactory::new(embedding_config).await {
             Ok(svc) => Some(Arc::new(svc)),

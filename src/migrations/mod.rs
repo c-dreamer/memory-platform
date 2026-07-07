@@ -104,7 +104,10 @@ mod tests {
     #[ignore = "requires a reachable Postgres instance"]
     async fn test_migrations_table_creation() {
         let database_url = env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://memory:password@127.0.0.1:5434/memory".to_string());
+            .unwrap_or_else(|_| {
+                "postgresql://memory:YAft44tZyrG4DET0WeigY8BpZ%252BcqGgPtTXsPK4XFgXc%253D@127.0.0.1:5433/memory"
+                    .to_string()
+            });
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(&database_url)

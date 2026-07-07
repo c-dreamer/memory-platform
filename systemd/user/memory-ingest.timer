@@ -1,0 +1,11 @@
+[Unit]
+Description=Run memory freshness ingest hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=10m
+Unit=memory-ingest.service
+
+[Install]
+WantedBy=timers.target

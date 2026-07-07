@@ -94,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             Some(config.nvidia_api_key.clone())
         },
+        cache_size: config.embedding_cache_size,
     };
     let embedding_service: Option<Arc<dyn memory_platform::services::embedding::EmbeddingService>> =
         match EmbeddingServiceFactory::new(embedding_config).await {

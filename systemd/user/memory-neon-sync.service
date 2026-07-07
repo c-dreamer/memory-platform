@@ -1,0 +1,10 @@
+[Unit]
+Description=Sync local memory Postgres to Neon
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/humanoracle26/memory-platform-rust
+EnvironmentFile=-/home/humanoracle26/memory-platform-rust/.env
+Environment=RUST_LOG=info
+ExecStart=/home/humanoracle26/memory-platform-rust/sync-to-neon.sh

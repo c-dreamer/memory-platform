@@ -1,0 +1,11 @@
+[Unit]
+Description=Run backup verification daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=20m
+Unit=memory-backup-verify.service
+
+[Install]
+WantedBy=timers.target

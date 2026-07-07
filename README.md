@@ -69,6 +69,21 @@ cargo test --test integration
 DATABASE_URL=postgresql://... cargo test --test integration -- --include-ignored
 ```
 
+### Bootstrap
+
+For a full local recovery after cloning the repo:
+
+```bash
+./scripts/bootstrap.sh
+```
+
+This will:
+
+1. Build the release binaries used by the memory MCP and ingest workflow.
+2. Rehydrate the local Postgres store from Neon.
+3. Re-ingest the live vault, OpenCode sessions, Codex sessions, config, and logs.
+4. Verify backup coverage, including the Numerai model backup under `gdrive:backups/numerai/models`.
+
 ### Configuration
 
 All configuration is via environment variables (see `.env.example`):
@@ -82,6 +97,17 @@ All configuration is via environment variables (see `.env.example`):
 | `API_PORT` | `8000` | HTTP server port |
 | `EMBEDDING_MODEL` | `local` | Embedding backend (`local` or `nvidia`) |
 | `VAULT_PATH` | `/vault` | Path to Obsidian vault |
+
+### Stats
+
+Use the stats CLI to inspect a single database or compare two URLs:
+
+```bash
+cargo run --quiet --bin stats -- --db-url "$DATABASE_URL"
+cargo run --quiet --bin stats -- --compare "$LOCAL_URL" "$NEON_URL"
+```
+
+The compare mode prints both database URLs, their sizes in MB, and the delta for the core tables.
 
 ## Development
 

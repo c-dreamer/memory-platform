@@ -216,21 +216,25 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
 
     info!("memory_search: query='{query}', limit={limit}");
 
+    let search_mode = if state.embedding_service.is_some() {
+        "hybrid"
+    } else {
+        warn!("No embedding service — using keyword-only search");
+        "keyword"
+    };
+
     // Generate embedding if embedding service is available
     let embedding = match &state.embedding_service {
         Some(svc) => svc.embed(&query).await?.as_vec().to_vec(),
-        None => {
-            warn!("No embedding service — using keyword-only search");
-            vec![0.0_f32; state.config.embedding_dim]
-        }
+        None => vec![],
     };
 
     // Search across all four tables in parallel
     let (memories, documents, experiences, trading) = tokio::try_join!(
-        state.search.hybrid_search("memories", &query, &embedding, "hybrid", limit),
-        state.search.hybrid_search("documents", &query, &embedding, "hybrid", limit),
-        state.search.hybrid_search("experiences", &query, &embedding, "hybrid", limit),
-        state.search.hybrid_search("trading_results", &query, &embedding, "hybrid", limit),
+        state.search.hybrid_search("memories", &query, &embedding, search_mode, limit),
+        state.search.hybrid_search("documents", &query, &embedding, search_mode, limit),
+        state.search.hybrid_search("experiences", &query, &embedding, search_mode, limit),
+        state.search.hybrid_search("trading_results", &query, &embedding, search_mode, limit),
     )
     .context("Search failed")?;
 
@@ -256,7 +260,7 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
         "trading_results": trading,
     });
 
-    Ok(serde_json::to_string_pretty(&result)?)
+    Ok(serde_json::to_string(&result)?)
 }
 
 /// 2. memory_store — store a new memory.
@@ -312,7 +316,7 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
         "created_at": memory.created_at,
     });
 
-    Ok(serde_json::to_string_pretty(&result)?)
+    Ok(serde_json::to_string(&result)?)
 }
 
 /// 3. memory_context — get context package for a query.
@@ -348,7 +352,7 @@ async fn tool_memory_context(state: &AppState, args: Value) -> Result<String> {
         }
     }
 
-    Ok(serde_json::to_string_pretty(&context)?)
+    Ok(serde_json::to_string(&context)?)
 }
 
 /// 4. memory_initialize — one-shot init: get context + format banner.
@@ -489,7 +493,7 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
         "summary": summary,
     });
 
-    Ok(serde_json::to_string_pretty(&result)?)
+    Ok(serde_json::to_string(&result)?)
 }
 
 /// 5. experience_find — find similar past experiences.
@@ -531,7 +535,7 @@ async fn tool_experience_find(state: &AppState, args: Value) -> Result<String> {
         "count": experiences.len(),
     });
 
-    Ok(serde_json::to_string_pretty(&result)?)
+    Ok(serde_json::to_string(&result)?)
 }
 
 /// 6. procedure_run — execute a named procedure.
@@ -580,7 +584,7 @@ async fn tool_procedure_run(state: &AppState, args: Value) -> Result<String> {
         "output": format!("Executed procedure '{}' successfully", procedure.name),
     });
 
-    Ok(serde_json::to_string_pretty(&result)?)
+    Ok(serde_json::to_string(&result)?)
 }
 
 /// 7. session_start — create a new session.
@@ -602,7 +606,7 @@ async fn tool_session_start(state: &AppState, args: Value) -> Result<String> {
         "started_at": session.started_at,
     });
 
-    Ok(serde_json::to_string_pretty(&result)?)
+    Ok(serde_json::to_string(&result)?)
 }
 
 /// 8. session_end — end a session with summary.
@@ -627,7 +631,7 @@ async fn tool_session_end(state: &AppState, args: Value) -> Result<String> {
         "summary": summary,
     });
 
-    Ok(serde_json::to_string_pretty(&result)?)
+    Ok(serde_json::to_string(&result)?)
 }
 
 /// 9. recall — recall a memory or document by ID.
@@ -654,7 +658,7 @@ async fn tool_recall(state: &AppState, args: Value) -> Result<String> {
                     .execute(&state.db.pool).await;
             }
 
-            return Ok(serde_json::to_string_pretty(&memory)?);
+            return Ok(serde_json::to_string(&memory)?);
         }
 
         // Try session
@@ -664,7 +668,7 @@ async fn tool_recall(state: &AppState, args: Value) -> Result<String> {
             .await
             .context("Failed to get session")?
         {
-            return Ok(serde_json::to_string_pretty(&session)?);
+            return Ok(serde_json::to_string(&session)?);
         }
 
         // Try experience
@@ -672,7 +676,7 @@ async fn tool_recall(state: &AppState, args: Value) -> Result<String> {
             .await
             .context("Failed to get experience")?
         {
-            return Ok(serde_json::to_string_pretty(&exp)?);
+            return Ok(serde_json::to_string(&exp)?);
         }
 
         // Try procedure
@@ -682,7 +686,7 @@ async fn tool_recall(state: &AppState, args: Value) -> Result<String> {
             .await
             .context("Failed to get procedure")?
         {
-            return Ok(serde_json::to_string_pretty(&proc)?);
+            return Ok(serde_json::to_string(&proc)?);
         }
     }
 
@@ -698,7 +702,7 @@ async fn tool_recall(state: &AppState, args: Value) -> Result<String> {
                 .bind(sid).bind(doc.id)
                 .execute(&state.db.pool).await;
         }
-        return Ok(serde_json::to_string_pretty(&doc)?);
+        return Ok(serde_json::to_string(&doc)?);
     }
 
     Err(anyhow::anyhow!("No record found for id: {id_str}"))
@@ -729,7 +733,7 @@ async fn tool_forget(state: &AppState, args: Value) -> Result<String> {
         "status": "forgotten",
     });
 
-    Ok(serde_json::to_string_pretty(&result)?)
+    Ok(serde_json::to_string(&result)?)
 }
 
 /// 11. list — paginated listing from a table.
@@ -845,7 +849,7 @@ async fn tool_list(state: &AppState, args: Value) -> Result<String> {
         }
     };
 
-    Ok(serde_json::to_string_pretty(&result)?)
+    Ok(serde_json::to_string(&result)?)
 }
 
 /// 12. status — database health + stats.
@@ -865,7 +869,7 @@ async fn tool_status(state: &AppState, _args: Value) -> Result<String> {
         },
     });
 
-    Ok(serde_json::to_string_pretty(&result)?)
+    Ok(serde_json::to_string(&result)?)
 }
 
 /// 13. session_context — get all documents and memories accessed in a session.
@@ -906,7 +910,7 @@ async fn tool_session_context(state: &AppState, args: Value) -> Result<String> {
         "count": entries.len(),
     });
 
-    Ok(serde_json::to_string_pretty(&result)?)
+    Ok(serde_json::to_string(&result)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,6 +1081,7 @@ mod tests {
             "forget",
             "list",
             "status",
+            "session_context",
         ];
 
         for name in &expected {

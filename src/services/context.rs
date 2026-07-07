@@ -9,6 +9,7 @@ use anyhow::Result;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::config::DEFAULT_EMBEDDING_DIM;
 use crate::db::postgres::PostgresDb;
 use crate::models::{Experience, Memory, Procedure, Session};
 use crate::search::SearchEngine;
@@ -56,7 +57,7 @@ impl ContextService {
 
     /// Search for relevant experiences.
     pub async fn relevant_experiences(&self, query: &str, limit: i64) -> Result<Vec<Experience>> {
-        let dummy_emb = vec![0.0_f32; 384];
+        let dummy_emb = vec![0.0_f32; DEFAULT_EMBEDDING_DIM];
         let results = self
             .search
             .hybrid_search("experiences", query, &dummy_emb, "keyword", limit)
@@ -149,6 +150,7 @@ impl ContextService {
     }
 }
 
+#[cfg(test)]
 impl Default for ContextService {
     fn default() -> Self {
         // Used only for tests; panics if the pool is actually used.

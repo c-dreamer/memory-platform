@@ -1,0 +1,9 @@
+[Unit]
+Description=Verify backup parity and retention
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/humanoracle26/memory-platform-rust
+EnvironmentFile=-/home/humanoracle26/memory-platform-rust/.env
+ExecStart=/usr/bin/env python3 /home/humanoracle26/memory-platform-rust/scripts/verify_backups.py

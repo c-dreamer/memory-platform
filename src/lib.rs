@@ -7,6 +7,7 @@
 pub mod api;
 pub mod config;
 pub mod db;
+pub mod ingest;
 pub mod mcp;
 pub mod migrations;
 pub mod models;

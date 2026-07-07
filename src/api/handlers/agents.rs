@@ -1,9 +1,9 @@
-use axum::{extract::State, Json};
+use axum::{Json, extract::State};
 use std::sync::Arc;
 
+use crate::AppState;
 use crate::api::auth::Auth;
 use crate::api::dto::{AgentRegisterRequest, AgentRegisterResponse};
-use crate::AppState;
 
 pub async fn register_agent(
     _auth: Auth,

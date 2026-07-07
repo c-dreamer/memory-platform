@@ -8,12 +8,35 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info};
 
 use crate::AppState;
 
+/// Maximum line size accepted on stdin (10 MiB).
+const MAX_LINE_SIZE: usize = 10 * 1024 * 1024;
+/// Read timeout on stdin (300 seconds).
+const STDIN_TIMEOUT_SECS: u64 = 300;
+
+// ---------------------------------------------------------------------------
+// JSON-RPC 2.0 error codes
+// ---------------------------------------------------------------------------
+
+/// Parse error (-32700): Invalid JSON was received by the server.
+pub const ERROR_PARSE_ERROR: i64 = -32700;
+/// Invalid Request (-32600): The JSON sent is not a valid Request object.
+pub const ERROR_INVALID_REQUEST: i64 = -32600;
+/// Method not found (-32601): The method does not exist / is not available.
+pub const ERROR_METHOD_NOT_FOUND: i64 = -32601;
+/// Invalid params (-32602): Invalid method parameter(s).
+pub const ERROR_INVALID_PARAMS: i64 = -32602;
+/// Internal error (-32603): Internal JSON-RPC error.
+pub const ERROR_INTERNAL_ERROR: i64 = -32603;
+
 mod hooks;
 mod tools;
+#[cfg(feature = "transport-http")]
+pub mod transport;
 
 pub use hooks::*;
 pub use tools::*;
@@ -45,11 +68,27 @@ impl McpServer {
         
         loop {
             line.clear();
-            let bytes_read = reader.read_line(&mut line).await?;
-            
+
+            let bytes_read = timeout(Duration::from_secs(STDIN_TIMEOUT_SECS), reader.read_line(&mut line))
+                .await
+                .map_err(|_| anyhow::anyhow!("stdin read timed out after {STDIN_TIMEOUT_SECS}s"))??;
+
             if bytes_read == 0 {
                 // EOF
                 break;
+            }
+
+            if line.len() > MAX_LINE_SIZE {
+                error!("Line exceeds maximum size ({MAX_LINE_SIZE} bytes)");
+                let error_response = json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": {"code": ERROR_INVALID_REQUEST, "message": "Request too large"},
+                });
+                let response_str = error_response.to_string() + "\n";
+                writer.write_all(response_str.as_bytes()).await?;
+                writer.flush().await?;
+                continue;
             }
             
             debug!("Received request: {}", line.trim());
@@ -61,7 +100,7 @@ impl McpServer {
                     let error_response = json!({
                         "jsonrpc": "2.0",
                         "id": Value::Null,
-                        "error": {"message": e.to_string()},
+                        "error": {"code": ERROR_PARSE_ERROR, "message": e.to_string()},
                     });
                     let response_str = error_response.to_string() + "\n";
                     writer.write_all(response_str.as_bytes()).await?;
@@ -69,6 +108,9 @@ impl McpServer {
                     continue;
                 }
             };
+
+            // MCP spec: notifications have no "id" — the server must not send a response
+            let is_notification = request_value.get("id").is_none();
 
             let response = self.handle_request(request_value).await;
             let response_json = match response {
@@ -78,10 +120,14 @@ impl McpServer {
                     json!({
                         "jsonrpc": "2.0",
                         "id": Value::Null,
-                        "error": {"message": e.to_string()},
+                        "error": {"code": ERROR_INTERNAL_ERROR, "message": e.to_string()},
                     })
                 }
             };
+
+            if is_notification {
+                continue;
+            }
 
             let response_str = response_json.to_string() + "\n";
             writer.write_all(response_str.as_bytes()).await?;
@@ -112,12 +158,18 @@ impl McpServer {
                 info!("MCP client initialized");
                 Ok(self.handle_initialize(id).await)
             }
+            "notifications/initialized" => {
+                info!("MCP client initialized (notification)");
+                Ok(json!({
+                    "jsonrpc": "2.0",
+                }))
+            }
             "tools/list" => Ok(self.handle_tools_list(id)),
             "tools/call" => self.handle_tools_call(id, params).await,
             _ => Ok(json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "error": {"message": "Method not found"},
+                "error": {"code": ERROR_METHOD_NOT_FOUND, "message": "Method not found"},
             })),
         }
     }
@@ -128,7 +180,7 @@ impl McpServer {
             "jsonrpc": "2.0",
             "id": id,
             "result": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-03-26",
                 "capabilities": {
                     "tools": {
                         "list": true,
@@ -263,7 +315,25 @@ mod tests {
         
         let response = server.handle_request(request).await.unwrap();
         assert!(response.get("error").is_some(), "Should return error for unknown method");
+        assert_eq!(response["error"]["code"], ERROR_METHOD_NOT_FOUND, "Error code should be -32601");
         assert_eq!(response["error"]["message"], "Method not found");
+    }
+
+    #[tokio::test]
+    async fn test_notification_suppresses_response() {
+        let state = minimal_state();
+        let server = McpServer::new(state);
+
+        // Notification without "id" — server must not send response
+        // handle_request still returns a value, but the listen loop skips it
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        });
+        let response = server.handle_request(request).await.unwrap();
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert!(response.get("id").is_none(), "Notification response should have no id");
     }
 
     #[tokio::test]
@@ -309,7 +379,7 @@ mod tests {
         let response = server.handle_initialize(json!(42)).await;
         assert_eq!(response["id"], 42);
         assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(response["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(response["result"]["serverInfo"]["name"], "memory-mcp");
         assert_eq!(response["result"]["serverInfo"]["version"], "2.0.0");
         assert!(response["result"]["capabilities"]["tools"]["list"] == true);

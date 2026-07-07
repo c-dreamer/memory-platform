@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Neon sync every 30 minutes
+
+[Timer]
+OnCalendar=*:0/30
+Persistent=true
+RandomizedDelaySec=5m
+Unit=memory-neon-sync.service
+
+[Install]
+WantedBy=timers.target
