@@ -45,6 +45,9 @@ jobs:
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Secret scan
+        run: ./scripts/check_secrets.sh
+
       - name: Build (all targets)
         run: cargo build --all-targets --verbose
         env:
