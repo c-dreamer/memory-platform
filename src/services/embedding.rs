@@ -35,6 +35,8 @@ pub struct EmbeddingConfig {
     pub nvidia_api_url: Option<String>,
     /// NVIDIA API key.
     pub nvidia_api_key: Option<String>,
+    /// NVIDIA embedding model name (e.g., "nvidia/nv-embed-v1").
+    pub nvidia_embedding_model: String,
     /// LRU cache size (number of entries).
     pub cache_size: usize,
 }
@@ -134,16 +136,18 @@ pub struct NvidiaNimEmbedding {
     client: Client,
     api_url: String,
     api_key: String,
+    model: String,
     cache: Arc<Mutex<LruCache<String, Embedding>>>,
 }
 
 impl NvidiaNimEmbedding {
     /// Create a new NVIDIA NIM embedding backend.
-    pub fn new(api_url: String, api_key: String, cache_size: usize) -> Self {
+    pub fn new(api_url: String, api_key: String, model: String, cache_size: usize) -> Self {
         Self {
             client: Client::new(),
             api_url,
             api_key,
+            model,
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(1000).unwrap()),
             ))),
@@ -182,11 +186,12 @@ impl NvidiaNimEmbedding {
 }
 
 impl EmbeddingService for NvidiaNimEmbedding {
-    fn embed(&self, text: &str) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send>> {
+    fn embed(&self, text: &str) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>> {
         let text = text.to_string();
         let client = self.client.clone();
         let api_url = self.api_url.clone();
         let api_key = self.api_key.clone();
+        let model = self.model.clone();
         let cache = Arc::clone(&self.cache);
         Box::pin(async move {
             if text.trim().is_empty() {
@@ -201,13 +206,24 @@ impl EmbeddingService for NvidiaNimEmbedding {
                 }
             }
 
+            // Truncate to ~8192 tokens safe limit (~25K safe-chars for markdown-heavy text)
+            let truncated = if text.len() > 25000 {
+                let cutoff = text.char_indices().nth(8000).map(|(i, _)| i).unwrap_or(25000);
+                let mut t = text[..cutoff].to_string();
+                t.push_str("... [truncated]");
+                t
+            } else {
+                text.clone()
+            };
+
             // Call NVIDIA NIM API
             let resp = client
                 .post(&api_url)
                 .header("Authorization", format!("Bearer {}", api_key))
                 .json(&serde_json::json!({
-                    "input": text,
-                    "model": "nv-embed-qa",
+                    "input": truncated,
+                    "model": model,
+                    "input_type": "query",
                 }))
                 .send()
                 .await
@@ -278,7 +294,7 @@ impl EmbeddingServiceFactory {
                     .nvidia_api_key
                     .context("NVIDIA API key is required for NVIDIA backend")?;
                 Ok(Self::Nvidia(NvidiaNimEmbedding::new(
-                    api_url, api_key, cache_size,
+                    api_url, api_key, config.nvidia_embedding_model.clone(), cache_size,
                 )))
             }
             _ => anyhow::bail!("Unknown embedding model: {}", config.model),

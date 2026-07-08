@@ -38,7 +38,7 @@ TABLES=(
 )
 
 exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
+if ! flock -n 9 2>/dev/null; then
   echo "[sync-to-neon] Another sync is already running, exiting."
   exit 0
 fi

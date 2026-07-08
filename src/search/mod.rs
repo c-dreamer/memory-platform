@@ -200,7 +200,7 @@ impl SearchEngine {
         for chunk in ids.chunks(50) {
             let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("${i}")).collect();
             let sql = format!(
-                "SELECT id, EXTRACT(EPOCH FROM (now() - COALESCE(last_accessed_at, created_at))) / 86400.0 AS days_since \
+                "SELECT id, (EXTRACT(EPOCH FROM (now() - COALESCE(last_accessed_at, created_at))) / 86400.0)::FLOAT8 AS days_since \
                  FROM memories WHERE id IN ({})",
                 placeholders.join(",")
             );

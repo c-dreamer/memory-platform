@@ -9,7 +9,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{timeout, Duration};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::AppState;
 
@@ -229,13 +229,16 @@ impl McpServer {
                     "content": [{"type": "text", "text": content}],
                 },
             })),
-            Err(e) => Ok(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "content": [{"type": "text", "text": json!({"error": e.to_string()}).to_string()}],
-                },
-            })),
+            Err(e) => {
+                warn!("Tool call failed: {e:#}");
+                Ok(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [{"type": "text", "text": json!({"error": format!("{e:#}")}).to_string()}],
+                    },
+                }))
+            }
         }
     }
 }

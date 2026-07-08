@@ -87,13 +87,14 @@ async fn main() -> anyhow::Result<()> {
         nvidia_api_url: if config.nvidia_api_key.is_empty() {
             None
         } else {
-            Some(config.nvidia_api_key.clone())
+            Some(config.nvidia_api_url.clone())
         },
         nvidia_api_key: if config.nvidia_api_key.is_empty() {
             None
         } else {
             Some(config.nvidia_api_key.clone())
         },
+        nvidia_embedding_model: config.nvidia_embedding_model.clone(),
         cache_size: config.embedding_cache_size,
     };
     let embedding_service: Option<Arc<dyn memory_platform::services::embedding::EmbeddingService>> =

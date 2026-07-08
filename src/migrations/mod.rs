@@ -1,31 +1,19 @@
 //! Database migration runner for the Memory Platform.
 //!
-//! Uses a simple file-based migration system with a `_migrations` tracking table.
-//! Migrations are applied in order, and already-applied versions are skipped.
-//!
-//! Design:
-//! - Migrations are SQL files in the `migrations/` directory, named `NNN_name.sql`.
-//! - The `_migrations` table tracks which versions have been applied.
-//! - The `Migrator` struct provides an async `run(pool: &PgPool) -> Result<()>` method.
-//! - Uses `sqlx::query` for raw SQL execution (no sqlx::migrate! macro).
+//! SQL files are embedded via `include_str!` at compile time so the binary
+//! is self-contained and works from any working directory.
 
 use anyhow::{Context, Result};
 use sqlx::PgPool;
-use std::fs;
-use std::path::Path;
 
 /// Migration runner.
 ///
-/// Scans the `migrations/` directory, reads SQL files, and applies them in order.
 /// Uses a `_migrations` table to track applied versions.
+/// Migration SQL is embedded in the binary — no filesystem dependency at runtime.
 pub struct Migrator;
 
 impl Migrator {
     /// Run all pending migrations.
-    ///
-    /// Creates the `_migrations` table if it doesn't exist.
-    /// Reads migration files from the `migrations/` directory (relative to CWD at runtime).
-    /// Applies them in order, skipping already-applied versions.
     pub async fn run(pool: &PgPool) -> Result<()> {
         // Create the _migrations table if it doesn't exist
         sqlx::query(
@@ -46,48 +34,31 @@ impl Migrator {
             .await
             .context("Failed to fetch applied migrations")?;
 
-        // Read migration files from the migrations/ directory
-        let migrations_dir = Path::new("migrations");
-        let mut migrations = fs::read_dir(migrations_dir)
-            .context("Failed to read migrations directory")?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                if path.extension().map_or(false, |ext| ext == "sql") {
-                    let version = path.file_stem()?.to_string_lossy().into_owned();
-                    Some((version, path))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        // Embedded migrations — version -> SQL mapping via include_str!
+        let embedded: &[(&str, &str)] = &[
+            ("001_initial", include_str!("../../migrations/001_initial.sql")),
+            ("002_hybrid_decay_contradiction", include_str!("../../migrations/002_hybrid_decay_contradiction.sql")),
+            ("003_session_vault_xref", include_str!("../../migrations/003_session_vault_xref.sql")),
+        ];
 
-        // Sort migrations by version (lexicographic order)
-        migrations.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Apply pending migrations
-        for (version, path) in migrations {
-            if applied.contains(&version) {
-                continue; // Skip already-applied migrations
+        // Apply pending migrations in order
+        for (version, sql) in embedded {
+            if applied.contains(&version.to_string()) {
+                continue;
             }
 
-            let sql = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read migration file: {}", path.display()))?;
-
-            // Execute the migration (raw_sql supports multi-statement SQL)
-            sqlx::raw_sql(&sql)
+            sqlx::raw_sql(sql)
                 .execute(pool)
                 .await
                 .with_context(|| format!("Failed to execute migration: {}", version))?;
 
-            // Record the migration as applied
             sqlx::query("INSERT INTO _migrations (version) VALUES ($1)")
-                .bind(&version)
+                .bind(version)
                 .execute(pool)
                 .await
                 .with_context(|| format!("Failed to record migration: {}", version))?;
 
-            println!("Applied migration: {}", version);
+            tracing::info!("Applied migration: {version}");
         }
 
         Ok(())

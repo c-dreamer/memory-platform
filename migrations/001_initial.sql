@@ -321,9 +321,12 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trg_memories_fts ON memories;
 CREATE TRIGGER trg_memories_fts BEFORE INSERT OR UPDATE OF content ON memories
     FOR EACH ROW EXECUTE FUNCTION update_memories_fts();
+DROP TRIGGER IF EXISTS trg_documents_fts ON documents;
 CREATE TRIGGER trg_documents_fts BEFORE INSERT OR UPDATE OF content ON documents
     FOR EACH ROW EXECUTE FUNCTION update_documents_fts();
+DROP TRIGGER IF EXISTS trg_experiences_fts ON experiences;
 CREATE TRIGGER trg_experiences_fts BEFORE INSERT OR UPDATE OF goal, lessons_learned ON experiences
     FOR EACH ROW EXECUTE FUNCTION update_experiences_fts();

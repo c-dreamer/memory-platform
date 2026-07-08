@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
             model: config.embedding_model.clone(),
             nvidia_api_url: Some(config.nvidia_api_url.clone()),
             nvidia_api_key: Some(config.nvidia_api_key.clone()),
+            nvidia_embedding_model: config.nvidia_embedding_model.clone(),
             cache_size: config.embedding_cache_size,
         };
         match EmbeddingServiceFactory::new(embedding_config).await {

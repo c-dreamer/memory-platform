@@ -636,7 +636,7 @@ impl PostgresDb {
         let (text_col, extra_col) = Self::table_schema(table);
         let emb_text = vec_to_pgvector(embedding);
         let sql = format!(
-            "SELECT id, {text_col} AS content, {extra_col} AS source_info, \
+            "SELECT id, {text_col} AS content, COALESCE({extra_col}::TEXT, '') AS source_info, \
                     1 - (embedding <=> $1::vector) AS score \
              FROM {table} \
              WHERE embedding IS NOT NULL \
@@ -666,8 +666,8 @@ impl PostgresDb {
 
         // Try tsvector first
         let ts_sql = format!(
-            "SELECT id, {text_col} AS content, {extra_col} AS source_info, \
-                    ts_rank(fts, plainto_tsquery('english', $1), 32) AS score \
+            "SELECT id, {text_col} AS content, COALESCE({extra_col}::TEXT, '') AS source_info, \
+                    ts_rank(fts, plainto_tsquery('english', $1), 32)::FLOAT8 AS score \
              FROM {table} \
              WHERE fts @@ plainto_tsquery('english', $1) \
              ORDER BY score DESC \
@@ -685,8 +685,8 @@ impl PostgresDb {
             _ => {
                 // Fallback to trigram similarity
                 let pg_sql = format!(
-                    "SELECT id, {text_col} AS content, {extra_col} AS source_info, \
-                            similarity({text_col}, $1) AS score \
+                    "SELECT id, {text_col} AS content, COALESCE({extra_col}::TEXT, '') AS source_info, \
+                            similarity({text_col}, $1)::FLOAT8 AS score \
                      FROM {table} \
                      WHERE {text_col} % $1 \
                      ORDER BY score DESC \

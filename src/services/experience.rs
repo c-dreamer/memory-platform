@@ -155,7 +155,7 @@ impl ExperienceService {
         let sql = format!(
             "SELECT id, agent_id, session_id, goal, reasoning_summary, actions, \
                     files_changed, result, lessons_learned, confidence, \
-                    duration_seconds, tags, related_project, embedding, \
+                    duration_seconds, tags, related_project, embedding::TEXT AS embedding, \
                     is_procedurized, created_at \
              FROM experiences WHERE id IN ({})",
             placeholders.join(",")
