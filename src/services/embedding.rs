@@ -253,11 +253,41 @@ impl EmbeddingService for NvidiaNimEmbedding {
     }
 }
 
+/// Fallback embedding service — tries local (fastembed), falls back to NVIDIA NIM.
+#[derive(Debug)]
+pub struct FallbackEmbedding {
+    primary: EmbeddingServiceFactory,
+    fallback: EmbeddingServiceFactory,
+}
+
+impl FallbackEmbedding {
+    pub fn new(primary: EmbeddingServiceFactory, fallback: EmbeddingServiceFactory) -> Self {
+        Self { primary, fallback }
+    }
+}
+
+impl EmbeddingService for FallbackEmbedding {
+    fn embed(&self, text: &str) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>> {
+        let text = text.to_string();
+        let text2 = text.clone();
+        Box::pin(async move {
+            match self.primary.embed(&text).await {
+                Ok(emb) => Ok(emb),
+                Err(e) => {
+                    tracing::warn!("Primary embedding failed ({:?}), falling back to NVIDIA NIM", e);
+                    self.fallback.embed(&text2).await
+                }
+            }
+        })
+    }
+}
+
 /// Factory for embedding service.
 pub enum EmbeddingServiceFactory {
     #[cfg(feature = "fastembed")]
     Local(LocalEmbedding),
     Nvidia(NvidiaNimEmbedding),
+    Fallback(Box<FallbackEmbedding>),
 }
 
 impl fmt::Debug for EmbeddingServiceFactory {
@@ -266,19 +296,40 @@ impl fmt::Debug for EmbeddingServiceFactory {
             #[cfg(feature = "fastembed")]
             Self::Local(_) => f.debug_tuple("Local").finish(),
             Self::Nvidia(_) => f.debug_tuple("Nvidia").finish(),
+            Self::Fallback(_) => f.debug_tuple("Fallback").finish(),
         }
     }
 }
 
 impl EmbeddingServiceFactory {
     /// Create an embedding service based on configuration.
+    ///
+    /// When `model` is `"local"` with fastembed feature, and valid NVIDIA credentials
+    /// are available, returns a `FallbackEmbedding` (local primary, NVIDIA fallback).
+    /// When `model` is `"nvidia"`, uses NVIDIA NIM API directly.
     pub async fn new(config: EmbeddingConfig) -> Result<Self> {
         let cache_size = config.cache_size;
         match config.model.as_str() {
             "local" => {
                 #[cfg(feature = "fastembed")]
                 {
-                    Ok(Self::Local(LocalEmbedding::new(cache_size).await?))
+                    let local = LocalEmbedding::new(cache_size).await?;
+                    // If NVIDIA credentials are available, wrap in fallback
+                    if let (Some(url), Some(key)) = (config.nvidia_api_url, config.nvidia_api_key) {
+                        if !url.is_empty() && !key.is_empty() {
+                            let model_name = if config.nvidia_embedding_model.is_empty() {
+                                "nvidia/nv-embedqa-e5-v5".to_string()
+                            } else {
+                                config.nvidia_embedding_model.clone()
+                            };
+                            let nvidia = NvidiaNimEmbedding::new(url, key, model_name, cache_size);
+                            return Ok(Self::Fallback(Box::new(FallbackEmbedding::new(
+                                EmbeddingServiceFactory::Local(local),
+                                EmbeddingServiceFactory::Nvidia(nvidia),
+                            ))));
+                        }
+                    }
+                    Ok(Self::Local(local))
                 }
                 #[cfg(not(feature = "fastembed"))]
                 {
@@ -312,6 +363,7 @@ impl EmbeddingService for EmbeddingServiceFactory {
                 Box::pin(async move { service.embed(&text).await })
             }
             Self::Nvidia(service) => Box::pin(async move { service.embed(&text).await }),
+            Self::Fallback(service) => Box::pin(async move { service.embed(&text).await }),
         }
     }
 }
@@ -348,6 +400,7 @@ mod tests {
         let service = NvidiaNimEmbedding::new(
             "http://fake.url".to_string(),
             "fake-api-key".to_string(),
+            "nv-embed-qa".to_string(),
             1000,
         );
         let embedding = service.embed("").await.expect("Failed to embed");

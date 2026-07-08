@@ -230,13 +230,18 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
     };
 
     // Search across all four tables in parallel
-    let (memories, documents, experiences, trading) = tokio::try_join!(
+    let (memories, documents, experiences, trading) = match tokio::try_join!(
         state.search.hybrid_search("memories", &query, &embedding, search_mode, limit),
         state.search.hybrid_search("documents", &query, &embedding, search_mode, limit),
         state.search.hybrid_search("experiences", &query, &embedding, search_mode, limit),
         state.search.hybrid_search("trading_results", &query, &embedding, search_mode, limit),
-    )
-    .context("Search failed")?;
+    ) {
+        Ok(results) => results,
+        Err(e) => {
+            tracing::error!("Search failed: {:?}", e);
+            return Ok(json!({"error": format!("Search failed: {}", e)}).to_string());
+        }
+    };
 
     // Record cross-references if session_id was provided
     if let Some(sid) = session_id {
@@ -283,7 +288,7 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
     };
     let embedding_slice = embedding.as_deref();
 
-    let memory = state
+    let memory = match state
         .db
         .store_memory(
             &content,
@@ -296,7 +301,13 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
             embedding_slice,
         )
         .await
-        .context("Failed to store memory")?;
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("Failed to store memory: {:?}", e);
+            return Ok(json!({"error": format!("Failed to store memory: {}", e)}).to_string());
+        }
+    };
 
     // Record cross-reference if session_id was provided
     if let Some(sid) = session_id {

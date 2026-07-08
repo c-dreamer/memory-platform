@@ -29,13 +29,22 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(Config::from_env()?);
     tracing::info!("Loaded config");
 
-    // Connect to PostgreSQL
-    let db = Arc::new(PostgresDb::connect(config.as_ref()).await?);
-    tracing::info!("Connected to PostgreSQL");
-
-    // Run migrations
-    Migrator::run(&db.pool).await?;
-    tracing::info!("Database migrations completed");
+    // Connect to PostgreSQL, but keep the MCP server alive in degraded mode if
+    // the database is temporarily unreachable. Codex can still complete the
+    // handshake and use any tools that do not need live storage.
+    let db = match PostgresDb::connect(config.as_ref()).await {
+        Ok(db) => {
+            tracing::info!("Connected to PostgreSQL");
+            let db = Arc::new(db);
+            Migrator::run(&db.pool).await?;
+            tracing::info!("Database migrations completed");
+            db
+        }
+        Err(e) => {
+            tracing::warn!("PostgreSQL unavailable, starting MCP in degraded mode: {e}");
+            Arc::new(PostgresDb::new_empty())
+        }
+    };
 
     // Clone pool for services that need PgPool directly
     let pool = db.pool.clone();

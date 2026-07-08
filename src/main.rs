@@ -40,13 +40,21 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(config);
     tracing::info!("Configuration loaded");
 
-    // Connect to PostgreSQL
-    let db = Arc::new(PostgresDb::connect(&config).await?);
-    tracing::info!("PostgreSQL connected");
-
-    // Run database migrations
-    Migrator::run(&db.pool).await?;
-    tracing::info!("Database migrations applied");
+    // Connect to PostgreSQL, but keep the daemon alive in degraded mode if
+    // the database is temporarily unavailable.
+    let db = match PostgresDb::connect(&config).await {
+        Ok(db) => {
+            tracing::info!("PostgreSQL connected");
+            let db = Arc::new(db);
+            Migrator::run(&db.pool).await?;
+            tracing::info!("Database migrations applied");
+            db
+        }
+        Err(e) => {
+            tracing::warn!("PostgreSQL unavailable, starting in degraded mode: {e}");
+            Arc::new(PostgresDb::new_empty())
+        }
+    };
 
     // Connect to Redis (optional — warn on failure)
     let redis_cache = match RedisCache::connect(&config.redis_url).await {
@@ -84,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     // Build embedding service
     let embedding_config = EmbeddingConfig {
         model: config.embedding_model.clone(),
-        nvidia_api_url: if config.nvidia_api_key.is_empty() {
+        nvidia_api_url: if config.nvidia_api_url.is_empty() {
             None
         } else {
             Some(config.nvidia_api_url.clone())

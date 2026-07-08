@@ -318,7 +318,7 @@ impl PostgresDb {
         sqlx::query_as::<_, Memory>(
             "INSERT INTO memories (agent_id, session_id, content, content_type, embedding, importance, tags, metadata) \
              VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8) \
-             RETURNING id, agent_id, session_id, content, content_type, embedding, importance, tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at",
+             RETURNING id, agent_id, session_id, content, content_type, embedding::text as embedding, importance, tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at",
         )
         .bind(agent_id)
         .bind(session_id)
@@ -635,12 +635,18 @@ impl PostgresDb {
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
         let (text_col, extra_col) = Self::table_schema(table);
         let emb_text = vec_to_pgvector(embedding);
+        // Cast TEXT[] arrays to TEXT for source_info
+        let extra_col_sql = if extra_col == "tags" {
+            format!("array_to_string({extra_col}, ',')")
+        } else {
+            extra_col.to_string()
+        };
         let sql = format!(
-            "SELECT id, {text_col} AS content, COALESCE({extra_col}::TEXT, '') AS source_info, \
-                    1 - (embedding <=> $1::vector) AS score \
+            "SELECT id, COALESCE({text_col}, '') AS content, COALESCE({extra_col_sql}, '') AS source_info, \
+                    (1 - (embedding <=> $1::vector))::float8 AS score \
              FROM {table} \
              WHERE embedding IS NOT NULL \
-               AND 1 - (embedding <=> $1::vector) > $2 \
+               AND (1 - (embedding <=> $1::vector))::float8 > $2 \
              ORDER BY score DESC \
              LIMIT $3"
         );
@@ -663,42 +669,63 @@ impl PostgresDb {
         limit: i64,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
         let (text_col, extra_col) = Self::table_schema(table);
+        // Cast TEXT[] arrays to TEXT for source_info
+        let extra_col_sql = if extra_col == "tags" {
+            format!("array_to_string({extra_col}, ',')")
+        } else {
+            extra_col.to_string()
+        };
 
-        // Try tsvector first
-        let ts_sql = format!(
-            "SELECT id, {text_col} AS content, COALESCE({extra_col}::TEXT, '') AS source_info, \
-                    ts_rank(fts, plainto_tsquery('english', $1), 32)::FLOAT8 AS score \
+        // Check if table has fts column first
+        let has_fts = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = $1 AND column_name = 'fts'
+            )",
+        )
+        .bind(table)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+
+        if has_fts {
+            // Try tsvector first
+            let ts_sql = format!(
+                "SELECT id, COALESCE({text_col}, '') AS content, COALESCE({extra_col_sql}, '') AS source_info, \
+                        ts_rank(fts, plainto_tsquery('english', $1), 32)::float8 AS score \
+                 FROM {table} \
+                 WHERE fts @@ plainto_tsquery('english', $1) \
+                 ORDER BY score DESC \
+                 LIMIT $2"
+            );
+
+            let result = sqlx::query_as::<_, SearchResult>(&ts_sql)
+                .bind(query)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await;
+
+            match result {
+                Ok(rows) if !rows.is_empty() => return Ok(rows),
+                Ok(_) => {}, // empty results, fall through to trigram
+                Err(_) => {}, // error, fall through to trigram
+            }
+        }
+
+        // Fallback to trigram similarity
+        let pg_sql = format!(
+            "SELECT id, COALESCE({text_col}, '') AS content, COALESCE({extra_col_sql}, '') AS source_info, \
+                    similarity({text_col}, $1)::float8 AS score \
              FROM {table} \
-             WHERE fts @@ plainto_tsquery('english', $1) \
+             WHERE {text_col} % $1 \
              ORDER BY score DESC \
              LIMIT $2"
         );
-
-        let result = sqlx::query_as::<_, SearchResult>(&ts_sql)
+        sqlx::query_as::<_, SearchResult>(&pg_sql)
             .bind(query)
             .bind(limit)
             .fetch_all(&self.pool)
-            .await;
-
-        match result {
-            Ok(rows) if !rows.is_empty() => Ok(rows),
-            _ => {
-                // Fallback to trigram similarity
-                let pg_sql = format!(
-                    "SELECT id, {text_col} AS content, COALESCE({extra_col}::TEXT, '') AS source_info, \
-                            similarity({text_col}, $1)::FLOAT8 AS score \
-                     FROM {table} \
-                     WHERE {text_col} % $1 \
-                     ORDER BY score DESC \
-                     LIMIT $2"
-                );
-                sqlx::query_as::<_, SearchResult>(&pg_sql)
-                    .bind(query)
-                    .bind(limit)
-                    .fetch_all(&self.pool)
-                    .await
-            }
-        }
+            .await
     }
 
     /// Legacy trigram-based full-text search. Prefer `bm25_search`.
