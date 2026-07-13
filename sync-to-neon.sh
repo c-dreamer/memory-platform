@@ -14,7 +14,15 @@ if [[ -f "$(dirname "$0")/.env" ]]; then
 fi
 
 LOCAL_URL="${LOCAL_URL:-${DATABASE_URL:-}}"
+# NOTE: NEON_DATABASE_URL uses the pooler URL (-pooler suffix) which routes to
+# different compute instances and may not persist schema changes (DDL).
+# Derive NEON_DIRECT by removing -pooler from the hostname for DDL operations.
 NEON_DIRECT="${NEON_DIRECT:-${NEON_DATABASE_URL:-}}"
+# If NEON_DIRECT wasn't explicitly set and NEON_DATABASE_URL contains -pooler,
+# derive the direct URL by removing it.
+if [[ "$NEON_DIRECT" == *-pooler* ]]; then
+  NEON_DIRECT="$(echo "$NEON_DATABASE_URL" | sed 's/-pooler//')"
+fi
 
 if [[ -z "$LOCAL_URL" ]]; then
   echo "[sync-to-neon] ERROR: LOCAL_URL or DATABASE_URL must be set"
