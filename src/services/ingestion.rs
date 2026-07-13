@@ -15,7 +15,7 @@ use sqlx::PgPool;
 use walkdir::WalkDir;
 
 use crate::db::postgres::PostgresDb;
-use crate::models::Document;
+use crate::models::{Document, Experience, Memory, Session};
 use crate::services::embedding::EmbeddingService;
 
 /// Report produced after an ingestion run.
@@ -238,6 +238,127 @@ impl IngestionService {
             duration_ms,
         })
     }
+
+    /// Repair all rows with NULL embeddings across operational tables.
+    pub async fn repair_null_embeddings(&self) -> Result<IngestionReport> {
+        let start = Instant::now();
+        let mut rows_scanned: u64 = 0;
+        let mut rows_fixed: u64 = 0;
+        let mut errors: Vec<String> = Vec::new();
+
+        let memories: Vec<Memory> = sqlx::query_as::<_, Memory>(
+            "SELECT id, agent_id, session_id, content, content_type, embedding, importance, \
+                    tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at \
+             FROM memories WHERE embedding IS NULL ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.db.pool)
+        .await
+        .context("Failed to query memories with null embedding")?;
+        rows_scanned += memories.len() as u64;
+
+        for memory in &memories {
+            match self.embedder.embed(&memory.content).await {
+                Ok(embedding) => {
+                    let result = sqlx::query(
+                        "UPDATE memories SET embedding = $1::vector, updated_at = now() WHERE id = $2",
+                    )
+                    .bind(embedding.as_vec())
+                    .bind(memory.id)
+                    .execute(&self.db.pool)
+                    .await;
+
+                    match result {
+                        Ok(_) => {
+                            let _ = self
+                                .db
+                                .store_embedding("memories", memory.id, embedding.as_vec())
+                                .await;
+                            rows_fixed += 1;
+                        }
+                        Err(e) => errors.push(format!("memories/{}: {e}", memory.id)),
+                    }
+                }
+                Err(e) => errors.push(format!("memories/{} (embed): {e:#}", memory.id)),
+            }
+        }
+
+        let experiences: Vec<Experience> = sqlx::query_as::<_, Experience>(
+            "SELECT id, agent_id, session_id, goal, reasoning_summary, actions, files_changed, \
+                    result, lessons_learned, confidence, duration_seconds, tags, related_project, \
+                    embedding, is_procedurized, created_at \
+             FROM experiences WHERE embedding IS NULL ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.db.pool)
+        .await
+        .context("Failed to query experiences with null embedding")?;
+        rows_scanned += experiences.len() as u64;
+
+        for experience in &experiences {
+            let text = compose_experience_text(experience);
+            match self.embedder.embed(&text).await {
+                Ok(embedding) => {
+                    let result =
+                        sqlx::query("UPDATE experiences SET embedding = $1::vector WHERE id = $2")
+                            .bind(embedding.as_vec())
+                            .bind(experience.id)
+                            .execute(&self.db.pool)
+                            .await;
+
+                    match result {
+                        Ok(_) => {
+                            let _ = self
+                                .db
+                                .store_embedding("experiences", experience.id, embedding.as_vec())
+                                .await;
+                            rows_fixed += 1;
+                        }
+                        Err(e) => errors.push(format!("experiences/{}: {e}", experience.id)),
+                    }
+                }
+                Err(e) => errors.push(format!("experiences/{} (embed): {e:#}", experience.id)),
+            }
+        }
+
+        let sessions: Vec<Session> = sqlx::query_as::<_, Session>(
+            "SELECT id, agent_id, parent_session_id, goal, status, summary, embedding::TEXT as embedding, \
+                    started_at, ended_at, created_at, updated_at \
+             FROM sessions WHERE embedding IS NULL ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.db.pool)
+        .await
+        .context("Failed to query sessions with null embedding")?;
+        rows_scanned += sessions.len() as u64;
+
+        for session in &sessions {
+            let text = compose_session_text(session);
+            match self.embedder.embed(&text).await {
+                Ok(embedding) => {
+                    let result = sqlx::query(
+                        "UPDATE sessions SET embedding = $1::vector, updated_at = now() WHERE id = $2",
+                    )
+                    .bind(embedding.as_vec())
+                    .bind(session.id)
+                    .execute(&self.db.pool)
+                    .await;
+
+                    match result {
+                        Ok(_) => rows_fixed += 1,
+                        Err(e) => errors.push(format!("sessions/{}: {e}", session.id)),
+                    }
+                }
+                Err(e) => errors.push(format!("sessions/{} (embed): {e:#}", session.id)),
+            }
+        }
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        Ok(IngestionReport {
+            files_scanned: rows_scanned,
+            files_ingested: rows_fixed,
+            chunks_created: 0,
+            errors,
+            duration_ms,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +422,48 @@ fn parse_frontmatter(raw: &str) -> (serde_json::Value, String) {
     }
 
     (serde_json::Value::Object(map), body)
+}
+
+fn compose_session_text(session: &Session) -> String {
+    let mut parts = Vec::new();
+    if let Some(goal) = session.goal.as_deref() {
+        if !goal.trim().is_empty() {
+            parts.push(format!("goal: {goal}"));
+        }
+    }
+    if let Some(summary) = session.summary.as_deref() {
+        if !summary.trim().is_empty() {
+            parts.push(format!("summary: {summary}"));
+        }
+    }
+    if parts.is_empty() {
+        format!("session {}", session.id)
+    } else {
+        parts.join("\n")
+    }
+}
+
+fn compose_experience_text(experience: &Experience) -> String {
+    let mut parts = vec![format!("goal: {}", experience.goal)];
+    if let Some(summary) = experience.reasoning_summary.as_deref() {
+        if !summary.trim().is_empty() {
+            parts.push(format!("reasoning_summary: {summary}"));
+        }
+    }
+    if let Some(result) = experience.result.as_deref() {
+        if !result.trim().is_empty() {
+            parts.push(format!("result: {result}"));
+        }
+    }
+    if let Some(lessons) = experience.lessons_learned.as_deref() {
+        if !lessons.trim().is_empty() {
+            parts.push(format!("lessons_learned: {lessons}"));
+        }
+    }
+    if !experience.tags.is_empty() {
+        parts.push(format!("tags: {}", experience.tags.join(", ")));
+    }
+    parts.join("\n")
 }
 
 /// Chunk markdown body by `##` (H2) and `###` (H3) headers.

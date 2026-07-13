@@ -287,6 +287,21 @@ impl PostgresDb {
         Ok(())
     }
 
+    /// Update a session embedding in-place.
+    pub async fn update_session_embedding(
+        &self,
+        id: Uuid,
+        embedding: &[f32],
+    ) -> Result<(), sqlx::Error> {
+        let emb_text = vec_to_pgvector(embedding);
+        sqlx::query("UPDATE sessions SET embedding = $1::vector, updated_at = now() WHERE id = $2")
+            .bind(emb_text)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Get recently completed sessions.
     pub async fn get_recent_sessions(&self, limit: i64) -> Result<Vec<Session>, sqlx::Error> {
         sqlx::query_as::<_, Session>(

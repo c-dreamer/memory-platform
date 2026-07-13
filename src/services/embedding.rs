@@ -416,7 +416,7 @@ mod tests {
             .await
             .expect("Failed to create local embedding");
         let embedding = service.embed("test").await.expect("Failed to embed");
-        assert_eq!(embedding.as_vec().len(), 384);
+        assert_eq!(embedding.as_vec().len(), DEFAULT_EMBEDDING_DIM);
         assert!(embedding.as_vec().iter().any(|&x| x != 0.0));
     }
 

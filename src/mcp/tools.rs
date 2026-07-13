@@ -212,7 +212,10 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result
 async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
     let query = get_string(&args, "query")?;
     let limit = get_i64(&args, "limit").unwrap_or(10);
-    let session_id = args.get("session_id").and_then(|v| v.as_str()).and_then(|s| Uuid::parse_str(s).ok());
+    let session_id = args
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok());
 
     info!("memory_search: query='{query}', limit={limit}");
 
@@ -231,10 +234,18 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
 
     // Search across all four tables in parallel
     let (memories, documents, experiences, trading) = match tokio::try_join!(
-        state.search.hybrid_search("memories", &query, &embedding, search_mode, limit),
-        state.search.hybrid_search("documents", &query, &embedding, search_mode, limit),
-        state.search.hybrid_search("experiences", &query, &embedding, search_mode, limit),
-        state.search.hybrid_search("trading_results", &query, &embedding, search_mode, limit),
+        state
+            .search
+            .hybrid_search("memories", &query, &embedding, search_mode, limit),
+        state
+            .search
+            .hybrid_search("documents", &query, &embedding, search_mode, limit),
+        state
+            .search
+            .hybrid_search("experiences", &query, &embedding, search_mode, limit),
+        state
+            .search
+            .hybrid_search("trading_results", &query, &embedding, search_mode, limit),
     ) {
         Ok(results) => results,
         Err(e) => {
@@ -248,13 +259,19 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
         let pool = &state.db.pool;
         for m in &memories {
             let _ = sqlx::query("SELECT record_memory_access($1, $2, 'searched', $3)")
-                .bind(sid).bind(m.id).bind(m.score)
-                .execute(pool).await;
+                .bind(sid)
+                .bind(m.id)
+                .bind(m.score)
+                .execute(pool)
+                .await;
         }
         for d in &documents {
             let _ = sqlx::query("SELECT record_document_access($1, $2, 'searched', $3)")
-                .bind(sid).bind(d.id).bind(d.score)
-                .execute(pool).await;
+                .bind(sid)
+                .bind(d.id)
+                .bind(d.score)
+                .execute(pool)
+                .await;
         }
     }
 
@@ -274,7 +291,10 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
     let tags = get_string_array(&args, "tags").unwrap_or_default();
     let content_type = get_string(&args, "content_type").unwrap_or_else(|_| "note".to_string());
     let importance = get_f64(&args, "importance").unwrap_or(0.5);
-    let session_id = args.get("session_id").and_then(|v| v.as_str()).and_then(|s| Uuid::parse_str(s).ok());
+    let session_id = args
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok());
 
     info!("memory_store: type={content_type}, importance={importance}, tags={tags:?}");
 
@@ -333,7 +353,10 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
 /// 3. memory_context — get context package for a query.
 async fn tool_memory_context(state: &AppState, args: Value) -> Result<String> {
     let query = get_string(&args, "query")?;
-    let session_id = args.get("session_id").and_then(|v| v.as_str()).and_then(|s| Uuid::parse_str(s).ok());
+    let session_id = args
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok());
 
     info!("memory_context: query='{query}'");
 
@@ -353,13 +376,19 @@ async fn tool_memory_context(state: &AppState, args: Value) -> Result<String> {
         let pool = &state.db.pool;
         for m in &context.memories {
             let _ = sqlx::query("SELECT record_memory_access($1, $2, 'loaded', $3)")
-                .bind(sid).bind(m.id).bind(m.score)
-                .execute(pool).await;
+                .bind(sid)
+                .bind(m.id)
+                .bind(m.score)
+                .execute(pool)
+                .await;
         }
         for d in &context.documents {
             let _ = sqlx::query("SELECT record_document_access($1, $2, 'loaded', $3)")
-                .bind(sid).bind(d.id).bind(d.score)
-                .execute(pool).await;
+                .bind(sid)
+                .bind(d.id)
+                .bind(d.score)
+                .execute(pool)
+                .await;
         }
     }
 
@@ -369,7 +398,10 @@ async fn tool_memory_context(state: &AppState, args: Value) -> Result<String> {
 /// 4. memory_initialize — one-shot init: get context + format banner.
 async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String> {
     let goal = get_string(&args, "goal")?;
-    let session_id = args.get("session_id").and_then(|v| v.as_str()).and_then(|s| Uuid::parse_str(s).ok());
+    let session_id = args
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok());
 
     info!("memory_initialize: goal='{goal}'");
 
@@ -389,13 +421,19 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
         let pool = &state.db.pool;
         for m in &context.memories {
             let _ = sqlx::query("SELECT record_memory_access($1, $2, 'loaded', $3)")
-                .bind(sid).bind(m.id).bind(m.score)
-                .execute(pool).await;
+                .bind(sid)
+                .bind(m.id)
+                .bind(m.score)
+                .execute(pool)
+                .await;
         }
         for d in &context.documents {
             let _ = sqlx::query("SELECT record_document_access($1, $2, 'loaded', $3)")
-                .bind(sid).bind(d.id).bind(d.score)
-                .execute(pool).await;
+                .bind(sid)
+                .bind(d.id)
+                .bind(d.score)
+                .execute(pool)
+                .await;
         }
     }
 
@@ -410,9 +448,7 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
         && context.procedures.is_empty()
         && context.trading_results.is_empty()
     {
-        banner.push_str(
-            "  (no context found \u{2014} work will be stored for future reference)\n",
-        );
+        banner.push_str("  (no context found \u{2014} work will be stored for future reference)\n");
     } else {
         if !context.memories.is_empty() {
             banner.push_str(&format!("\nMemories ({}):\n", context.memories.len()));
@@ -436,10 +472,7 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
             }
         }
         if !context.experiences.is_empty() {
-            banner.push_str(&format!(
-                "\nExperiences ({}):\n",
-                context.experiences.len()
-            ));
+            banner.push_str(&format!("\nExperiences ({}):\n", context.experiences.len()));
             for e in &context.experiences {
                 banner.push_str(&format!(
                     "  - [score:{:.2}] {}\n",
@@ -462,10 +495,7 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
             }
         }
         if !context.procedures.is_empty() {
-            banner.push_str(&format!(
-                "\nProcedures ({}):\n",
-                context.procedures.len()
-            ));
+            banner.push_str(&format!("\nProcedures ({}):\n", context.procedures.len()));
             for p in &context.procedures {
                 banner.push_str(&format!("  - [used:{}] {}\n", p.times_used, p.name));
             }
@@ -576,8 +606,7 @@ async fn tool_procedure_run(state: &AppState, args: Value) -> Result<String> {
         }
     };
 
-    let procedure =
-        procedure.ok_or_else(|| anyhow::anyhow!("Procedure not found: {name}"))?;
+    let procedure = procedure.ok_or_else(|| anyhow::anyhow!("Procedure not found: {name}"))?;
 
     // Record execution
     state
@@ -610,6 +639,15 @@ async fn tool_session_start(state: &AppState, args: Value) -> Result<String> {
         .await
         .context("Failed to create session")?;
 
+    if let Some(svc) = &state.embedding_service {
+        if let Ok(embedding) = svc.embed(&format!("goal: {goal}")).await {
+            let _ = state
+                .db
+                .update_session_embedding(session.id, embedding.as_vec())
+                .await;
+        }
+    }
+
     let result = json!({
         "session_id": session.id,
         "goal": session.goal,
@@ -636,6 +674,16 @@ async fn tool_session_end(state: &AppState, args: Value) -> Result<String> {
         .await
         .context("Failed to end session")?;
 
+    if let Some(svc) = &state.embedding_service {
+        let text = format!("summary: {summary}");
+        if let Ok(embedding) = svc.embed(&text).await {
+            let _ = state
+                .db
+                .update_session_embedding(session_id, embedding.as_vec())
+                .await;
+        }
+    }
+
     let result = json!({
         "session_id": session_id,
         "status": "completed",
@@ -648,7 +696,10 @@ async fn tool_session_end(state: &AppState, args: Value) -> Result<String> {
 /// 9. recall — recall a memory or document by ID.
 async fn tool_recall(state: &AppState, args: Value) -> Result<String> {
     let id_str = get_string(&args, "id")?;
-    let session_id = args.get("session_id").and_then(|v| v.as_str()).and_then(|s| Uuid::parse_str(s).ok());
+    let session_id = args
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok());
 
     info!("recall: id='{id_str}'");
 
@@ -665,8 +716,10 @@ async fn tool_recall(state: &AppState, args: Value) -> Result<String> {
             let _ = state.db.record_memory_access(uuid).await;
             if let Some(sid) = session_id {
                 let _ = sqlx::query("SELECT record_memory_access($1, $2, 'loaded', NULL)")
-                    .bind(sid).bind(uuid)
-                    .execute(&state.db.pool).await;
+                    .bind(sid)
+                    .bind(uuid)
+                    .execute(&state.db.pool)
+                    .await;
             }
 
             return Ok(serde_json::to_string(&memory)?);
@@ -710,8 +763,10 @@ async fn tool_recall(state: &AppState, args: Value) -> Result<String> {
     {
         if let Some(sid) = session_id {
             let _ = sqlx::query("SELECT record_document_access($1, $2, 'loaded', NULL)")
-                .bind(sid).bind(doc.id)
-                .execute(&state.db.pool).await;
+                .bind(sid)
+                .bind(doc.id)
+                .execute(&state.db.pool)
+                .await;
         }
         return Ok(serde_json::to_string(&doc)?);
     }
@@ -722,8 +777,7 @@ async fn tool_recall(state: &AppState, args: Value) -> Result<String> {
 /// 10. forget — soft-delete a memory.
 async fn tool_forget(state: &AppState, args: Value) -> Result<String> {
     let id_str = get_string(&args, "id")?;
-    let id = Uuid::parse_str(&id_str)
-        .with_context(|| format!("Invalid ID: {id_str}"))?;
+    let id = Uuid::parse_str(&id_str).with_context(|| format!("Invalid ID: {id_str}"))?;
 
     info!("forget: id={id}");
 
@@ -892,7 +946,17 @@ async fn tool_session_context(state: &AppState, args: Value) -> Result<String> {
     info!("session_context: id={session_id}");
 
     // Use the get_session_context SQL function to fetch all context
-    let rows = sqlx::query_as::<_, (String, Uuid, String, Option<f64>, String, chrono::DateTime<chrono::Utc>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            Uuid,
+            String,
+            Option<f64>,
+            String,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
         "SELECT entity_type, entity_id, interaction_type, relevance_score, content, accessed_at \
          FROM get_session_context($1)",
     )
@@ -903,16 +967,18 @@ async fn tool_session_context(state: &AppState, args: Value) -> Result<String> {
 
     let entries: Vec<Value> = rows
         .into_iter()
-        .map(|(entity_type, entity_id, interaction_type, relevance_score, content, accessed_at)| {
-            json!({
-                "entity_type": entity_type,
-                "entity_id": entity_id,
-                "interaction_type": interaction_type,
-                "relevance_score": relevance_score,
-                "content_preview": truncate(&content, 200),
-                "accessed_at": accessed_at,
-            })
-        })
+        .map(
+            |(entity_type, entity_id, interaction_type, relevance_score, content, accessed_at)| {
+                json!({
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "interaction_type": interaction_type,
+                    "relevance_score": relevance_score,
+                    "content_preview": truncate(&content, 200),
+                    "accessed_at": accessed_at,
+                })
+            },
+        )
         .collect();
 
     let result = json!({
@@ -938,13 +1004,11 @@ fn get_string(args: &Value, key: &str) -> Result<String> {
 
 /// Extract an optional string array argument.
 fn get_string_array(args: &Value, key: &str) -> Option<Vec<String>> {
-    args.get(key)
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
+    args.get(key).and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    })
 }
 
 /// Extract an optional i64 argument.
@@ -959,9 +1023,7 @@ fn get_f64(args: &Value, key: &str) -> Option<f64> {
 
 /// Extract an optional usize argument.
 fn get_usize(args: &Value, key: &str) -> Option<usize> {
-    args.get(key)
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
+    args.get(key).and_then(|v| v.as_u64()).map(|n| n as usize)
 }
 
 /// Truncate a string to `max_len` characters, adding "..." if truncated.
@@ -1065,7 +1127,10 @@ mod tests {
                 tool.get("description").and_then(|v| v.as_str()).is_some(),
                 "Tool missing description"
             );
-            assert!(tool.get("inputSchema").is_some(), "Tool missing inputSchema");
+            assert!(
+                tool.get("inputSchema").is_some(),
+                "Tool missing inputSchema"
+            );
         }
     }
 
