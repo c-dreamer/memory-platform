@@ -2,12 +2,13 @@ services:
   postgres:
     image: pgvector/pgvector:pg17
     container_name: memory-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: memory
       POSTGRES_PASSWORD: password
       POSTGRES_DB: memory
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql
@@ -20,6 +21,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: memory-redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
     healthcheck:
@@ -31,6 +33,7 @@ services:
   neo4j:
     image: neo4j:latest
     container_name: memory-neo4j
+    restart: unless-stopped
     environment:
       NEO4J_AUTH: neo4j/password
     ports:
