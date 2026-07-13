@@ -9,6 +9,9 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- Trigram full-text search (for keyword fallback)
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
+-- UUID / random ID helpers
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- UUID generation
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 

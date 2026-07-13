@@ -36,9 +36,26 @@ impl Migrator {
 
         // Embedded migrations — version -> SQL mapping via include_str!
         let embedded: &[(&str, &str)] = &[
-            ("001_initial", include_str!("../../migrations/001_initial.sql")),
-            ("002_hybrid_decay_contradiction", include_str!("../../migrations/002_hybrid_decay_contradiction.sql")),
-            ("003_session_vault_xref", include_str!("../../migrations/003_session_vault_xref.sql")),
+            (
+                "001_initial",
+                include_str!("../../migrations/001_initial.sql"),
+            ),
+            (
+                "002_hybrid_decay_contradiction",
+                include_str!("../../migrations/002_hybrid_decay_contradiction.sql"),
+            ),
+            (
+                "003_session_vault_xref",
+                include_str!("../../migrations/003_session_vault_xref.sql"),
+            ),
+            (
+                "004_embeddings_unique_source",
+                include_str!("../../migrations/004_embeddings_unique_source.sql"),
+            ),
+            (
+                "005_embeddings_2048",
+                include_str!("../../migrations/005_embeddings_2048.sql"),
+            ),
         ];
 
         // Apply pending migrations in order
@@ -74,8 +91,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a reachable Postgres instance"]
     async fn test_migrations_table_creation() {
-        let database_url = env::var("DATABASE_URL")
-            .expect("DATABASE_URL is required for migration tests");
+        let database_url =
+            env::var("DATABASE_URL").expect("DATABASE_URL is required for migration tests");
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(&database_url)
