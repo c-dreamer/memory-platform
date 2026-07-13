@@ -1,4 +1,4 @@
-//! Embedding wrapper type for VECTOR(384) columns.
+//! Embedding wrapper type for VECTOR(2048) columns.
 //!
 //! PostgreSQL pgvector stores vectors as `'[x,y,z]'` text. This wrapper
 //! implements sqlx::Type and sqlx::Decode to read that format, and serde
@@ -6,9 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A 384-dimensional embedding vector.
+/// A 2048-dimensional embedding vector.
 ///
-/// Stored as `VECTOR(384)` in PostgreSQL (pgvector extension).
+/// Stored as `VECTOR(2048)` in PostgreSQL (pgvector extension).
 /// Serialized as `Vec<f32>` in JSON. sqlx reads the `'[x,y,z]'` text format.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Embedding(pub Vec<f32>);

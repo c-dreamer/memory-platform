@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     goal            TEXT,
     status          TEXT DEFAULT 'active',  -- 'active', 'completed', 'failed', 'abandoned'
     summary         TEXT,
-    embedding       VECTOR(384),
+    embedding       VECTOR(2048),
     started_at      TIMESTAMPTZ DEFAULT now(),
     ended_at        TIMESTAMPTZ,
     created_at      TIMESTAMPTZ DEFAULT now(),
@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS memories (
     session_id      UUID REFERENCES sessions(id) ON DELETE SET NULL,
     content         TEXT NOT NULL,
     content_type    TEXT DEFAULT 'note',    -- 'note', 'observation', 'insight', 'decision', 'error'
-    embedding       VECTOR(384),
+    embedding       VECTOR(2048),
     fts             TSVECTOR,               -- for BM25 full-text search
     importance      FLOAT DEFAULT 0.5,     -- 0.0 (trivial) to 1.0 (critical)
     tags            TEXT[] DEFAULT '{}',
@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS documents (
     content         TEXT NOT NULL,
     checksum        TEXT,
     frontmatter     JSONB DEFAULT '{}',
-    embedding       VECTOR(384),
+    embedding       VECTOR(2048),
     fts             TSVECTOR,
     token_count     INT,
     file_size_bytes INT,
@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS code_changes (
     files_changed   JSONB DEFAULT '[]',
     commit_hash     TEXT,
     branch          TEXT,
-    embedding       VECTOR(384),
+    embedding       VECTOR(2048),
     tags            TEXT[] DEFAULT '{}',
     created_at      TIMESTAMPTZ DEFAULT now()
 );
@@ -146,7 +146,7 @@ CREATE TABLE IF NOT EXISTS trading_results (
     indicators      JSONB DEFAULT '{}',
     inputs          JSONB DEFAULT '{}',
     notes           TEXT,
-    embedding       VECTOR(384),
+    embedding       VECTOR(2048),
     created_at      TIMESTAMPTZ DEFAULT now()
 );
 
@@ -167,7 +167,7 @@ CREATE TABLE IF NOT EXISTS experiences (
     duration_seconds INT,
     tags            TEXT[] DEFAULT '{}',
     related_project TEXT,
-    embedding       VECTOR(384),
+    embedding       VECTOR(2048),
     fts             TSVECTOR,
     is_procedurized BOOLEAN DEFAULT false,
     created_at      TIMESTAMPTZ DEFAULT now()
@@ -214,7 +214,7 @@ CREATE TABLE IF NOT EXISTS summaries (
     session_id      UUID REFERENCES sessions(id) ON DELETE CASCADE,
     source_type     TEXT,                   -- 'session', 'project', 'day'
     content         TEXT NOT NULL,
-    embedding       VECTOR(384),
+    embedding       VECTOR(2048),
     token_count     INT,
     created_at      TIMESTAMPTZ DEFAULT now()
 );
@@ -226,9 +226,9 @@ CREATE TABLE IF NOT EXISTS embeddings (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     source_table    TEXT NOT NULL,
     source_id       UUID NOT NULL,
-    embedding       VECTOR(384) NOT NULL,
-    model           TEXT DEFAULT 'sentence-transformers/all-MiniLM-L6-v2',
-    dimension       INT DEFAULT 384,
+    embedding       VECTOR(2048) NOT NULL,
+    model           TEXT DEFAULT 'nvidia/llama-nemotron-embed-1b-v2',
+    dimension       INT DEFAULT 2048,
     created_at      TIMESTAMPTZ DEFAULT now()
 );
 

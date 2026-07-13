@@ -1,8 +1,11 @@
-//! One-shot backfill: re-embed all documents with NULL embeddings via NVIDIA API.
+//! One-shot backfill: re-embed all documents with NULL embeddings.
 
 use anyhow::{Context, Result};
-use memory_platform::services::embedding::{EmbeddingConfig, EmbeddingService, EmbeddingServiceFactory};
+use memory_platform::services::embedding::{
+    EmbeddingConfig, EmbeddingService, EmbeddingServiceFactory,
+};
 use memory_platform::services::ingestion::IngestionService;
+use memory_platform::Config;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use tracing::info;
@@ -16,12 +19,8 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let db_url = std::env::var("DATABASE_URL")
-        .context("DATABASE_URL is required")?;
-    let nvidia_api_key = std::env::var("NVIDIA_API_KEY")
-        .context("NVIDIA_API_KEY is required")?;
-    let nvidia_api_url = std::env::var("NVIDIA_API_URL")
-        .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1/embeddings".into());
+    let config = Config::from_env().context("Failed to load config")?;
+    let db_url = config.database_url.clone();
 
     info!("Connecting to database...");
     let pool = PgPoolOptions::new()
@@ -31,17 +30,20 @@ async fn main() -> Result<()> {
         .context("Failed to connect to PostgreSQL")?;
 
     let embedding_config = EmbeddingConfig {
-        model: "nvidia".into(),
-        nvidia_api_url: Some(nvidia_api_url),
-        nvidia_api_key: Some(nvidia_api_key),
-        nvidia_embedding_model: "nvidia/nv-embed-v1".into(),
-        cache_size: 1000,
+        model: config.embedding_model.clone(),
+        nvidia_api_url: Some(config.nvidia_api_url.clone()),
+        nvidia_api_key: if config.nvidia_api_key.is_empty() {
+            None
+        } else {
+            Some(config.nvidia_api_key.clone())
+        },
+        nvidia_embedding_model: config.nvidia_embedding_model.clone(),
+        cache_size: config.embedding_cache_size,
     };
 
-    info!("Initializing NVIDIA embedding service...");
-    let embedder: Arc<dyn EmbeddingService> = Arc::new(
-        EmbeddingServiceFactory::new(embedding_config).await?
-    );
+    info!("Initializing embedding service...");
+    let embedder: Arc<dyn EmbeddingService> =
+        Arc::new(EmbeddingServiceFactory::new(embedding_config).await?);
 
     let ingestion = IngestionService::new(pool, embedder);
 

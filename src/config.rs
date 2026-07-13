@@ -18,8 +18,8 @@ pub enum ConfigError {
     },
 }
 
-/// Default embedding dimension used as fallback when Config is not available.
-pub const DEFAULT_EMBEDDING_DIM: usize = 384;
+/// Default embedding dimension for the active production embedding backend.
+pub const DEFAULT_EMBEDDING_DIM: usize = 2048;
 
 /// Application configuration loaded from environment variables.
 ///
@@ -389,7 +389,10 @@ mod tests {
         assert_eq!(cfg.chunk_size, 512);
         assert_eq!(cfg.chunk_overlap, 64);
         assert_eq!(cfg.max_chunks_per_doc, 100);
-        assert_eq!(cfg.nvidia_embedding_model, "nvidia/llama-nemotron-embed-1b-v2");
+        assert_eq!(
+            cfg.nvidia_embedding_model,
+            "nvidia/llama-nemotron-embed-1b-v2"
+        );
         assert_eq!(cfg.rust_log, "info");
         assert_eq!(cfg.embedding_cache_size, 1000);
     }

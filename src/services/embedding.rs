@@ -5,6 +5,7 @@
 //! - NVIDIA NIM API fallback
 //! - LRU cache (1000 entries)
 
+use crate::config::DEFAULT_EMBEDDING_DIM;
 use crate::models::embedding::Embedding;
 use anyhow::{Context, Result};
 #[cfg(feature = "fastembed")]
@@ -93,7 +94,7 @@ impl EmbeddingService for LocalEmbedding {
         let cache = Arc::clone(&self.cache);
         Box::pin(async move {
             if text.trim().is_empty() {
-                return Ok(Embedding::new(vec![0.0; 384]));
+                return Ok(Embedding::new(vec![0.0; DEFAULT_EMBEDDING_DIM]));
             }
 
             // Check cache first
@@ -117,7 +118,8 @@ impl EmbeddingService for LocalEmbedding {
             .await
             .context("Failed to spawn blocking task for embedding")??;
 
-            let embedding = Embedding::new(embedding.unwrap_or_else(|| vec![0.0; 384]));
+            let embedding =
+                Embedding::new(embedding.unwrap_or_else(|| vec![0.0; DEFAULT_EMBEDDING_DIM]));
 
             // Update cache
             {
@@ -170,6 +172,51 @@ impl NvidiaNimEmbedding {
 
         Ok(Embedding::new(embedding))
     }
+
+    async fn embed_remote_chunk(
+        client: &Client,
+        api_url: &str,
+        api_key: &str,
+        model: &str,
+        text: &str,
+    ) -> Result<Embedding> {
+        let resp = client
+            .post(api_url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .json(&serde_json::json!({
+                "input": text,
+                "model": model,
+                "input_type": "query",
+            }))
+            .send()
+            .await
+            .context("Failed to send request to NVIDIA NIM API")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let error_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("NVIDIA NIM API error ({}): {}", status, error_text);
+        }
+
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse NVIDIA NIM API response")?;
+
+        Self::parse_embedding_response(data)
+    }
+
+    fn split_for_embedding(text: &str, max_chars: usize) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() <= max_chars {
+            return vec![text.to_string()];
+        }
+
+        chars
+            .chunks(max_chars)
+            .map(|chunk| chunk.iter().collect())
+            .collect()
+    }
 }
 
 impl EmbeddingService for NvidiaNimEmbedding {
@@ -182,7 +229,7 @@ impl EmbeddingService for NvidiaNimEmbedding {
         let cache = Arc::clone(&self.cache);
         Box::pin(async move {
             if text.trim().is_empty() {
-                return Ok(Embedding::new(vec![0.0; 384]));
+                return Ok(Embedding::new(vec![0.0; DEFAULT_EMBEDDING_DIM]));
             }
 
             // Check cache first
@@ -193,41 +240,38 @@ impl EmbeddingService for NvidiaNimEmbedding {
                 }
             }
 
-            // Truncate to ~8192 tokens safe limit (~25K safe-chars for markdown-heavy text)
-            let truncated = if text.len() > 25000 {
-                let cutoff = text.char_indices().nth(8000).map(|(i, _)| i).unwrap_or(25000);
-                let mut t = text[..cutoff].to_string();
-                t.push_str("... [truncated]");
-                t
+            let chunks = Self::split_for_embedding(&text, 4000);
+            let embedding = if chunks.len() == 1 {
+                Self::embed_remote_chunk(&client, &api_url, &api_key, &model, &chunks[0]).await?
             } else {
-                text.clone()
+                let mut accumulator: Option<Vec<f32>> = None;
+                let mut count = 0usize;
+
+                for chunk in &chunks {
+                    let chunk_embedding =
+                        Self::embed_remote_chunk(&client, &api_url, &api_key, &model, chunk)
+                            .await?;
+                    let values = chunk_embedding.into_inner();
+
+                    if let Some(existing) = accumulator.as_mut() {
+                        for (dst, src) in existing.iter_mut().zip(values.iter()) {
+                            *dst += *src;
+                        }
+                    } else {
+                        accumulator = Some(values);
+                    }
+                    count += 1;
+                }
+
+                let mut values = accumulator.unwrap_or_else(|| vec![0.0; DEFAULT_EMBEDDING_DIM]);
+                if count > 1 {
+                    let scale = 1.0 / count as f32;
+                    for value in &mut values {
+                        *value *= scale;
+                    }
+                }
+                Embedding::new(values)
             };
-
-            // Call NVIDIA NIM API
-            let resp = client
-                .post(&api_url)
-                .header("Authorization", format!("Bearer {}", api_key))
-                .json(&serde_json::json!({
-                    "input": truncated,
-                    "model": model,
-                    "input_type": "query",
-                }))
-                .send()
-                .await
-                .context("Failed to send request to NVIDIA NIM API")?;
-
-            let status = resp.status();
-            if !status.is_success() {
-                let error_text = resp.text().await.unwrap_or_default();
-                anyhow::bail!("NVIDIA NIM API error ({}): {}", status, error_text);
-            }
-
-            let data: serde_json::Value = resp
-                .json()
-                .await
-                .context("Failed to parse NVIDIA NIM API response")?;
-
-            let embedding = Self::parse_embedding_response(data)?;
 
             // Update cache
             {
@@ -261,7 +305,10 @@ impl EmbeddingService for FallbackEmbedding {
             match self.primary.embed(&text).await {
                 Ok(emb) => Ok(emb),
                 Err(e) => {
-                    tracing::warn!("Primary embedding failed ({:?}), falling back to NVIDIA NIM", e);
+                    tracing::warn!(
+                        "Primary embedding failed ({:?}), falling back to NVIDIA NIM",
+                        e
+                    );
                     self.fallback.embed(&text2).await
                 }
             }
@@ -332,7 +379,10 @@ impl EmbeddingServiceFactory {
                     .nvidia_api_key
                     .context("NVIDIA API key is required for NVIDIA backend")?;
                 Ok(Self::Nvidia(NvidiaNimEmbedding::new(
-                    api_url, api_key, config.nvidia_embedding_model.clone(), cache_size,
+                    api_url,
+                    api_key,
+                    config.nvidia_embedding_model.clone(),
+                    cache_size,
                 )))
             }
             _ => anyhow::bail!("Unknown embedding model: {}", config.model),
@@ -373,12 +423,12 @@ mod tests {
     #[tokio::test]
     async fn test_nvidia_embedding() {
         let response = serde_json::json!({
-            "data": [{"embedding": vec![0.1_f64; 384]}]
+            "data": [{"embedding": vec![0.1_f64; DEFAULT_EMBEDDING_DIM]}]
         });
 
         let embedding = NvidiaNimEmbedding::parse_embedding_response(response)
             .expect("Failed to parse embedding");
-        assert_eq!(embedding.as_vec().len(), 384);
+        assert_eq!(embedding.as_vec().len(), DEFAULT_EMBEDDING_DIM);
         assert!(embedding.as_vec().iter().all(|x| x.is_finite()));
     }
 
@@ -391,7 +441,7 @@ mod tests {
             1000,
         );
         let embedding = service.embed("").await.expect("Failed to embed");
-        assert_eq!(embedding.as_vec().len(), 384);
+        assert_eq!(embedding.as_vec().len(), DEFAULT_EMBEDDING_DIM);
         assert!(embedding.as_vec().iter().all(|&x| x == 0.0));
     }
 }

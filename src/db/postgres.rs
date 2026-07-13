@@ -381,37 +381,73 @@ impl PostgresDb {
     ) -> Result<Uuid, sqlx::Error> {
         let emb_text = embedding.map(vec_to_pgvector);
 
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(path)
+            .execute(&mut *tx)
+            .await?;
+
         #[derive(sqlx::FromRow)]
         struct DocId {
             id: Uuid,
         }
 
-        let row: DocId = sqlx::query_as(
-            "INSERT INTO documents (path, vault_section, title, content, checksum, frontmatter, \
-                                    embedding, token_count, file_size_bytes, file_modified_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10) \
-             ON CONFLICT (path) DO UPDATE SET \
-                 content = EXCLUDED.content, \
-                 checksum = EXCLUDED.checksum, \
-                 embedding = EXCLUDED.embedding, \
-                 token_count = EXCLUDED.token_count, \
-                 file_size_bytes = EXCLUDED.file_size_bytes, \
-                 file_modified_at = EXCLUDED.file_modified_at, \
-                 updated_at = now() \
-             RETURNING id",
-        )
-        .bind(path)
-        .bind(vault_section)
-        .bind(title)
-        .bind(content)
-        .bind(checksum)
-        .bind(frontmatter)
-        .bind(emb_text)
-        .bind(token_count)
-        .bind(file_size_bytes)
-        .bind(file_modified_at)
-        .fetch_one(&self.pool)
-        .await?;
+        let existing: Option<DocId> =
+            sqlx::query_as("SELECT id FROM documents WHERE path = $1 LIMIT 1")
+                .bind(path)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        let row = if let Some(existing) = existing {
+            sqlx::query(
+                "UPDATE documents SET \
+                     vault_section = $1, \
+                     title = $2, \
+                     content = $3, \
+                     checksum = $4, \
+                     frontmatter = $5, \
+                     embedding = $6::vector, \
+                     token_count = $7, \
+                     file_size_bytes = $8, \
+                     file_modified_at = $9, \
+                     updated_at = now() \
+                 WHERE id = $10",
+            )
+            .bind(vault_section)
+            .bind(title)
+            .bind(content)
+            .bind(checksum)
+            .bind(frontmatter)
+            .bind(emb_text.as_deref())
+            .bind(token_count)
+            .bind(file_size_bytes)
+            .bind(file_modified_at)
+            .bind(existing.id)
+            .execute(&mut *tx)
+            .await?;
+            existing
+        } else {
+            sqlx::query_as(
+                "INSERT INTO documents (path, vault_section, title, content, checksum, frontmatter, \
+                                        embedding, token_count, file_size_bytes, file_modified_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9, $10) \
+                 RETURNING id",
+            )
+            .bind(path)
+            .bind(vault_section)
+            .bind(title)
+            .bind(content)
+            .bind(checksum)
+            .bind(frontmatter)
+            .bind(emb_text.as_deref())
+            .bind(token_count)
+            .bind(file_size_bytes)
+            .bind(file_modified_at)
+            .fetch_one(&mut *tx)
+            .await?
+        };
+
+        tx.commit().await?;
 
         match embedding {
             Some(embedding) => {
@@ -494,7 +530,8 @@ impl PostgresDb {
         .await?;
 
         if let Some(embedding) = embedding {
-            self.store_embedding("trading_results", row.id, embedding).await?;
+            self.store_embedding("trading_results", row.id, embedding)
+                .await?;
         }
 
         Ok(row)
@@ -538,7 +575,8 @@ impl PostgresDb {
         .await?;
 
         if let Some(embedding) = embedding {
-            self.store_embedding("experiences", row.id, embedding).await?;
+            self.store_embedding("experiences", row.id, embedding)
+                .await?;
         }
 
         Ok(row)
@@ -737,8 +775,8 @@ impl PostgresDb {
 
             match result {
                 Ok(rows) if !rows.is_empty() => return Ok(rows),
-                Ok(_) => {}, // empty results, fall through to trigram
-                Err(_) => {}, // error, fall through to trigram
+                Ok(_) => {}  // empty results, fall through to trigram
+                Err(_) => {} // error, fall through to trigram
             }
         }
 
@@ -991,7 +1029,13 @@ impl PostgresDb {
                     memory_id_a: memory_id,
                     memory_id_b: mem.id,
                     content_a: content.chars().take(200).collect(),
-                    content_b: mem.content.as_deref().unwrap_or("").chars().take(200).collect(),
+                    content_b: mem
+                        .content
+                        .as_deref()
+                        .unwrap_or("")
+                        .chars()
+                        .take(200)
+                        .collect(),
                     similarity: (mem.score * 1000.0).round() / 1000.0,
                     contradiction_type: "semantic".into(),
                 });
