@@ -12,6 +12,7 @@ use crate::config::DEFAULT_EMBEDDING_DIM;
 use crate::db::postgres::{CreateExperience, PostgresDb};
 use crate::models::Experience;
 use crate::search::SearchEngine;
+use crate::services::embedding::EmbeddingService;
 
 /// Confidence delta applied on successful reuse.
 const SUCCESS_DELTA: f64 = 0.05;
@@ -27,16 +28,37 @@ const DECAY_HALF_LIFE_DAYS: f64 = 30.0;
 const DECAY_MIN_SCORE: f64 = 0.1;
 
 /// Service for experience retrieval, recording, and confidence management.
-#[derive(Debug)]
 pub struct ExperienceService {
     pool: PgPool,
     search: Arc<SearchEngine>,
+    embedding_service: Option<Arc<dyn EmbeddingService>>,
+}
+
+impl std::fmt::Debug for ExperienceService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExperienceService")
+            .field("pool", &self.pool)
+            .field("search", &self.search)
+            .field(
+                "embedding_service",
+                &self.embedding_service.as_ref().map(|_| "(EmbeddingService)"),
+            )
+            .finish()
+    }
 }
 
 impl ExperienceService {
     #[must_use]
-    pub fn new(pool: PgPool, search: Arc<SearchEngine>) -> Self {
-        Self { pool, search }
+    pub fn new(
+        pool: PgPool,
+        search: Arc<SearchEngine>,
+        embedding_service: Option<Arc<dyn EmbeddingService>>,
+    ) -> Self {
+        Self {
+            pool,
+            search,
+            embedding_service,
+        }
     }
 
     /// Find past experiences relevant to a query.
@@ -82,7 +104,15 @@ impl ExperienceService {
         let db = PostgresDb {
             pool: self.pool.clone(),
         };
-        db.store_experience(&data, None)
+
+        let embedding = if let Some(service) = &self.embedding_service {
+            let text = compose_experience_text(&data);
+            Some(service.embed(&text).await?.into_inner())
+        } else {
+            None
+        };
+
+        db.store_experience(&data, embedding.as_deref())
             .await
             .context("Failed to store experience")
             .map_err(Into::into)
@@ -172,6 +202,29 @@ impl ExperienceService {
             .context("Failed to fetch experiences by IDs")
             .map_err(Into::into)
     }
+}
+
+fn compose_experience_text(data: &CreateExperience) -> String {
+    let mut parts = vec![format!("goal: {}", data.goal)];
+    if let Some(summary) = data.reasoning_summary.as_deref() {
+        if !summary.trim().is_empty() {
+            parts.push(format!("reasoning_summary: {summary}"));
+        }
+    }
+    if let Some(result) = data.result.as_deref() {
+        if !result.trim().is_empty() {
+            parts.push(format!("result: {result}"));
+        }
+    }
+    if let Some(lessons) = data.lessons_learned.as_deref() {
+        if !lessons.trim().is_empty() {
+            parts.push(format!("lessons_learned: {lessons}"));
+        }
+    }
+    if !data.tags.is_empty() {
+        parts.push(format!("tags: {}", data.tags.join(", ")));
+    }
+    parts.join("\n")
 }
 
 #[cfg(test)]

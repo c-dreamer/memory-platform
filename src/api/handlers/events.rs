@@ -1,32 +1,63 @@
-use axum::{Json, extract::State};
+use axum::{extract::State, Json};
 use std::sync::Arc;
 
-use crate::AppState;
 use crate::api::auth::Auth;
 use crate::api::dto::{EventCreate, EventResponse};
-use uuid::Uuid;
+use crate::AppState;
 use serde_json::json;
+use uuid::Uuid;
 
 pub async fn ingest_event(
     _auth: Auth,
     State(state): State<Arc<AppState>>,
     Json(body): Json<EventCreate>,
 ) -> Json<EventResponse> {
-    tracing::info!("ingest_event called: agent_id={:?}, type={:?}", body.agent_id, body.event_type);
-    
+    tracing::info!(
+        "ingest_event called: agent_id={:?}, type={:?}",
+        body.agent_id,
+        body.event_type
+    );
+
     // Parse session_id if provided
     let session_id = body.session_id.and_then(|s| Uuid::parse_str(&s).ok());
     let agent_id = body.agent_id.and_then(|s| Uuid::parse_str(&s).ok());
 
     // Build content from event
-    let summary = body.payload.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-    let details = body.payload.get("details").and_then(|v| v.as_str()).unwrap_or("");
+    let summary = body
+        .payload
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let details = body
+        .payload
+        .get("details")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let content = format!("{}\n\n{}", summary, details).trim().to_string();
 
-    let event_type = if body.event_type.is_empty() { "task_complete".to_string() } else { body.event_type.clone() };
-    
-    tracing::info!("Storing event as memory: content_len={}, event_type={}", content.len(), event_type);
-    
+    let event_type = if body.event_type.is_empty() {
+        "task_complete".to_string()
+    } else {
+        body.event_type.clone()
+    };
+
+    tracing::info!(
+        "Storing event as memory: content_len={}, event_type={}",
+        content.len(),
+        event_type
+    );
+
+    let embedding = match &state.embedding_service {
+        Some(svc) => match svc.embed(&content).await {
+            Ok(emb) => Some(emb.as_vec().to_vec()),
+            Err(e) => {
+                tracing::warn!("Failed to embed event content: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+
     // Store as a memory with event metadata
     let memory = state
         .db
@@ -38,7 +69,7 @@ pub async fn ingest_event(
             &json!(body.payload),
             agent_id,
             session_id,
-            None,
+            embedding.as_deref(),
         )
         .await;
 

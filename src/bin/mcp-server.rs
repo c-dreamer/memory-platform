@@ -11,7 +11,9 @@ use memory_platform::migrations::Migrator;
 use memory_platform::search::SearchEngine;
 use memory_platform::services::context::ContextService;
 use memory_platform::services::decay::DecayEngine;
-use memory_platform::services::embedding::{EmbeddingConfig, EmbeddingService, EmbeddingServiceFactory};
+use memory_platform::services::embedding::{
+    EmbeddingConfig, EmbeddingService, EmbeddingServiceFactory,
+};
 use memory_platform::services::experience::ExperienceService;
 use memory_platform::services::procedure::ProcedureService;
 
@@ -72,7 +74,11 @@ async fn main() -> anyhow::Result<()> {
 
     let context_service = Arc::new(ContextService::new(pool.clone(), Arc::clone(&search)));
     let decay_engine = Arc::new(DecayEngine::new(Arc::clone(&config)));
-    let experience_service = Arc::new(ExperienceService::new(pool.clone(), Arc::clone(&search)));
+    let experience_service = Arc::new(ExperienceService::new(
+        pool.clone(),
+        Arc::clone(&search),
+        embedding_service.clone(),
+    ));
     let procedure_service = Arc::new(ProcedureService::new(pool.clone()));
 
     // Build AppState
@@ -96,7 +102,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("MCP server ready");
 
     // Enter JSON-RPC listen loop
-    server.listen(tokio::io::stdin(), tokio::io::stdout()).await?;
+    server
+        .listen(tokio::io::stdin(), tokio::io::stdout())
+        .await?;
 
     Ok(())
 }

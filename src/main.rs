@@ -124,7 +124,11 @@ async fn main() -> anyhow::Result<()> {
 
     let context_service = Arc::new(ContextService::new(db.pool.clone(), Arc::clone(&search)));
 
-    let experience_service = Arc::new(ExperienceService::new(db.pool.clone(), Arc::clone(&search)));
+    let experience_service = Arc::new(ExperienceService::new(
+        db.pool.clone(),
+        Arc::clone(&search),
+        embedding_service.clone(),
+    ));
 
     let procedure_service = Arc::new(ProcedureService::new(db.pool.clone()));
 
