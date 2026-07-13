@@ -12,8 +12,13 @@ if [[ -f "$REPO_DIR/.env" ]]; then
   set +a
 fi
 
-LOCAL_URL="${LOCAL_URL:-${DATABASE_URL:-postgresql://memory:YAft44tZyrG4DET0WeigY8BpZ%2BcqGgPtTXsPK4XFgXc%3D@127.0.0.1:5433/memory}}"
+LOCAL_URL="${LOCAL_URL:-${DATABASE_URL:-}}"
 NEON_URL="${NEON_URL:-${NEON_DATABASE_URL:-}}"
+
+if [[ -z "$LOCAL_URL" ]]; then
+  echo "[rehydrate] ERROR: LOCAL_URL or DATABASE_URL must be set"
+  exit 1
+fi
 
 if [[ -z "$NEON_URL" ]]; then
   echo "[rehydrate] ERROR: NEON_URL or NEON_DATABASE_URL must be set"

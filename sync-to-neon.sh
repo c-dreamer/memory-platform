@@ -13,8 +13,13 @@ if [[ -f "$(dirname "$0")/.env" ]]; then
   set +a
 fi
 
-LOCAL_URL="${LOCAL_URL:-${DATABASE_URL:-postgres://memory:YAft44tZyrG4DET0WeigY8BpZ%252BcqGgPtTXsPK4XFgXc%253D@127.0.0.1:5433/memory}}"
+LOCAL_URL="${LOCAL_URL:-${DATABASE_URL:-}}"
 NEON_DIRECT="${NEON_DIRECT:-${NEON_DATABASE_URL:-}}"
+
+if [[ -z "$LOCAL_URL" ]]; then
+  echo "[sync-to-neon] ERROR: LOCAL_URL or DATABASE_URL must be set"
+  exit 1
+fi
 
 if [[ -z "$NEON_DIRECT" ]]; then
   echo "[sync-to-neon] ERROR: NEON_DIRECT or NEON_DATABASE_URL must be set"

@@ -315,7 +315,7 @@ impl PostgresDb {
     ) -> Result<Memory, sqlx::Error> {
         let emb_text = embedding.map(vec_to_pgvector);
 
-        sqlx::query_as::<_, Memory>(
+        let row = sqlx::query_as::<_, Memory>(
             "INSERT INTO memories (agent_id, session_id, content, content_type, embedding, importance, tags, metadata) \
              VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8) \
              RETURNING id, agent_id, session_id, content, content_type, embedding::text as embedding, importance, tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at",
@@ -329,7 +329,13 @@ impl PostgresDb {
         .bind(tags)
         .bind(metadata)
         .fetch_one(&self.pool)
-        .await
+        .await?;
+
+        if let Some(embedding) = embedding {
+            self.store_embedding("memories", row.id, embedding).await?;
+        }
+
+        Ok(row)
     }
 
     /// Get a memory by UUID (excludes fts column since it's #[sqlx(skip)]).
@@ -407,6 +413,15 @@ impl PostgresDb {
         .fetch_one(&self.pool)
         .await?;
 
+        match embedding {
+            Some(embedding) => {
+                self.store_embedding("documents", row.id, embedding).await?;
+            }
+            None => {
+                self.delete_embedding("documents", row.id).await?;
+            }
+        }
+
         Ok(row.id)
     }
 
@@ -447,7 +462,7 @@ impl PostgresDb {
     ) -> Result<TradingResult, sqlx::Error> {
         let emb_text = embedding.map(vec_to_pgvector);
 
-        sqlx::query_as::<_, TradingResult>(
+        let row = sqlx::query_as::<_, TradingResult>(
             "INSERT INTO trading_results (agent_id, ea_version, strategy, symbol, timeframe, \
                 trade_type, direction, entry_price, exit_price, profit_factor, drawdown, \
                 win_rate, total_trades, net_profit, duration_days, indicators, inputs, notes, embedding) \
@@ -476,7 +491,13 @@ impl PostgresDb {
         .bind(&data.notes)
         .bind(emb_text)
         .fetch_one(&self.pool)
-        .await
+        .await?;
+
+        if let Some(embedding) = embedding {
+            self.store_embedding("trading_results", row.id, embedding).await?;
+        }
+
+        Ok(row)
     }
 
     // ------------------------------------------------------------------
@@ -491,7 +512,7 @@ impl PostgresDb {
     ) -> Result<Experience, sqlx::Error> {
         let emb_text = embedding.map(vec_to_pgvector);
 
-        sqlx::query_as::<_, Experience>(
+        let row = sqlx::query_as::<_, Experience>(
             "INSERT INTO experiences (agent_id, session_id, goal, reasoning_summary, actions, \
                 files_changed, result, lessons_learned, confidence, duration_seconds, tags, \
                 related_project, embedding) \
@@ -514,7 +535,13 @@ impl PostgresDb {
         .bind(&data.related_project)
         .bind(emb_text)
         .fetch_one(&self.pool)
-        .await
+        .await?;
+
+        if let Some(embedding) = embedding {
+            self.store_embedding("experiences", row.id, embedding).await?;
+        }
+
+        Ok(row)
     }
 
     /// Find pairs of similar successful experiences via cross-join vector comparison.
@@ -637,22 +664,25 @@ impl PostgresDb {
         let emb_text = vec_to_pgvector(embedding);
         // Cast TEXT[] arrays to TEXT for source_info
         let extra_col_sql = if extra_col == "tags" {
-            format!("array_to_string({extra_col}, ',')")
+            format!("array_to_string(s.{extra_col}, ',')")
         } else {
-            extra_col.to_string()
+            format!("s.{extra_col}")
         };
         let sql = format!(
-            "SELECT id, COALESCE({text_col}, '') AS content, COALESCE({extra_col_sql}, '') AS source_info, \
-                    (1 - (embedding <=> $1::vector))::float8 AS score \
-             FROM {table} \
-             WHERE embedding IS NOT NULL \
-               AND (1 - (embedding <=> $1::vector))::float8 > $2 \
+            "SELECT s.id, COALESCE(s.{text_col}, '') AS content, COALESCE({extra_col_sql}, '') AS source_info, \
+                    (1 - (e.embedding <=> $1::vector))::float8 AS score \
+             FROM embeddings e \
+             INNER JOIN {table} s ON s.id = e.source_id \
+             WHERE e.source_table = $2 \
+               AND e.embedding IS NOT NULL \
+               AND (1 - (e.embedding <=> $1::vector))::float8 > $3 \
              ORDER BY score DESC \
-             LIMIT $3"
+             LIMIT $4"
         );
 
         sqlx::query_as::<_, SearchResult>(&sql)
             .bind(&emb_text)
+            .bind(table)
             .bind(threshold)
             .bind(limit)
             .fetch_all(&self.pool)
@@ -1029,23 +1059,37 @@ impl PostgresDb {
         source_table: &str,
         source_id: Uuid,
         embedding: &[f32],
-        model: &str,
     ) -> Result<(), sqlx::Error> {
         let emb_text = vec_to_pgvector(embedding);
         let dimension = embedding.len() as i32;
 
         sqlx::query(
-            "INSERT INTO embeddings (source_table, source_id, embedding, model, dimension) \
-             VALUES ($1, $2, $3::vector, $4, $5) \
-             ON CONFLICT DO NOTHING",
+            "INSERT INTO embeddings (source_table, source_id, embedding, dimension) \
+             VALUES ($1, $2, $3::vector, $4) \
+             ON CONFLICT (source_table, source_id) DO UPDATE SET \
+                 embedding = EXCLUDED.embedding, \
+                 dimension = EXCLUDED.dimension",
         )
         .bind(source_table)
         .bind(source_id)
         .bind(&emb_text)
-        .bind(model)
         .bind(dimension)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Delete a stored embedding for a source row.
+    pub async fn delete_embedding(
+        &self,
+        source_table: &str,
+        source_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM embeddings WHERE source_table = $1 AND source_id = $2")
+            .bind(source_table)
+            .bind(source_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
