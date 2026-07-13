@@ -197,39 +197,70 @@ pub async fn sync_vault(
             "imported_at": imported_at.to_rfc3339(),
         });
 
-        let result = sqlx::query(
-            "INSERT INTO documents (path, vault_section, title, content, checksum, \
-             token_count, file_size_bytes, file_modified_at, frontmatter) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-             ON CONFLICT (path) DO UPDATE SET \
-             vault_section = EXCLUDED.vault_section, \
-             title = EXCLUDED.title, \
-             content = EXCLUDED.content, \
-             checksum = EXCLUDED.checksum, \
-             token_count = EXCLUDED.token_count, \
-             file_size_bytes = EXCLUDED.file_size_bytes, \
-             file_modified_at = EXCLUDED.file_modified_at, \
-             frontmatter = EXCLUDED.frontmatter, \
-             updated_at = now()",
-        )
-        .bind(&file_path)
-        .bind(&vault_section)
-        .bind(&title)
-        .bind(&file.content)
-        .bind(&file.checksum)
-        .bind(token_count)
-        .bind(file.content.len() as i32)
-        .bind(file_modified_at)
-        .bind(&meta)
-        .execute(pool)
-        .await;
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(&file_path)
+            .execute(&mut *tx)
+            .await?;
+
+        let existing: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT id FROM documents WHERE path = $1 LIMIT 1")
+                .bind(&file_path)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        let result = if let Some(doc_id) = existing {
+            sqlx::query(
+                "UPDATE documents SET \
+                 vault_section = $1, \
+                 title = $2, \
+                 content = $3, \
+                 checksum = $4, \
+                 token_count = $5, \
+                 file_size_bytes = $6, \
+                 file_modified_at = $7, \
+                 frontmatter = $8, \
+                 updated_at = now() \
+                 WHERE id = $9",
+            )
+            .bind(&vault_section)
+            .bind(&title)
+            .bind(&file.content)
+            .bind(&file.checksum)
+            .bind(token_count)
+            .bind(file.content.len() as i32)
+            .bind(file_modified_at)
+            .bind(&meta)
+            .bind(doc_id)
+            .execute(&mut *tx)
+            .await
+        } else {
+            sqlx::query(
+                "INSERT INTO documents (path, vault_section, title, content, checksum, \
+                 token_count, file_size_bytes, file_modified_at, frontmatter) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            )
+            .bind(&file_path)
+            .bind(&vault_section)
+            .bind(&title)
+            .bind(&file.content)
+            .bind(&file.checksum)
+            .bind(token_count)
+            .bind(file.content.len() as i32)
+            .bind(file_modified_at)
+            .bind(&meta)
+            .execute(&mut *tx)
+            .await
+        };
 
         match result {
             Ok(_) => {
+                tx.commit().await?;
                 info!("Imported: {file_path}");
                 summary.imported += 1;
             }
             Err(e) => {
+                tx.rollback().await.ok();
                 let err_msg = format!("Failed to import {}: {e}", file.path.display());
                 warn!("{err_msg}");
                 summary.errors.push(err_msg);
