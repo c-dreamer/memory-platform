@@ -68,7 +68,7 @@ pub struct CreateExperience {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SearchResult {
     pub id: Uuid,
-    pub content: String,
+    pub content: Option<String>,
     pub source_info: String,
     pub score: f64,
 }
@@ -258,7 +258,7 @@ impl PostgresDb {
         sqlx::query_as::<_, Session>(
             "INSERT INTO sessions (agent_id, goal, parent_session_id) \
              VALUES ($1, $2, $3) \
-             RETURNING id, agent_id, parent_session_id, goal, status, summary, embedding, started_at, ended_at, created_at, updated_at",
+             RETURNING id, agent_id, parent_session_id, goal, status, summary, embedding::TEXT as embedding, started_at, ended_at, created_at, updated_at",
         )
         .bind(agent_id)
         .bind(goal)
@@ -318,7 +318,7 @@ impl PostgresDb {
         let row = sqlx::query_as::<_, Memory>(
             "INSERT INTO memories (agent_id, session_id, content, content_type, embedding, importance, tags, metadata) \
              VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8) \
-             RETURNING id, agent_id, session_id, content, content_type, embedding::text as embedding, importance, tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at",
+             RETURNING id, agent_id, session_id, content, content_type, embedding::TEXT as embedding, importance, tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at",
         )
         .bind(agent_id)
         .bind(session_id)
@@ -341,7 +341,7 @@ impl PostgresDb {
     /// Get a memory by UUID (excludes fts column since it's #[sqlx(skip)]).
     pub async fn get_memory(&self, id: Uuid) -> Result<Option<Memory>, sqlx::Error> {
         sqlx::query_as::<_, Memory>(
-            "SELECT id, agent_id, session_id, content, content_type, embedding, importance, tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at FROM memories WHERE id = $1",
+            "SELECT id, agent_id, session_id, content, content_type, embedding::TEXT as embedding, importance, tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at FROM memories WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -428,7 +428,7 @@ impl PostgresDb {
     /// Get a document by path (lightweight — only id, path, checksum).
     pub async fn get_document_by_path(&self, path: &str) -> Result<Option<Document>, sqlx::Error> {
         sqlx::query_as::<_, Document>(
-            "SELECT id, path, vault_section, title, content, checksum, frontmatter, embedding, token_count, file_size_bytes, file_modified_at, created_at, updated_at FROM documents WHERE path = $1",
+            "SELECT id, path, vault_section, title, content, checksum, frontmatter, embedding::TEXT as embedding, token_count, file_size_bytes, file_modified_at, created_at, updated_at FROM documents WHERE path = $1",
         )
         .bind(path)
         .fetch_optional(&self.pool)
@@ -442,7 +442,7 @@ impl PostgresDb {
         limit: i64,
     ) -> Result<Vec<Document>, sqlx::Error> {
         sqlx::query_as::<_, Document>(
-            "SELECT id, path, vault_section, title, content, checksum, frontmatter, embedding, token_count, file_size_bytes, file_modified_at, created_at, updated_at FROM documents WHERE vault_section = $1 ORDER BY updated_at DESC LIMIT $2",
+            "SELECT id, path, vault_section, title, content, checksum, frontmatter, embedding::TEXT as embedding, token_count, file_size_bytes, file_modified_at, created_at, updated_at FROM documents WHERE vault_section = $1 ORDER BY updated_at DESC LIMIT $2",
         )
         .bind(section)
         .bind(limit)
@@ -830,7 +830,7 @@ impl PostgresDb {
                 r.id,
                 RrfEntry {
                     id: r.id,
-                    content: r.content.clone(),
+                    content: r.content.clone().unwrap_or_default(),
                     source_info: r.source_info.clone(),
                     rrf_score,
                     vec_rank: Some(rank as i32 + 1),
@@ -848,7 +848,7 @@ impl PostgresDb {
                 })
                 .or_insert(RrfEntry {
                     id: r.id,
-                    content: r.content.clone(),
+                    content: r.content.clone().unwrap_or_default(),
                     source_info: r.source_info.clone(),
                     rrf_score: kw_score,
                     vec_rank: None,
@@ -975,7 +975,7 @@ impl PostgresDb {
                 continue;
             }
 
-            let existing_lower = mem.content.to_lowercase();
+            let existing_lower = mem.content.as_deref().unwrap_or("").to_lowercase();
             let mut signals = 0;
 
             for &(a, b) in NEGATION_PAIRS {
@@ -991,7 +991,7 @@ impl PostgresDb {
                     memory_id_a: memory_id,
                     memory_id_b: mem.id,
                     content_a: content.chars().take(200).collect(),
-                    content_b: mem.content.chars().take(200).collect(),
+                    content_b: mem.content.as_deref().unwrap_or("").chars().take(200).collect(),
                     similarity: (mem.score * 1000.0).round() / 1000.0,
                     contradiction_type: "semantic".into(),
                 });

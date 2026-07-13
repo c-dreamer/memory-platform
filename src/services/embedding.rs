@@ -155,25 +155,12 @@ impl NvidiaNimEmbedding {
     }
 
     fn parse_embedding_response(data: serde_json::Value) -> Result<Embedding> {
-        let embedding: Vec<f32> = data["data"][0]["embedding"]
+        let mut embedding: Vec<f32> = data["data"][0]["embedding"]
             .as_array()
             .context("Invalid embedding format in NVIDIA NIM API response")?
             .iter()
             .map(|v| v.as_f64().unwrap_or_default() as f32)
             .collect();
-
-        // Ensure dimension is 384 (truncate/pad if needed)
-        let len = embedding.len();
-        let mut embedding = if len > 384 {
-            embedding.into_iter().take(384).collect()
-        } else if len < 384 {
-            embedding
-                .into_iter()
-                .chain(std::iter::repeat(0.0).take(384 - len))
-                .collect()
-        } else {
-            embedding
-        };
 
         // Normalize embedding
         let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();

@@ -265,12 +265,9 @@ CREATE TABLE IF NOT EXISTS config (
 -- INDEXES
 -- ============================================================
 
--- Vector indexes (IVFFlat with appropriate list sizes)
-CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-CREATE INDEX IF NOT EXISTS idx_documents_embedding ON documents USING ivfflat (embedding vector_cosine_ops) WITH (lists = 50);
-CREATE INDEX IF NOT EXISTS idx_experiences_embedding ON experiences USING ivfflat (embedding vector_cosine_ops) WITH (lists = 50);
-CREATE INDEX IF NOT EXISTS idx_summaries_embedding ON summaries USING ivfflat (embedding vector_cosine_ops) WITH (lists = 50);
-CREATE INDEX IF NOT EXISTS idx_embeddings_vector ON embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+-- Vector indexes — skipped because pgvector's IVFFlat/HNSW only support ≤2000 dims
+-- and this deployment uses 2048-dim NVIDIA embeddings. Exact search with <=> suffices
+-- at current data volumes (~1500 rows per table).
 
 -- Full-text search indexes (BM25 via tsvector)
 CREATE INDEX IF NOT EXISTS idx_memories_fts ON memories USING gin(fts);

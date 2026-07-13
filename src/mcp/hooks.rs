@@ -139,7 +139,7 @@ pub fn format_context_banner(context: &ContextPackage) -> String {
                 lines.push(format!(
                     "  - [score:{:.2}] {}",
                     m.score,
-                    truncate_str(&m.content, 120)
+                    truncate_str(m.content.as_deref().unwrap_or(""), 120)
                 ));
             }
         }
@@ -150,7 +150,7 @@ pub fn format_context_banner(context: &ContextPackage) -> String {
                 lines.push(format!(
                     "  - [score:{:.2}] {} ({})",
                     d.score,
-                    truncate_str(&d.content, 120),
+                    truncate_str(d.content.as_deref().unwrap_or(""), 120),
                     d.source_info
                 ));
             }
@@ -165,7 +165,7 @@ pub fn format_context_banner(context: &ContextPackage) -> String {
                 lines.push(format!(
                     "  - [score:{:.2}] {}",
                     e.score,
-                    truncate_str(&e.content, 120)
+                    truncate_str(e.content.as_deref().unwrap_or(""), 120)
                 ));
             }
         }

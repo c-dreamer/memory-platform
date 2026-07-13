@@ -420,7 +420,7 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
                 banner.push_str(&format!(
                     "  - [score:{:.2}] {}\n",
                     m.score,
-                    truncate(&m.content, 120)
+                    truncate(m.content.as_deref().unwrap_or(""), 120)
                 ));
             }
         }
@@ -430,7 +430,7 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
                 banner.push_str(&format!(
                     "  - [score:{:.2}] {} ({})\n",
                     d.score,
-                    truncate(&d.content, 120),
+                    truncate(d.content.as_deref().unwrap_or(""), 120),
                     d.source_info
                 ));
             }
@@ -444,7 +444,7 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
                 banner.push_str(&format!(
                     "  - [score:{:.2}] {}\n",
                     e.score,
-                    truncate(&e.content, 120)
+                    truncate(e.content.as_deref().unwrap_or(""), 120)
                 ));
             }
         }

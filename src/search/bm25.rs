@@ -40,7 +40,7 @@ impl Bm25Search {
             .into_iter()
             .map(|r| SearchResult {
                 id: r.id,
-                content: r.content,
+                content: r.content.unwrap_or_default(),
                 score: r.score,
                 source_info: r.source_info,
                 vec_rank: None,
