@@ -35,7 +35,7 @@ pub struct Config {
     pub neo4j_password: String,
 
     // --- API ---
-    pub(crate) api_key: String,
+    pub api_key: String,
     pub api_port: u16,
 
     // --- Embeddings ---
@@ -144,7 +144,7 @@ impl Config {
             embedding_model: env_var("EMBEDDING_MODEL").unwrap_or_else(|| "local".into()),
             embedding_dim: parse_env("EMBEDDING_DIM", 384)?,
             nvidia_api_url: env_var("NVIDIA_API_URL")
-                .unwrap_or_else(|| "https://api.nvcf.nvidia.com/v2/nvcf/pexec/functions".into()),
+                .unwrap_or_else(|| "https://integrate.api.nvidia.com/v1/embeddings".into()),
             nvidia_api_key: env_var("NVIDIA_API_KEY").unwrap_or_default(),
             openai_api_key: env_var("OPENAI_API_KEY").unwrap_or_default(),
 
@@ -205,7 +205,7 @@ impl Default for Config {
             api_port: 8000,
             embedding_model: "local".into(),
             embedding_dim: 384,
-            nvidia_api_url: "https://api.nvcf.nvidia.com/v2/nvcf/pexec/functions".into(),
+            nvidia_api_url: "https://integrate.api.nvidia.com/v1/embeddings".into(),
             nvidia_api_key: String::new(),
             openai_api_key: String::new(),
             vault_path: "/vault".into(),

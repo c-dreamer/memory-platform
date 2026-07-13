@@ -362,7 +362,7 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "fastembed")]
     async fn test_local_embedding() {
-        let service = LocalEmbedding::new()
+        let service = LocalEmbedding::new(1000)
             .await
             .expect("Failed to create local embedding");
         let embedding = service.embed("test").await.expect("Failed to embed");
