@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use sqlx::Row;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -161,6 +162,11 @@ pub fn list_tools() -> Value {
             }
         },
         {
+            "name": "archive_status",
+            "description": "Read-only archive health: verified bundles, archived records, restore state, and pending sync queue.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        },
+        {
             "name": "session_context",
             "description": "Get all documents and memories accessed in a session. Returns a chronological list with interaction types and relevance scores.",
             "inputSchema": {
@@ -199,6 +205,7 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result
         "forget" => tool_forget(state, arguments).await,
         "list" => tool_list(state, arguments).await,
         "status" => tool_status(state, arguments).await,
+        "archive_status" => tool_archive_status(state, arguments).await,
         "session_context" => tool_session_context(state, arguments).await,
         _ => Err(anyhow::anyhow!("Unknown tool: {name}")),
     }
@@ -935,6 +942,34 @@ async fn tool_status(state: &AppState, _args: Value) -> Result<String> {
     });
 
     Ok(serde_json::to_string(&result)?)
+}
+
+/// Read-only cold-archive and durable-sync health for MCP clients.
+async fn tool_archive_status(state: &AppState, _args: Value) -> Result<String> {
+    let tiers = sqlx::query("SELECT storage_tier, count(*) FROM documents GROUP BY storage_tier")
+        .fetch_all(&state.db.pool)
+        .await
+        .context("Failed to read document archive tiers")?;
+    let tier_counts: Vec<Value> = tiers
+        .into_iter()
+        .map(|row| json!({"tier": row.get::<String, _>(0), "count": row.get::<i64, _>(1)}))
+        .collect();
+    let bundles = sqlx::query("SELECT archive_id, state, verified_at FROM archive_meta.bundles ORDER BY created_at DESC LIMIT 10")
+        .fetch_all(&state.db.pool)
+        .await
+        .context("Failed to read archive bundle status")?;
+    let bundle_status: Vec<Value> = bundles.into_iter().map(|row| json!({
+        "archive_id": row.get::<Uuid, _>(0), "state": row.get::<String, _>(1),
+        "verified_at": row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(2).ok().flatten(),
+    })).collect();
+    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_meta.outbox")
+        .fetch_one(&state.db.pool)
+        .await
+        .context("Failed to read sync queue depth")?;
+    Ok(
+        json!({"document_tiers": tier_counts, "bundles": bundle_status, "pending_sync": pending})
+            .to_string(),
+    )
 }
 
 /// 13. session_context — get all documents and memories accessed in a session.

@@ -1,0 +1,9 @@
+[Unit]
+Description=Verify memory archive manifests and checksums
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/memory-platform
+EnvironmentFile=-%h/memory-platform/.env
+ExecStart=%h/memory-platform/scripts/verify-memory-archive.sh

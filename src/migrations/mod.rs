@@ -36,9 +36,38 @@ impl Migrator {
 
         // Embedded migrations — version -> SQL mapping via include_str!
         let embedded: &[(&str, &str)] = &[
-            ("001_initial", include_str!("../../migrations/001_initial.sql")),
-            ("002_hybrid_decay_contradiction", include_str!("../../migrations/002_hybrid_decay_contradiction.sql")),
-            ("003_session_vault_xref", include_str!("../../migrations/003_session_vault_xref.sql")),
+            (
+                "001_initial",
+                include_str!("../../migrations/001_initial.sql"),
+            ),
+            (
+                "002_hybrid_decay_contradiction",
+                include_str!("../../migrations/002_hybrid_decay_contradiction.sql"),
+            ),
+            (
+                "003_session_vault_xref",
+                include_str!("../../migrations/003_session_vault_xref.sql"),
+            ),
+            (
+                "004_embeddings_unique_source",
+                include_str!("../../migrations/004_embeddings_unique_source.sql"),
+            ),
+            (
+                "005_embeddings_2048",
+                include_str!("../../migrations/005_embeddings_2048.sql"),
+            ),
+            (
+                "006_updated_at_triggers",
+                include_str!("../../migrations/006_updated_at_triggers.sql"),
+            ),
+            (
+                "007_code_changes_embedding_2048",
+                include_str!("../../migrations/007_code_changes_embedding_2048.sql"),
+            ),
+            (
+                "008_storage_tiers_and_archive",
+                include_str!("../../migrations/008_storage_tiers_and_archive.sql"),
+            ),
         ];
 
         // Apply pending migrations in order
