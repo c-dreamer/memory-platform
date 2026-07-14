@@ -22,6 +22,10 @@ path = "src/bin/vault-sync.rs"
 name = "ingest"
 path = "src/bin/ingest.rs"
 
+[[bin]]
+name = "neon-sync"
+path = "src/bin/neon-sync.rs"
+
 [lib]
 name = "memory_platform"
 path = "src/lib.rs"

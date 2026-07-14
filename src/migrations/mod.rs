@@ -56,6 +56,18 @@ impl Migrator {
                 "005_embeddings_2048",
                 include_str!("../../migrations/005_embeddings_2048.sql"),
             ),
+            (
+                "006_updated_at_triggers",
+                include_str!("../../migrations/006_updated_at_triggers.sql"),
+            ),
+            (
+                "007_code_changes_embedding_2048",
+                include_str!("../../migrations/007_code_changes_embedding_2048.sql"),
+            ),
+            (
+                "008_storage_tiers_and_archive",
+                include_str!("../../migrations/008_storage_tiers_and_archive.sql"),
+            ),
         ];
 
         // Apply pending migrations in order
