@@ -1142,10 +1142,10 @@ mod tests {
     }
 
     #[test]
-    fn list_tools_returns_13_tools() {
+    fn list_tools_returns_14_tools() {
         let tools = list_tools();
         let arr = tools.as_array().expect("tools should be an array");
-        assert_eq!(arr.len(), 13, "Expected 13 tools");
+        assert_eq!(arr.len(), 14, "Expected 14 tools");
     }
 
     #[test]

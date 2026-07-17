@@ -72,6 +72,10 @@ impl Migrator {
                 "009_sync_key_uniqueness",
                 include_str!("../../migrations/009_sync_key_uniqueness.sql"),
             ),
+            (
+                "010_session_source_keys",
+                include_str!("../../migrations/010_session_source_keys.sql"),
+            ),
         ];
 
         // Apply pending migrations in order

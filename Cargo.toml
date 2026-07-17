@@ -54,7 +54,7 @@ sha2 = "0.10"
 hex = "0.4"
 regex = "1"
 walkdir = "2"
-pulldown-cmark = { version = "0.13", optional = true }
+pulldown-cmark = "0.13"
 fastembed = { version = "5", optional = true }
 once_cell = "1"
 async-trait = "0.1"
@@ -67,7 +67,7 @@ mockito = { version = "1.4", default-features = false }
 default = ["neo4j", "markdown"]
 neo4j = ["dep:neo4rs"]
 fastembed = ["dep:fastembed"]
-markdown = ["dep:pulldown-cmark"]
+markdown = []
 transport-http = []
 
 [profile.release]

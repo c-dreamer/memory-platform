@@ -103,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
             Some(config.nvidia_api_key.clone())
         },
         nvidia_embedding_model: config.nvidia_embedding_model.clone(),
+        expected_dimension: config.embedding_dim,
         cache_size: config.embedding_cache_size,
     };
     let embedding_service: Option<Arc<dyn memory_platform::services::embedding::EmbeddingService>> =

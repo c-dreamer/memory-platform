@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
             Some(config.nvidia_api_key.clone())
         },
         nvidia_embedding_model: config.nvidia_embedding_model.clone(),
+        expected_dimension: config.embedding_dim,
         cache_size: config.embedding_cache_size,
     };
 

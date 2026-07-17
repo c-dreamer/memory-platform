@@ -1,10 +1,12 @@
 //! Embedding service — local model (fastembed) or NVIDIA NIM API.
 //!
 //! Provides async embedding generation with:
-//! - Local ONNX model (all-MiniLM-L6-v2, 384-dim)
+//! - Local ONNX model (validated against the configured production dimension)
 //! - NVIDIA NIM API fallback
 //! - LRU cache (1000 entries)
 
+#[cfg(test)]
+use crate::config::DEFAULT_EMBEDDING_DIM;
 use crate::models::embedding::Embedding;
 use anyhow::{Context, Result};
 #[cfg(feature = "fastembed")]
@@ -16,6 +18,7 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(feature = "fastembed")]
 use std::sync::Mutex as BlockingMutex;
 use tokio::sync::Mutex;
@@ -37,6 +40,8 @@ pub struct EmbeddingConfig {
     pub nvidia_api_key: Option<String>,
     /// NVIDIA embedding model name (e.g., "nvidia/nv-embed-v1").
     pub nvidia_embedding_model: String,
+    /// Required output dimension. Provider responses are rejected if this differs.
+    pub expected_dimension: usize,
     /// LRU cache size (number of entries).
     pub cache_size: usize,
 }
@@ -46,6 +51,7 @@ pub struct EmbeddingConfig {
 pub struct LocalEmbedding {
     model: Arc<BlockingMutex<TextEmbedding>>,
     cache: Arc<Mutex<LruCache<String, Embedding>>>,
+    expected_dimension: usize,
 }
 
 #[cfg(feature = "fastembed")]
@@ -63,7 +69,7 @@ impl fmt::Debug for LocalEmbedding {
 #[cfg(feature = "fastembed")]
 impl LocalEmbedding {
     /// Create a new local embedding backend.
-    pub async fn new(cache_size: usize) -> Result<Self> {
+    pub async fn new(cache_size: usize, expected_dimension: usize) -> Result<Self> {
         let cache = Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(1000).unwrap()),
         )));
@@ -81,6 +87,7 @@ impl LocalEmbedding {
         Ok(Self {
             model: Arc::new(BlockingMutex::new(model)),
             cache,
+            expected_dimension,
         })
     }
 }
@@ -91,6 +98,7 @@ impl EmbeddingService for LocalEmbedding {
         let text = text.to_string();
         let model = Arc::clone(&self.model);
         let cache = Arc::clone(&self.cache);
+        let expected_dimension = self.expected_dimension;
         Box::pin(async move {
             if text.trim().is_empty() {
                 anyhow::bail!("cannot embed empty text")
@@ -120,6 +128,9 @@ impl EmbeddingService for LocalEmbedding {
             let embedding = Embedding::new(
                 embedding.context("Embedding backend returned no vector")?,
             );
+            if embedding.as_vec().len() != expected_dimension {
+                anyhow::bail!("local embedding provider returned {} dimensions; expected {}", embedding.as_vec().len(), expected_dimension);
+            }
 
             // Update cache
             {
@@ -139,30 +150,39 @@ pub struct NvidiaNimEmbedding {
     api_url: String,
     api_key: String,
     model: String,
+    expected_dimension: usize,
     cache: Arc<Mutex<LruCache<String, Embedding>>>,
 }
 
 impl NvidiaNimEmbedding {
     /// Create a new NVIDIA NIM embedding backend.
-    pub fn new(api_url: String, api_key: String, model: String, cache_size: usize) -> Self {
+    pub fn new(api_url: String, api_key: String, model: String, cache_size: usize, expected_dimension: usize) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("valid embedding HTTP client configuration"),
             api_url,
             api_key,
             model,
+            expected_dimension,
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(1000).unwrap()),
             ))),
         }
     }
 
-    fn parse_embedding_response(data: serde_json::Value) -> Result<Embedding> {
+    fn parse_embedding_response(data: serde_json::Value, expected_dimension: usize) -> Result<Embedding> {
         let mut embedding: Vec<f32> = data["data"][0]["embedding"]
             .as_array()
             .context("Invalid embedding format in NVIDIA NIM API response")?
             .iter()
             .map(|v| v.as_f64().unwrap_or_default() as f32)
             .collect();
+
+        if embedding.len() != expected_dimension {
+            anyhow::bail!("embedding provider returned {} dimensions; expected {}", embedding.len(), expected_dimension);
+        }
 
         // Normalize embedding
         let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -178,6 +198,7 @@ impl NvidiaNimEmbedding {
         api_url: &str,
         api_key: &str,
         model: &str,
+        expected_dimension: usize,
         text: &str,
     ) -> Result<Embedding> {
         let resp = client
@@ -203,7 +224,7 @@ impl NvidiaNimEmbedding {
             .await
             .context("Failed to parse NVIDIA NIM API response")?;
 
-        Self::parse_embedding_response(data)
+        Self::parse_embedding_response(data, expected_dimension)
     }
 
     fn split_for_embedding(text: &str, max_chars: usize) -> Vec<String> {
@@ -226,6 +247,7 @@ impl EmbeddingService for NvidiaNimEmbedding {
         let api_url = self.api_url.clone();
         let api_key = self.api_key.clone();
         let model = self.model.clone();
+        let expected_dimension = self.expected_dimension;
         let cache = Arc::clone(&self.cache);
         Box::pin(async move {
             if text.trim().is_empty() {
@@ -242,16 +264,17 @@ impl EmbeddingService for NvidiaNimEmbedding {
 
             let chunks = Self::split_for_embedding(&text, 4000);
             let embedding = if chunks.len() == 1 {
-                Self::embed_remote_chunk(&client, &api_url, &api_key, &model, &chunks[0]).await?
+                Self::embed_remote_chunk(&client, &api_url, &api_key, &model, expected_dimension, &chunks[0]).await?
             } else {
                 let mut accumulator: Option<Vec<f32>> = None;
                 let mut count = 0usize;
 
                 for chunk in &chunks {
                     let chunk_embedding =
-                        Self::embed_remote_chunk(&client, &api_url, &api_key, &model, chunk)
+                        Self::embed_remote_chunk(&client, &api_url, &api_key, &model, expected_dimension, chunk)
                             .await?;
                     let values = chunk_embedding.into_inner();
+                    if values.len() != expected_dimension { anyhow::bail!("embedding chunk dimension mismatch") }
 
                     if let Some(existing) = accumulator.as_mut() {
                         for (dst, src) in existing.iter_mut().zip(values.iter()) {
@@ -342,12 +365,13 @@ impl EmbeddingServiceFactory {
     /// are available, returns a `FallbackEmbedding` (local primary, NVIDIA fallback).
     /// When `model` is `"nvidia"`, uses NVIDIA NIM API directly.
     pub async fn new(config: EmbeddingConfig) -> Result<Self> {
-        let cache_size = config.cache_size;
+        let cache_size = config.cache_size.max(1);
+        let expected_dimension = config.expected_dimension.max(1);
         match config.model.as_str() {
             "local" => {
                 #[cfg(feature = "fastembed")]
                 {
-                    let local = LocalEmbedding::new(cache_size).await?;
+                    let local = LocalEmbedding::new(cache_size, expected_dimension).await?;
                     // If NVIDIA credentials are available, wrap in fallback
                     if let (Some(url), Some(key)) = (config.nvidia_api_url, config.nvidia_api_key) {
                         if !url.is_empty() && !key.is_empty() {
@@ -356,7 +380,7 @@ impl EmbeddingServiceFactory {
                             } else {
                                 config.nvidia_embedding_model.clone()
                             };
-                            let nvidia = NvidiaNimEmbedding::new(url, key, model_name, cache_size);
+                            let nvidia = NvidiaNimEmbedding::new(url, key, model_name, cache_size, expected_dimension);
                             return Ok(Self::Fallback(Box::new(FallbackEmbedding::new(
                                 EmbeddingServiceFactory::Local(local),
                                 EmbeddingServiceFactory::Nvidia(nvidia),
@@ -383,6 +407,7 @@ impl EmbeddingServiceFactory {
                     api_key,
                     config.nvidia_embedding_model.clone(),
                     cache_size,
+                    expected_dimension,
                 )))
             }
             _ => anyhow::bail!("Unknown embedding model: {}", config.model),
@@ -426,7 +451,7 @@ mod tests {
             "data": [{"embedding": vec![0.1_f64; DEFAULT_EMBEDDING_DIM]}]
         });
 
-        let embedding = NvidiaNimEmbedding::parse_embedding_response(response)
+        let embedding = NvidiaNimEmbedding::parse_embedding_response(response, DEFAULT_EMBEDDING_DIM)
             .expect("Failed to parse embedding");
         assert_eq!(embedding.as_vec().len(), DEFAULT_EMBEDDING_DIM);
         assert!(embedding.as_vec().iter().all(|x| x.is_finite()));
@@ -439,9 +464,8 @@ mod tests {
             "fake-api-key".to_string(),
             "nv-embed-qa".to_string(),
             1000,
+            DEFAULT_EMBEDDING_DIM,
         );
-        let embedding = service.embed("").await.expect("Failed to embed");
-        assert_eq!(embedding.as_vec().len(), DEFAULT_EMBEDDING_DIM);
-        assert!(embedding.as_vec().iter().all(|&x| x == 0.0));
+        assert!(service.embed("").await.is_err());
     }
 }

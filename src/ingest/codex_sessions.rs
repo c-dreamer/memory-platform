@@ -326,7 +326,8 @@ pub async fn ingest_codex_sessions(
             Ok(_) => {
                 let started_at = session_summary.timestamp.unwrap_or(file.modified_at);
                 let mem_session_id = engine
-                    .insert_session(
+                    .upsert_source_session(
+                        &format!("codex:{session_id}"),
                         &title,
                         "completed",
                         Some(&format!(

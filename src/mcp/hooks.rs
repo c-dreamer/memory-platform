@@ -283,7 +283,7 @@ mod tests {
         let mut ctx = empty_context();
         ctx.memories.push(SearchResult {
             id: Uuid::new_v4(),
-            content: "Rust is memory-safe without a garbage collector".into(),
+            content: Some("Rust is memory-safe without a garbage collector".into()),
             source_info: "rust,memory".into(),
             score: 0.95,
         });

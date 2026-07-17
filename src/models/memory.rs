@@ -70,7 +70,7 @@ mod tests {
             session_id: None,
             content: "Test memory".into(),
             content_type: "note".into(),
-            embedding: Some(Embedding::new(vec![0.5; 384])),
+            embedding: Some(Embedding::new(vec![0.5; 2048])),
             fts: None,
             importance: 0.5,
             tags: vec![],
