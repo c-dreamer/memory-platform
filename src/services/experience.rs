@@ -8,7 +8,6 @@ use anyhow::Context;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::config::DEFAULT_EMBEDDING_DIM;
 use crate::db::postgres::{CreateExperience, PostgresDb};
 use crate::models::Experience;
 use crate::search::SearchEngine;
@@ -73,7 +72,7 @@ impl ExperienceService {
         // Use a zero embedding for keyword-only search when no embedder is wired.
         // The SearchEngine's hybrid mode will still run BM25 which is sufficient
         // for experience retrieval by goal text.
-        let dummy_embedding = vec![0.0_f32; DEFAULT_EMBEDDING_DIM];
+        let dummy_embedding = Vec::new();
         let results = self
             .search
             .hybrid_search(

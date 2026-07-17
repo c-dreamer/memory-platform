@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::config::DEFAULT_EMBEDDING_DIM;
 use crate::db::postgres::PostgresDb;
 use crate::db::postgres::ContextPackage;
 
@@ -30,7 +29,7 @@ pub async fn on_session_start(db: &PostgresDb, session_id: Uuid) -> Result<Conte
 
     // Assemble context using a zero embedding (keyword-only search)
     // since we may not have an embedding service wired in the hook layer
-    let dummy_embedding = vec![0.0_f32; DEFAULT_EMBEDDING_DIM];
+    let dummy_embedding = Vec::new();
     let context = db
         .get_context_for_query(goal, &dummy_embedding, 10)
         .await

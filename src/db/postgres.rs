@@ -200,6 +200,16 @@ impl PostgresDb {
         rows.into_iter().map(|r| (r.tbl, r.cnt)).collect()
     }
 
+    /// Return the dimension distribution of active search vectors.
+    pub async fn embedding_dimensions(&self) -> Result<Vec<(i32, i64)>, sqlx::Error> {
+        sqlx::query_as::<_, (i32, i64)>(
+            "SELECT vector_dims(embedding)::int, COUNT(*)::bigint FROM embeddings \
+             WHERE embedding IS NOT NULL GROUP BY vector_dims(embedding) ORDER BY 1",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
     // ------------------------------------------------------------------
     // Agents
     // ------------------------------------------------------------------
@@ -1183,6 +1193,26 @@ impl PostgresDb {
             recent_sessions,
             procedures,
             trading_results,
+        })
+    }
+
+    /// Assemble context without vectors. This is the controlled fallback used
+    /// when embedding initialization or dimension validation fails.
+    pub async fn get_keyword_context_for_query(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> Result<ContextPackage, sqlx::Error> {
+        let memories = self.bm25_search("memories", query, limit).await?;
+        let documents = self.bm25_search("documents", query, limit).await?;
+        let experiences = self.bm25_search("experiences", query, limit).await?;
+        Ok(ContextPackage {
+            memories,
+            documents,
+            experiences,
+            recent_sessions: self.get_recent_sessions(3).await?,
+            procedures: self.get_related_procedures(3).await?,
+            trading_results: self.get_trading_results_summary(3).await?,
         })
     }
 

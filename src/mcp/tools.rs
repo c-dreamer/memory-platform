@@ -367,16 +367,13 @@ async fn tool_memory_context(state: &AppState, args: Value) -> Result<String> {
 
     info!("memory_context: query='{query}'");
 
-    let embedding = match &state.embedding_service {
-        Some(svc) => svc.embed(&query).await?.as_vec().to_vec(),
-        None => vec![0.0_f32; state.config.embedding_dim],
+    let context = match &state.embedding_service {
+        Some(svc) => {
+            let embedding = svc.embed(&query).await?.as_vec().to_vec();
+            state.db.get_context_for_query(&query, &embedding, 10).await?
+        }
+        None => state.db.get_keyword_context_for_query(&query, 10).await?,
     };
-
-    let context = state
-        .db
-        .get_context_for_query(&query, &embedding, 10)
-        .await
-        .context("Failed to assemble context")?;
 
     // Record cross-references if session_id was provided
     if let Some(sid) = session_id {
@@ -412,16 +409,13 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
 
     info!("memory_initialize: goal='{goal}'");
 
-    let embedding = match &state.embedding_service {
-        Some(svc) => svc.embed(&goal).await?.as_vec().to_vec(),
-        None => vec![0.0_f32; state.config.embedding_dim],
+    let context = match &state.embedding_service {
+        Some(svc) => {
+            let embedding = svc.embed(&goal).await?.as_vec().to_vec();
+            state.db.get_context_for_query(&goal, &embedding, 10).await?
+        }
+        None => state.db.get_keyword_context_for_query(&goal, 10).await?,
     };
-
-    let context = state
-        .db
-        .get_context_for_query(&goal, &embedding, 10)
-        .await
-        .context("Failed to assemble context")?;
 
     // Record cross-references if session_id was provided
     if let Some(sid) = session_id {
@@ -557,7 +551,7 @@ async fn tool_experience_find(state: &AppState, args: Value) -> Result<String> {
             // Fallback: search experiences table directly
             let embedding = match &state.embedding_service {
                 Some(svc) => svc.embed(&goal).await?.as_vec().to_vec(),
-                None => vec![0.0_f32; state.config.embedding_dim],
+                None => vec![],
             };
             let results = state
                 .search
@@ -930,12 +924,16 @@ async fn tool_status(state: &AppState, _args: Value) -> Result<String> {
 
     let healthy = state.db.health().await;
     let stats = state.db.get_stats().await;
+    let embedding_dimensions = state.db.embedding_dimensions().await.unwrap_or_default();
 
     let result = json!({
         "healthy": healthy,
         "stats": stats,
         "config": {
             "embedding_model": state.config.embedding_model,
+            "embedding_dimension": state.config.embedding_dim,
+            "active_embedding_dimensions": embedding_dimensions,
+            "embedding_service": state.embedding_service.is_some(),
             "search_mode": state.config.search_default_mode,
             "decay_enabled": state.config.decay_enabled,
         },

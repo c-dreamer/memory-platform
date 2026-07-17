@@ -5,7 +5,6 @@
 //! - NVIDIA NIM API fallback
 //! - LRU cache (1000 entries)
 
-use crate::config::DEFAULT_EMBEDDING_DIM;
 use crate::models::embedding::Embedding;
 use anyhow::{Context, Result};
 #[cfg(feature = "fastembed")]
@@ -94,7 +93,7 @@ impl EmbeddingService for LocalEmbedding {
         let cache = Arc::clone(&self.cache);
         Box::pin(async move {
             if text.trim().is_empty() {
-                return Ok(Embedding::new(vec![0.0; DEFAULT_EMBEDDING_DIM]));
+                anyhow::bail!("cannot embed empty text")
             }
 
             // Check cache first
@@ -118,8 +117,9 @@ impl EmbeddingService for LocalEmbedding {
             .await
             .context("Failed to spawn blocking task for embedding")??;
 
-            let embedding =
-                Embedding::new(embedding.unwrap_or_else(|| vec![0.0; DEFAULT_EMBEDDING_DIM]));
+            let embedding = Embedding::new(
+                embedding.context("Embedding backend returned no vector")?,
+            );
 
             // Update cache
             {
@@ -229,7 +229,7 @@ impl EmbeddingService for NvidiaNimEmbedding {
         let cache = Arc::clone(&self.cache);
         Box::pin(async move {
             if text.trim().is_empty() {
-                return Ok(Embedding::new(vec![0.0; DEFAULT_EMBEDDING_DIM]));
+                anyhow::bail!("cannot embed empty text")
             }
 
             // Check cache first
@@ -263,7 +263,7 @@ impl EmbeddingService for NvidiaNimEmbedding {
                     count += 1;
                 }
 
-                let mut values = accumulator.unwrap_or_else(|| vec![0.0; DEFAULT_EMBEDDING_DIM]);
+                let mut values = accumulator.context("Embedding backend returned no vectors")?;
                 if count > 1 {
                     let scale = 1.0 / count as f32;
                     for value in &mut values {

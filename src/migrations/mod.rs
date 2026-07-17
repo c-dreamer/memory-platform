@@ -68,6 +68,10 @@ impl Migrator {
                 "008_storage_tiers_and_archive",
                 include_str!("../../migrations/008_storage_tiers_and_archive.sql"),
             ),
+            (
+                "009_sync_key_uniqueness",
+                include_str!("../../migrations/009_sync_key_uniqueness.sql"),
+            ),
         ];
 
         // Apply pending migrations in order

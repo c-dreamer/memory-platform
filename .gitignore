@@ -26,3 +26,9 @@ Thumbs.db
 # Local agent scratch and Python bytecode
 .omo/
 scripts/__pycache__/
+
+# FastEmbed
+.fastembed_cache/
+
+# Scripts
+export-obsidian-index.sh

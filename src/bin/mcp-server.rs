@@ -48,6 +48,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let active_dimensions = db.embedding_dimensions().await.unwrap_or_default();
+    if active_dimensions.len() > 1 {
+        tracing::error!(?active_dimensions, "Mixed active embedding dimensions; vector search will remain disabled until controlled re-embedding");
+    }
+
     // Clone pool for services that need PgPool directly
     let pool = db.pool.clone();
 
@@ -64,7 +69,22 @@ async fn main() -> anyhow::Result<()> {
             cache_size: config.embedding_cache_size,
         };
         match EmbeddingServiceFactory::new(embedding_config).await {
-            Ok(svc) => Some(Arc::new(svc)),
+            Ok(svc) => {
+                match svc.embed("__memory_platform_embedding_probe__").await {
+                    Ok(probe) if active_dimensions.len() <= 1 && (config.embedding_dim == 0 || probe.as_vec().len() == config.embedding_dim) => {
+                        tracing::info!(model = %config.embedding_model, dimension = probe.as_vec().len(), "Embedding probe passed");
+                        Some(Arc::new(svc))
+                    }
+                    Ok(probe) => {
+                        tracing::error!(configured = config.embedding_dim, actual = probe.as_vec().len(), "Embedding dimension mismatch; keyword-only mode");
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Embedding probe failed; keyword-only mode");
+                        None
+                    }
+                }
+            }
             Err(e) => {
                 tracing::warn!("Embedding service unavailable (keyword-only fallback): {e}");
                 None

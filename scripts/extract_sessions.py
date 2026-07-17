@@ -13,9 +13,21 @@ Format:
 """
 
 import json
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
+
+
+def _sanitise(obj):
+    """Recursively replace lone surrogates (U+D800–U+DFFF) with U+FFFD."""
+    if isinstance(obj, str):
+        return re.sub(r'[\ud800-\udfff]', '\uFFFD', obj)
+    if isinstance(obj, dict):
+        return {k: _sanitise(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitise(v) for v in obj]
+    return obj
 
 
 def main():
@@ -141,7 +153,7 @@ def main():
             del prt_dict['data']
             total_parts += 1
 
-            print(json.dumps({"type": "part", "session_id": ses['id'], "data": prt_dict}))
+            print(json.dumps({"type": "part", "session_id": ses['id'], "data": _sanitise(prt_dict)}))
 
     # --- Extract all user todos ---
     todo_rows = conn.execute("""
