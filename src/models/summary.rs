@@ -51,12 +51,12 @@ mod tests {
             session_id: None,
             source_type: None,
             content: "Embedded summary".into(),
-            embedding: Some(Embedding::new(vec![0.2; 384])),
+            embedding: Some(Embedding::new(vec![0.2; 2048])),
             token_count: None,
             created_at: now,
         };
         assert!(summary.embedding.is_some());
-        assert_eq!(summary.embedding.unwrap().as_vec().len(), 384);
+        assert_eq!(summary.embedding.unwrap().as_vec().len(), 2048);
     }
 
     #[test]

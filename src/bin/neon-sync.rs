@@ -808,6 +808,22 @@ async fn status(local: &PgPool, neon: &PgPool) -> Result<()> {
         .fetch_one(local)
         .await?;
     println!("pending queue entries: {pending}");
+    let latest_run = sqlx::query(
+        "SELECT status,started_at,finished_at,rows_applied,bytes_applied,error_summary FROM sync_meta.runs ORDER BY started_at DESC LIMIT 1",
+    )
+    .fetch_optional(neon)
+    .await?;
+    if let Some(row) = latest_run {
+        println!(
+            "last run: status={} started={} finished={} batch_rows={} bytes={} replay_state={}",
+            row.try_get::<String, _>(0)?,
+            row.try_get::<chrono::DateTime<chrono::Utc>, _>(1)?,
+            row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(2)?.map(|v| v.to_rfc3339()).unwrap_or_else(|| "-".into()),
+            row.try_get::<i64, _>(3).unwrap_or_default(),
+            row.try_get::<i64, _>(4).unwrap_or_default(),
+            row.try_get::<Option<String>, _>(5)?.unwrap_or_else(|| "clean".into()),
+        );
+    }
     let state = sqlx::query(
         "SELECT state_key,state_value,updated_at FROM sync_meta.state ORDER BY state_key",
     )

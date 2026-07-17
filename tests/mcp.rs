@@ -52,7 +52,7 @@ async fn test_mcp_initialize() {
     assert!(resp["result"].get("serverInfo").is_some());
 }
 
-/// Test that MCP server returns 12 tools for tools/list.
+/// Test that MCP server returns the complete tool set for tools/list.
 #[tokio::test]
 async fn test_mcp_tools_list() {
     let state = minimal_state();
@@ -70,14 +70,14 @@ async fn test_mcp_tools_list() {
     let resp = response.unwrap();
 
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 12, "Should return 12 tools");
+    assert_eq!(tools.len(), 14, "Should return 14 tools");
 
     let names: Vec<&str> = tools.iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
     for name in &["memory_search", "memory_store", "memory_context",
                   "memory_initialize", "experience_find", "procedure_run",
-                  "session_start", "session_end", "recall", "forget", "list", "status"] {
+                  "session_start", "session_end", "recall", "forget", "list", "status", "session_context", "archive_status"] {
         assert!(names.contains(name), "Missing tool: {name}");
     }
 }
@@ -112,9 +112,9 @@ async fn test_mcp_malformed_requests() {
     let r1 = json!({ "id": 1, "method": "initialize" });
     assert!(server.handle_request(r1).await.is_err());
 
-    // Missing id
+    // A request without an id is a valid notification and receives no response.
     let r2 = json!({ "jsonrpc": "2.0", "method": "initialize" });
-    assert!(server.handle_request(r2).await.is_err());
+    assert!(server.handle_request(r2).await.is_ok());
 }
 
 /// Test MCP server listen loop via public API.

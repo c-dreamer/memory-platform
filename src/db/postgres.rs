@@ -1424,13 +1424,13 @@ mod tests {
     fn search_result_serde_roundtrip() {
         let sr = SearchResult {
             id: Uuid::new_v4(),
-            content: "Rust is memory-safe".into(),
+            content: Some("Rust is memory-safe".into()),
             source_info: "rust,memory".into(),
             score: 0.95,
         };
         let json = serde_json::to_string(&sr).unwrap();
         let decoded: SearchResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.content, "Rust is memory-safe");
+        assert_eq!(decoded.content, Some("Rust is memory-safe".into()));
         assert_eq!(decoded.score, 0.95);
     }
 

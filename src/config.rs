@@ -142,7 +142,7 @@ impl Config {
 
             // --- Embeddings ---
             embedding_model: env_var("EMBEDDING_MODEL").unwrap_or_else(|| "local".into()),
-            embedding_dim: parse_env("EMBEDDING_DIM", 384)?,
+            embedding_dim: parse_env("EMBEDDING_DIM", DEFAULT_EMBEDDING_DIM)?,
             nvidia_api_url: env_var("NVIDIA_API_URL")
                 .unwrap_or_else(|| "https://integrate.api.nvidia.com/v1/embeddings".into()),
             nvidia_api_key: env_var("NVIDIA_API_KEY").unwrap_or_default(),
@@ -204,7 +204,7 @@ impl Default for Config {
             api_key: String::new(),
             api_port: 8000,
             embedding_model: "local".into(),
-            embedding_dim: 384,
+            embedding_dim: DEFAULT_EMBEDDING_DIM,
             nvidia_api_url: "https://integrate.api.nvidia.com/v1/embeddings".into(),
             nvidia_api_key: String::new(),
             openai_api_key: String::new(),
@@ -369,7 +369,7 @@ mod tests {
         assert_eq!(cfg.api_key, "");
         assert_eq!(cfg.api_port, 8000);
         assert_eq!(cfg.embedding_model, "local");
-        assert_eq!(cfg.embedding_dim, 384);
+        assert_eq!(cfg.embedding_dim, DEFAULT_EMBEDDING_DIM);
         assert_eq!(cfg.nvidia_api_key, "");
         assert_eq!(cfg.openai_api_key, "");
         assert_eq!(cfg.vault_path, "/vault");
@@ -533,7 +533,7 @@ mod tests {
             || {
                 let cfg = Config::from_env().expect("from_env should succeed");
                 assert_eq!(cfg.api_port, 8000);
-                assert_eq!(cfg.embedding_dim, 384);
+                assert_eq!(cfg.embedding_dim, DEFAULT_EMBEDDING_DIM);
                 assert_eq!(
                     cfg.database_url,
                     "postgresql://memory:password@memory-postgres:5432/memory"

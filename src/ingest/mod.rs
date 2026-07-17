@@ -121,6 +121,23 @@ impl IngestEngine {
         Ok(id)
     }
 
+    /// Upsert a source-backed session without creating a duplicate row.
+    pub async fn upsert_source_session(
+        &self, source_key: &str, goal: &str, status: &str, summary: Option<&str>,
+        started_at: chrono::DateTime<Utc>, ended_at: Option<chrono::DateTime<Utc>>,
+    ) -> Result<Uuid> {
+        sqlx::query_scalar(
+            r#"INSERT INTO sessions (goal,status,summary,started_at,ended_at,source_key)
+               VALUES ($1,$2,$3,$4,$5,$6)
+               ON CONFLICT (source_key) DO UPDATE SET goal=EXCLUDED.goal,
+                 status=EXCLUDED.status, summary=EXCLUDED.summary,
+                 ended_at=EXCLUDED.ended_at, updated_at=now()
+               RETURNING id"#,
+        )
+        .bind(goal).bind(status).bind(summary).bind(started_at).bind(ended_at).bind(source_key)
+        .fetch_one(&self.pool).await.context("upserting source session")
+    }
+
     /// Insert an experience record.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_experience(

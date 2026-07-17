@@ -62,14 +62,14 @@ mod tests {
             goal: None,
             status: "completed".into(),
             summary: Some("Done".into()),
-            embedding: Some(Embedding::new(vec![0.1; 384])),
+            embedding: Some(Embedding::new(vec![0.1; 2048])),
             started_at: now,
             ended_at: Some(now),
             created_at: now,
             updated_at: now,
         };
         assert!(session.embedding.is_some());
-        assert_eq!(session.embedding.unwrap().as_vec().len(), 384);
+        assert_eq!(session.embedding.unwrap().as_vec().len(), 2048);
     }
 
     #[test]

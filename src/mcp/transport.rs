@@ -62,9 +62,13 @@ pub async fn handle_http_request(state: Arc<AppState>, body: String) -> Result<S
     let request_value: Value = serde_json::from_str(&body)
         .map_err(|e| anyhow::anyhow!("Parse error: {e}"))?;
 
+    let is_notification = request_value.get("id").is_none();
     let response = server.handle_request(request_value).await?;
 
-    // Serialize response — if empty object (notification), return no content
+    // Notifications must not receive a JSON-RPC response.
+    if is_notification {
+        return Ok(String::new());
+    }
     let response_str = serde_json::to_string(&response)?;
     Ok(response_str)
 }
@@ -79,7 +83,7 @@ pub async fn http_json_rpc_handler(
 ) -> (axum::http::StatusCode, String) {
     match handle_http_request(state, body).await {
         Ok(response) => {
-            if response == "{}" {
+            if response.is_empty() {
                 // Notification — no content
                 (axum::http::StatusCode::NO_CONTENT, response)
             } else {

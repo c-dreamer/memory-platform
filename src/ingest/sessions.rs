@@ -213,7 +213,7 @@ async fn process_session(
 
     // Insert session record
     let mem_session_id = engine
-        .insert_session(title, "completed", None, created_dt, Some(updated_dt))
+        .upsert_source_session(&format!("opencode:{ses_id}"), title, "completed", None, created_dt, Some(updated_dt))
         .await
         .unwrap_or_else(|e| {
             warn!("  Failed to insert session '{title}': {e}");

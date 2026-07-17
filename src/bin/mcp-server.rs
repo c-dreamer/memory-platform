@@ -38,8 +38,11 @@ async fn main() -> anyhow::Result<()> {
         Ok(db) => {
             tracing::info!("Connected to PostgreSQL");
             let db = Arc::new(db);
-            Migrator::run(&db.pool).await?;
-            tracing::info!("Database migrations completed");
+            if let Err(e) = Migrator::run(&db.pool).await {
+                tracing::warn!(error = %e, "Database migrations failed; starting MCP in degraded mode");
+            } else {
+                tracing::info!("Database migrations completed");
+            }
             db
         }
         Err(e) => {
@@ -66,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
             nvidia_api_url: Some(config.nvidia_api_url.clone()),
             nvidia_api_key: Some(config.nvidia_api_key.clone()),
             nvidia_embedding_model: config.nvidia_embedding_model.clone(),
+            expected_dimension: config.embedding_dim,
             cache_size: config.embedding_cache_size,
         };
         match EmbeddingServiceFactory::new(embedding_config).await {

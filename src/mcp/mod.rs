@@ -112,7 +112,9 @@ impl McpServer {
             // MCP spec: notifications have no "id" — the server must not send a response
             let is_notification = request_value.get("id").is_none();
 
-            let response = self.handle_request(request_value).await;
+        let invalid_request = request_value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+            || request_value.get("method").and_then(Value::as_str).is_none();
+        let response = self.handle_request(request_value).await;
             let response_json = match response {
                 Ok(res) => res,
                 Err(e) => {
@@ -120,7 +122,7 @@ impl McpServer {
                     json!({
                         "jsonrpc": "2.0",
                         "id": Value::Null,
-                        "error": {"code": ERROR_INTERNAL_ERROR, "message": e.to_string()},
+                        "error": {"code": if invalid_request { ERROR_INVALID_REQUEST } else { ERROR_INTERNAL_ERROR }, "message": e.to_string()},
                     })
                 }
             };
@@ -176,6 +178,7 @@ impl McpServer {
 
     /// Handle "initialize" method.
     async fn handle_initialize(&self, id: Value) -> Value {
+        let storage_healthy = self.state.db.health().await;
         json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -191,6 +194,11 @@ impl McpServer {
                     "name": "memory-mcp",
                     "version": "2.0.0",
                 },
+                "status": {
+                    "storage": if storage_healthy { "healthy" } else { "degraded" },
+                    "embedding": if self.state.embedding_service.is_some() { "available" } else { "keyword-only" },
+                    "configured_embedding_dimension": self.state.config.embedding_dim,
+                }
             },
         })
     }
@@ -301,7 +309,7 @@ mod tests {
         
         let tools = response["result"]["tools"].as_array().unwrap();
         assert!(!tools.is_empty(), "Should return non-empty tools list");
-        assert_eq!(tools.len(), 13, "Should return exactly 13 tools");
+        assert_eq!(tools.len(), 14, "Should return exactly 14 tools");
     }
 
     #[tokio::test]

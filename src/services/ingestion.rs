@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use walkdir::WalkDir;
 
 use crate::db::postgres::PostgresDb;
@@ -347,6 +347,38 @@ impl IngestionService {
                     }
                 }
                 Err(e) => errors.push(format!("sessions/{} (embed): {e:#}", session.id)),
+            }
+        }
+
+        // Repair every other embedding-backed table as well. Keeping this list
+        // explicit avoids accidentally embedding operational metadata tables.
+        for (table, text_sql) in [
+            ("documents", "content"),
+            ("summaries", "content"),
+            ("code_changes", "concat_ws('\\n', problem, solution)"),
+            ("trading_results", "concat_ws(' ', strategy, symbol, trade_type, direction, notes)"),
+        ] {
+            let query = format!("SELECT id, COALESCE({text_sql}, '') AS source_text FROM {table} WHERE embedding IS NULL AND COALESCE({text_sql}, '') <> '' ORDER BY created_at ASC");
+            let rows = sqlx::query(&query).fetch_all(&self.db.pool).await
+                .with_context(|| format!("Failed to query {table} with null embedding"))?;
+            rows_scanned += rows.len() as u64;
+            for row in rows {
+                let id: uuid::Uuid = row.try_get("id")?;
+                let source_text: String = row.try_get("source_text")?;
+                match self.embedder.embed(&source_text).await {
+                    Ok(embedding) => {
+                        let update = format!("UPDATE {table} SET embedding = $1::vector WHERE id = $2");
+                        match sqlx::query(&update).bind(embedding.as_vec()).bind(id).execute(&self.db.pool).await {
+                            Ok(_) => {
+                                self.db.store_embedding(table, id, embedding.as_vec()).await
+                                    .with_context(|| format!("storing derived embedding for {table}/{id}"))?;
+                                rows_fixed += 1;
+                            }
+                            Err(e) => errors.push(format!("{table}/{id}: {e}")),
+                        }
+                    }
+                    Err(e) => errors.push(format!("{table}/{id} (embed): {e:#}")),
+                }
             }
         }
 
