@@ -18,10 +18,13 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 #[cfg(feature = "fastembed")]
 use std::sync::Mutex as BlockingMutex;
+use std::time::Duration;
 use tokio::sync::Mutex;
+
+const EMBEDDING_REQUEST_TIMEOUT_SECS: u64 = 300;
+const EMBEDDING_REQUEST_RETRIES: usize = 4;
 
 /// Embedding service trait.
 pub trait EmbeddingService: Send + Sync {
@@ -125,11 +128,14 @@ impl EmbeddingService for LocalEmbedding {
             .await
             .context("Failed to spawn blocking task for embedding")??;
 
-            let embedding = Embedding::new(
-                embedding.context("Embedding backend returned no vector")?,
-            );
+            let embedding =
+                Embedding::new(embedding.context("Embedding backend returned no vector")?);
             if embedding.as_vec().len() != expected_dimension {
-                anyhow::bail!("local embedding provider returned {} dimensions; expected {}", embedding.as_vec().len(), expected_dimension);
+                anyhow::bail!(
+                    "local embedding provider returned {} dimensions; expected {}",
+                    embedding.as_vec().len(),
+                    expected_dimension
+                );
             }
 
             // Update cache
@@ -156,10 +162,16 @@ pub struct NvidiaNimEmbedding {
 
 impl NvidiaNimEmbedding {
     /// Create a new NVIDIA NIM embedding backend.
-    pub fn new(api_url: String, api_key: String, model: String, cache_size: usize, expected_dimension: usize) -> Self {
+    pub fn new(
+        api_url: String,
+        api_key: String,
+        model: String,
+        cache_size: usize,
+        expected_dimension: usize,
+    ) -> Self {
         Self {
             client: Client::builder()
-                .timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(EMBEDDING_REQUEST_TIMEOUT_SECS))
                 .build()
                 .expect("valid embedding HTTP client configuration"),
             api_url,
@@ -172,7 +184,10 @@ impl NvidiaNimEmbedding {
         }
     }
 
-    fn parse_embedding_response(data: serde_json::Value, expected_dimension: usize) -> Result<Embedding> {
+    fn parse_embedding_response(
+        data: serde_json::Value,
+        expected_dimension: usize,
+    ) -> Result<Embedding> {
         let mut embedding: Vec<f32> = data["data"][0]["embedding"]
             .as_array()
             .context("Invalid embedding format in NVIDIA NIM API response")?
@@ -181,7 +196,11 @@ impl NvidiaNimEmbedding {
             .collect();
 
         if embedding.len() != expected_dimension {
-            anyhow::bail!("embedding provider returned {} dimensions; expected {}", embedding.len(), expected_dimension);
+            anyhow::bail!(
+                "embedding provider returned {} dimensions; expected {}",
+                embedding.len(),
+                expected_dimension
+            );
         }
 
         // Normalize embedding
@@ -201,30 +220,54 @@ impl NvidiaNimEmbedding {
         expected_dimension: usize,
         text: &str,
     ) -> Result<Embedding> {
-        let resp = client
-            .post(api_url)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .json(&serde_json::json!({
-                "input": text,
-                "model": model,
-                "input_type": "query",
-            }))
-            .send()
-            .await
-            .context("Failed to send request to NVIDIA NIM API")?;
+        // Truncate to ~512 tokens (Unicode-safe, ~2048 bytes)
+        let truncated_text = if text.chars().count() > 512 {
+            text.chars().take(512).collect::<String>()
+        } else {
+            text.to_string()
+        };
+        for attempt in 0..=EMBEDDING_REQUEST_RETRIES {
+            let response = client
+                .post(api_url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&serde_json::json!({
+                    "input": text,
+                    "model": model,
+                    "input_type": "query",
+                }))
+                .send()
+                .await;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("NVIDIA NIM API error ({}): {}", status, error_text);
+            match response {
+                Ok(resp) if resp.status().is_success() => {
+                    let data: serde_json::Value = resp
+                        .json()
+                        .await
+                        .context("Failed to parse NVIDIA NIM API response")?;
+                    return Self::parse_embedding_response(data, expected_dimension);
+                }
+                Ok(resp) if !resp.status().is_server_error() => {
+                    let status = resp.status();
+                    let error_text = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("NVIDIA NIM API error ({}): {}", status, error_text);
+                }
+                Ok(resp) => {
+                    tracing::warn!(attempt = attempt + 1, status = %resp.status(), "NVIDIA provider returned a retryable error");
+                }
+                Err(error) => {
+                    tracing::warn!(attempt = attempt + 1, error = %error, "NVIDIA provider request failed; retrying");
+                }
+            }
+
+            if attempt < EMBEDDING_REQUEST_RETRIES {
+                tokio::time::sleep(Duration::from_secs(2_u64.saturating_pow(attempt as u32))).await;
+            }
         }
 
-        let data: serde_json::Value = resp
-            .json()
-            .await
-            .context("Failed to parse NVIDIA NIM API response")?;
-
-        Self::parse_embedding_response(data, expected_dimension)
+        anyhow::bail!(
+            "NVIDIA NIM API failed after {} attempts",
+            EMBEDDING_REQUEST_RETRIES + 1
+        )
     }
 
     fn split_for_embedding(text: &str, max_chars: usize) -> Vec<String> {
@@ -264,17 +307,33 @@ impl EmbeddingService for NvidiaNimEmbedding {
 
             let chunks = Self::split_for_embedding(&text, 4000);
             let embedding = if chunks.len() == 1 {
-                Self::embed_remote_chunk(&client, &api_url, &api_key, &model, expected_dimension, &chunks[0]).await?
+                Self::embed_remote_chunk(
+                    &client,
+                    &api_url,
+                    &api_key,
+                    &model,
+                    expected_dimension,
+                    &chunks[0],
+                )
+                .await?
             } else {
                 let mut accumulator: Option<Vec<f32>> = None;
                 let mut count = 0usize;
 
                 for chunk in &chunks {
-                    let chunk_embedding =
-                        Self::embed_remote_chunk(&client, &api_url, &api_key, &model, expected_dimension, chunk)
-                            .await?;
+                    let chunk_embedding = Self::embed_remote_chunk(
+                        &client,
+                        &api_url,
+                        &api_key,
+                        &model,
+                        expected_dimension,
+                        chunk,
+                    )
+                    .await?;
                     let values = chunk_embedding.into_inner();
-                    if values.len() != expected_dimension { anyhow::bail!("embedding chunk dimension mismatch") }
+                    if values.len() != expected_dimension {
+                        anyhow::bail!("embedding chunk dimension mismatch")
+                    }
 
                     if let Some(existing) = accumulator.as_mut() {
                         for (dst, src) in existing.iter_mut().zip(values.iter()) {
@@ -380,7 +439,13 @@ impl EmbeddingServiceFactory {
                             } else {
                                 config.nvidia_embedding_model.clone()
                             };
-                            let nvidia = NvidiaNimEmbedding::new(url, key, model_name, cache_size, expected_dimension);
+                            let nvidia = NvidiaNimEmbedding::new(
+                                url,
+                                key,
+                                model_name,
+                                cache_size,
+                                expected_dimension,
+                            );
                             return Ok(Self::Fallback(Box::new(FallbackEmbedding::new(
                                 EmbeddingServiceFactory::Local(local),
                                 EmbeddingServiceFactory::Nvidia(nvidia),
@@ -407,7 +472,7 @@ impl EmbeddingServiceFactory {
                     api_key,
                     config.nvidia_embedding_model.clone(),
                     cache_size,
-                    expected_dimension,
+                    config.expected_dimension,
                 )))
             }
             _ => anyhow::bail!("Unknown embedding model: {}", config.model),
@@ -451,8 +516,9 @@ mod tests {
             "data": [{"embedding": vec![0.1_f64; DEFAULT_EMBEDDING_DIM]}]
         });
 
-        let embedding = NvidiaNimEmbedding::parse_embedding_response(response, DEFAULT_EMBEDDING_DIM)
-            .expect("Failed to parse embedding");
+        let embedding =
+            NvidiaNimEmbedding::parse_embedding_response(response, DEFAULT_EMBEDDING_DIM)
+                .expect("Failed to parse embedding");
         assert_eq!(embedding.as_vec().len(), DEFAULT_EMBEDDING_DIM);
         assert!(embedding.as_vec().iter().all(|x| x.is_finite()));
     }
@@ -464,6 +530,7 @@ mod tests {
             "fake-api-key".to_string(),
             "nv-embed-qa".to_string(),
             1000,
+            2048,
             DEFAULT_EMBEDDING_DIM,
         );
         assert!(service.embed("").await.is_err());

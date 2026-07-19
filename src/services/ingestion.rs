@@ -248,24 +248,38 @@ impl IngestionService {
 
         let memories: Vec<Memory> = sqlx::query_as::<_, Memory>(
             "SELECT id, agent_id, session_id, content, content_type, embedding, importance, \
-                    tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at \
-             FROM memories WHERE embedding IS NULL ORDER BY created_at ASC",
+         tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at \
+         FROM memories WHERE embedding IS NULL ORDER BY created_at ASC",
         )
         .fetch_all(&self.db.pool)
         .await
         .context("Failed to query memories with null embedding")?;
         rows_scanned += memories.len() as u64;
 
-        for memory in &memories {
-            match self.embedder.embed(&memory.content).await {
-                Ok(embedding) => {
+        for (i, memory) in memories.iter().enumerate() {
+            if i % 10 == 0 {
+                tracing::info!(
+                    "Processing memory {}/{} ({:.1}%)",
+                    i,
+                    memories.len(),
+                    (i as f64 / memories.len() as f64) * 100.0
+                );
+            }
+
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.embedder.embed(&memory.content),
+            )
+            .await
+            {
+                Ok(Ok(embedding)) => {
                     let result = sqlx::query(
-                        "UPDATE memories SET embedding = $1::vector, updated_at = now() WHERE id = $2",
-                    )
-                    .bind(embedding.as_vec())
-                    .bind(memory.id)
-                    .execute(&self.db.pool)
-                    .await;
+                    "UPDATE memories SET embedding = $1::vector, updated_at = now() WHERE id = $2",
+                )
+                .bind(embedding.as_vec())
+                .bind(memory.id)
+                .execute(&self.db.pool)
+                .await;
 
                     match result {
                         Ok(_) => {
@@ -278,7 +292,8 @@ impl IngestionService {
                         Err(e) => errors.push(format!("memories/{}: {e}", memory.id)),
                     }
                 }
-                Err(e) => errors.push(format!("memories/{} (embed): {e:#}", memory.id)),
+                Ok(Err(e)) => errors.push(format!("memories/{} (embed): {e:#}", memory.id)),
+                Err(_) => errors.push(format!("memories/{} (embed): timeout after 30s", memory.id)),
             }
         }
 
@@ -293,10 +308,23 @@ impl IngestionService {
         .context("Failed to query experiences with null embedding")?;
         rows_scanned += experiences.len() as u64;
 
-        for experience in &experiences {
+        for (i, experience) in experiences.iter().enumerate() {
+            if i % 10 == 0 {
+                tracing::info!(
+                    "Processing experience {}/{} ({:.1}%)",
+                    i,
+                    experiences.len(),
+                    (i as f64 / experiences.len() as f64) * 100.0
+                );
+            }
             let text = compose_experience_text(experience);
-            match self.embedder.embed(&text).await {
-                Ok(embedding) => {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.embedder.embed(&text),
+            )
+            .await
+            {
+                Ok(Ok(embedding)) => {
                     let result =
                         sqlx::query("UPDATE experiences SET embedding = $1::vector WHERE id = $2")
                             .bind(embedding.as_vec())
@@ -315,7 +343,11 @@ impl IngestionService {
                         Err(e) => errors.push(format!("experiences/{}: {e}", experience.id)),
                     }
                 }
-                Err(e) => errors.push(format!("experiences/{} (embed): {e:#}", experience.id)),
+                Ok(Err(e)) => errors.push(format!("experiences/{} (embed): {e:#}", experience.id)),
+                Err(_) => errors.push(format!(
+                    "experiences/{} (embed): timeout after 30s",
+                    experience.id
+                )),
             }
         }
 
@@ -356,10 +388,15 @@ impl IngestionService {
             ("documents", "content"),
             ("summaries", "content"),
             ("code_changes", "concat_ws('\\n', problem, solution)"),
-            ("trading_results", "concat_ws(' ', strategy, symbol, trade_type, direction, notes)"),
+            (
+                "trading_results",
+                "concat_ws(' ', strategy, symbol, trade_type, direction, notes)",
+            ),
         ] {
             let query = format!("SELECT id, COALESCE({text_sql}, '') AS source_text FROM {table} WHERE embedding IS NULL AND COALESCE({text_sql}, '') <> '' ORDER BY created_at ASC");
-            let rows = sqlx::query(&query).fetch_all(&self.db.pool).await
+            let rows = sqlx::query(&query)
+                .fetch_all(&self.db.pool)
+                .await
                 .with_context(|| format!("Failed to query {table} with null embedding"))?;
             rows_scanned += rows.len() as u64;
             for row in rows {
@@ -367,11 +404,21 @@ impl IngestionService {
                 let source_text: String = row.try_get("source_text")?;
                 match self.embedder.embed(&source_text).await {
                     Ok(embedding) => {
-                        let update = format!("UPDATE {table} SET embedding = $1::vector WHERE id = $2");
-                        match sqlx::query(&update).bind(embedding.as_vec()).bind(id).execute(&self.db.pool).await {
+                        let update =
+                            format!("UPDATE {table} SET embedding = $1::vector WHERE id = $2");
+                        match sqlx::query(&update)
+                            .bind(embedding.as_vec())
+                            .bind(id)
+                            .execute(&self.db.pool)
+                            .await
+                        {
                             Ok(_) => {
-                                self.db.store_embedding(table, id, embedding.as_vec()).await
-                                    .with_context(|| format!("storing derived embedding for {table}/{id}"))?;
+                                self.db
+                                    .store_embedding(table, id, embedding.as_vec())
+                                    .await
+                                    .with_context(|| {
+                                        format!("storing derived embedding for {table}/{id}")
+                                    })?;
                                 rows_fixed += 1;
                             }
                             Err(e) => errors.push(format!("{table}/{id}: {e}")),
