@@ -531,7 +531,7 @@ async fn derived_rebuild_due(local: &PgPool, rows_applied: usize) -> Result<bool
     if rows_applied != 0 {
         return Ok(true);
     }
-    let rebuilt: Option<i64> =
+    let rebuilt: Option<i32> =
         sqlx::query_scalar("SELECT 1 FROM sync_meta.state WHERE state_key='last_derived_rebuild'")
             .fetch_optional(local)
             .await?;
