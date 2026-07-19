@@ -231,7 +231,7 @@ impl NvidiaNimEmbedding {
                 .post(api_url)
                 .header("Authorization", format!("Bearer {}", api_key))
                 .json(&serde_json::json!({
-                    "input": text,
+                    "input": truncated_text,
                     "model": model,
                     "input_type": "query",
                 }))
@@ -530,7 +530,6 @@ mod tests {
             "fake-api-key".to_string(),
             "nv-embed-qa".to_string(),
             1000,
-            2048,
             DEFAULT_EMBEDDING_DIM,
         );
         assert!(service.embed("").await.is_err());
