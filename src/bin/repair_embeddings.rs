@@ -57,5 +57,25 @@ async fn main() -> Result<()> {
     }
     println!("  Duration:  {}ms", report.duration_ms);
 
+    let mut remaining_nulls = 0_i64;
+    let mut mismatched = 0_i64;
+    for table in ["documents", "memories", "experiences", "sessions", "summaries", "code_changes", "trading_results"] {
+        let nulls: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE embedding IS NULL"))
+            .fetch_one(&pool).await?;
+        let bad_dims: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE embedding IS NOT NULL AND vector_dims(embedding) <> 2048"))
+            .fetch_one(&pool).await?;
+        remaining_nulls += nulls;
+        mismatched += bad_dims;
+        println!("  {table}: null_embeddings={nulls} mismatched_dimensions={bad_dims}");
+    }
+    let cache_bad: i64 = sqlx::query_scalar("SELECT count(*) FROM embeddings WHERE embedding IS NULL OR vector_dims(embedding) <> 2048")
+        .fetch_one(&pool).await?;
+    mismatched += cache_bad;
+    println!("  embeddings cache: invalid_rows={cache_bad}");
+
+    if !report.errors.is_empty() || remaining_nulls != 0 || mismatched != 0 {
+        anyhow::bail!("embedding repair incomplete: {} provider/database errors, {remaining_nulls} null embeddings, {mismatched} invalid vectors", report.errors.len());
+    }
+
     Ok(())
 }

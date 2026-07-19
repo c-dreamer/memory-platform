@@ -393,7 +393,7 @@ impl IngestionService {
                 "concat_ws(' ', strategy, symbol, trade_type, direction, notes)",
             ),
         ] {
-            let query = format!("SELECT id, COALESCE({text_sql}, '') AS source_text FROM {table} WHERE embedding IS NULL AND COALESCE({text_sql}, '') <> '' ORDER BY created_at ASC");
+            let query = format!("SELECT id, COALESCE({text_sql}, '') AS source_text FROM {table} WHERE embedding IS NULL ORDER BY created_at ASC");
             let rows = sqlx::query(&query)
                 .fetch_all(&self.db.pool)
                 .await
@@ -402,7 +402,12 @@ impl IngestionService {
             for row in rows {
                 let id: uuid::Uuid = row.try_get("id")?;
                 let source_text: String = row.try_get("source_text")?;
-                match self.embedder.embed(&source_text).await {
+                let embed_text = if source_text.trim().is_empty() {
+                    "<empty memory-platform record>"
+                } else {
+                    &source_text
+                };
+                match self.embedder.embed(embed_text).await {
                     Ok(embedding) => {
                         let update =
                             format!("UPDATE {table} SET embedding = $1::vector WHERE id = $2");
