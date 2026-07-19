@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(EmbeddingServiceFactory::new(embedding_config).await?);
 
-    let ingestion = IngestionService::new(pool, embedder);
+    let ingestion = IngestionService::new(pool.clone(), embedder);
 
     info!("Repairing null embeddings across memories, experiences, and sessions...");
     let report = ingestion.repair_null_embeddings().await?;
