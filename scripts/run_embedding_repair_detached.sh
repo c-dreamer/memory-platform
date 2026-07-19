@@ -15,7 +15,7 @@ mkdir -p "$STATE_DIR"
 
 write_status() {
   local status="$1" attempt="$2" message="$3"
-  printf '{"status":"%s","attempt":%s,"pid":%s,"updated_at":"%s","message":%s}\n' \
+  printf '{"status":"%s","attempt":%s,"pid":%s,"updated_at":"%s","message":"%s"}\n' \
     "$status" "$attempt" "$$" "$(date -u +%FT%TZ)" "$(printf '%s' "$message" | sed 's/\\/\\\\/g; s/"/\\"/g')" \
     >"$STATUS_FILE"
 }
