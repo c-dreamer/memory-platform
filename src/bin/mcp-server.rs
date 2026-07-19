@@ -7,7 +7,6 @@ use std::sync::Arc;
 use memory_platform::config::Config;
 use memory_platform::db::postgres::PostgresDb;
 use memory_platform::mcp;
-use memory_platform::migrations::Migrator;
 use memory_platform::search::SearchEngine;
 use memory_platform::services::context::ContextService;
 use memory_platform::services::decay::DecayEngine;
@@ -38,11 +37,12 @@ async fn main() -> anyhow::Result<()> {
         Ok(db) => {
             tracing::info!("Connected to PostgreSQL");
             let db = Arc::new(db);
-            if let Err(e) = Migrator::run(&db.pool).await {
-                tracing::warn!(error = %e, "Database migrations failed; starting MCP in degraded mode");
-            } else {
-                tracing::info!("Database migrations completed");
-            }
+            // Schema changes are an explicit deployment operation.  Starting a
+            // client must remain read-only so a short-lived MCP session cannot
+            // unexpectedly run DDL against the authoritative database.
+            tracing::info!(
+                "Connected to PostgreSQL; migration state will be reported by memory_health"
+            );
             db
         }
         Err(e) => {
@@ -73,22 +73,28 @@ async fn main() -> anyhow::Result<()> {
             cache_size: config.embedding_cache_size,
         };
         match EmbeddingServiceFactory::new(embedding_config).await {
-            Ok(svc) => {
-                match svc.embed("__memory_platform_embedding_probe__").await {
-                    Ok(probe) if active_dimensions.len() <= 1 && (config.embedding_dim == 0 || probe.as_vec().len() == config.embedding_dim) => {
-                        tracing::info!(model = %config.embedding_model, dimension = probe.as_vec().len(), "Embedding probe passed");
-                        Some(Arc::new(svc))
-                    }
-                    Ok(probe) => {
-                        tracing::error!(configured = config.embedding_dim, actual = probe.as_vec().len(), "Embedding dimension mismatch; keyword-only mode");
-                        None
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Embedding probe failed; keyword-only mode");
-                        None
-                    }
+            Ok(svc) => match svc.embed("__memory_platform_embedding_probe__").await {
+                Ok(probe)
+                    if active_dimensions.len() <= 1
+                        && (config.embedding_dim == 0
+                            || probe.as_vec().len() == config.embedding_dim) =>
+                {
+                    tracing::info!(model = %config.embedding_model, dimension = probe.as_vec().len(), "Embedding probe passed");
+                    Some(Arc::new(svc))
                 }
-            }
+                Ok(probe) => {
+                    tracing::error!(
+                        configured = config.embedding_dim,
+                        actual = probe.as_vec().len(),
+                        "Embedding dimension mismatch; keyword-only mode"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Embedding probe failed; keyword-only mode");
+                    None
+                }
+            },
             Err(e) => {
                 tracing::warn!("Embedding service unavailable (keyword-only fallback): {e}");
                 None

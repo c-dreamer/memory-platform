@@ -73,6 +73,10 @@ impl Migrator {
                 include_str!("../../migrations/009_sync_key_uniqueness.sql"),
             ),
             (
+                "010_shared_event_sync",
+                include_str!("../../migrations/010_shared_event_sync.sql"),
+            ),
+            (
                 "010_session_source_keys",
                 include_str!("../../migrations/010_session_source_keys.sql"),
             ),
@@ -115,8 +119,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a reachable Postgres instance"]
     async fn test_migrations_table_creation() {
-        let database_url = env::var("DATABASE_URL")
-            .expect("DATABASE_URL is required for migration tests");
+        let database_url =
+            env::var("DATABASE_URL").expect("DATABASE_URL is required for migration tests");
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(&database_url)

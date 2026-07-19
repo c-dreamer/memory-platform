@@ -22,11 +22,12 @@ use uuid::Uuid;
 
 use memory_platform::migrations::Migrator;
 
-const DEFAULT_BATCH_ROWS: usize = 200;
+const DEFAULT_BATCH_ROWS: usize = 25;
 const MIN_BATCH_ROWS: usize = 1;
 const MAX_BATCH_BYTES: usize = 2 * 1024 * 1024;
 const RUN_BUDGET: Duration = Duration::from_secs(10 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const QUERY_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RETRIES: usize = 4;
 
 #[derive(Parser)]
@@ -40,21 +41,31 @@ struct Cli {
     /// Local authoritative PostgreSQL URL. Reads LOCAL_URL then DATABASE_URL.
     #[arg(long, env = "LOCAL_URL")]
     local_url: Option<String>,
-    /// Neon direct (non-pooler) PostgreSQL URL. Reads NEON_DIRECT then NEON_DATABASE_URL.
-    #[arg(long, env = "NEON_DIRECT")]
+    /// Neon direct PostgreSQL URL. Reads NEON_SYNC_URL, then NEON_DIRECT.
+    #[arg(long, env = "NEON_SYNC_URL")]
     neon_url: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Reconcile if needed and drain the queue within the run budget.
+    /// Compatibility alias for `push`.
     Run,
-    /// Compare complete inventories, archive stale target rows, and enqueue differences.
+    /// Compatibility alias for the bounded audit command.
     Reconcile,
-    /// Show queue state and count parity without changing either corpus.
+    /// Read-only queue, migration, lease, and lightweight count status.
     Status,
-    /// Verify exact active-row fingerprints, embedding integrity, and queue emptiness.
-    Verify,
+    /// Read-only endpoint and schema health check. Never runs DDL.
+    Health,
+    /// Apply ordered migrations and install local capture triggers.
+    Migrate,
+    /// Push durable local changes and events within the run budget.
+    Push,
+    /// Pull unseen remote events into the local durable inbox.
+    Pull,
+    /// Compare one resumable inventory page and enqueue only local repairs.
+    Audit,
+    /// Create bounded baseline events for an existing local corpus.
+    Bootstrap,
     /// Rebuild Neon full-text search and derived embedding cache without NVIDIA calls.
     RebuildDerived,
     /// Emergency-only destructive target reset. Never runs automatically.
@@ -245,10 +256,14 @@ fn urls(cli: &Cli) -> Result<(String, String)> {
     let neon = cli
         .neon_url
         .clone()
+        .or_else(|| env::var("NEON_DIRECT").ok())
+        .or_else(|| env::var("NEON_SYNC_URL").ok())
         .or_else(|| env::var("NEON_DATABASE_URL").ok())
-        .ok_or_else(|| anyhow!("NEON_DIRECT or NEON_DATABASE_URL is required"))?;
-    // Pooler connections are not suitable for DDL or long transactions.
-    Ok((local, neon.replace("-pooler", "")))
+        .ok_or_else(|| anyhow!("NEON_SYNC_URL or NEON_DIRECT is required"))?;
+    if neon.contains("-pooler") {
+        bail!("NEON_SYNC_URL must be a direct endpoint; refusing to rewrite a pooler URL")
+    }
+    Ok((local, neon))
 }
 
 async fn connect(url: &str, label: &str) -> Result<PgPool> {
@@ -258,7 +273,7 @@ async fn connect(url: &str, label: &str) -> Result<PgPool> {
     let mut last_error = None;
     for attempt in 0..=MAX_RETRIES {
         let connection = PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(1)
             .acquire_timeout(CONNECT_TIMEOUT)
             .connect_with(options.clone());
         match tokio::time::timeout(CONNECT_TIMEOUT, connection).await {
@@ -295,16 +310,39 @@ CREATE TABLE IF NOT EXISTS sync_meta.state (
     state_value JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS sync_meta.runtime (
+    singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
+    device_id TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE SEQUENCE IF NOT EXISTS sync_meta.logical_clock;
 CREATE OR REPLACE FUNCTION sync_meta.capture_change() RETURNS trigger AS $$
 DECLARE
     record_value JSONB;
+    event_payload JSONB;
     row_key TEXT;
+    device TEXT;
 BEGIN
+    IF current_setting('memory.sync_replay', true) = 'on' THEN
+        RETURN COALESCE(NEW, OLD);
+    END IF;
     IF TG_OP = 'UPDATE' AND (to_jsonb(NEW) - 'updated_at') IS NOT DISTINCT FROM (to_jsonb(OLD) - 'updated_at') THEN
         RETURN NEW;
     END IF;
     record_value := CASE WHEN TG_OP = 'DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END;
     row_key := record_value ->> TG_ARGV[0];
+    SELECT device_id INTO device FROM sync_meta.runtime WHERE singleton;
+    IF device IS NULL THEN
+        RAISE EXCEPTION 'sync_meta.runtime is not configured; run neon-sync migrate with MEMORY_DEVICE_ID';
+    END IF;
+    event_payload := record_value - 'embedding' - 'fts';
+    IF TG_OP = 'DELETE' OR record_value ->> 'storage_tier' <> 'active' THEN
+        event_payload := event_payload - 'content' - 'goal' - 'summary';
+    END IF;
+    INSERT INTO sync_meta.events(event_id, device_id, logical_time, table_name, record_key, operation, payload, payload_checksum)
+    VALUES (gen_random_uuid(), device, nextval('sync_meta.logical_clock'), TG_TABLE_NAME, row_key,
+        CASE WHEN TG_OP = 'DELETE' THEN 'delete' WHEN record_value ->> 'storage_tier' <> 'active' THEN 'archive' ELSE 'upsert' END,
+        event_payload, md5(event_payload::text));
     INSERT INTO sync_meta.outbox(table_name, record_key, generation, operation, changed_at, attempts, last_error)
     VALUES (TG_TABLE_NAME, row_key, 1, CASE WHEN TG_OP = 'DELETE' OR record_value ->> 'storage_tier' <> 'active' THEN 'delete' ELSE 'upsert' END, now(), 0, NULL)
     ON CONFLICT (table_name, record_key) DO UPDATE SET
@@ -317,6 +355,12 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 "#).execute(local).await.context("creating local sync queue")?;
+    let device_id =
+        env::var("MEMORY_DEVICE_ID").context("MEMORY_DEVICE_ID is required for sync migration")?;
+    sqlx::query("INSERT INTO sync_meta.runtime(singleton,device_id) VALUES(true,$1) ON CONFLICT(singleton) DO UPDATE SET device_id=EXCLUDED.device_id,updated_at=now()")
+        .bind(device_id)
+        .execute(local)
+        .await?;
     for spec in TABLES {
         let trigger = format!("trg_sync_outbox_{}", spec.name);
         let sql = format!("DROP TRIGGER IF EXISTS {} ON public.{}; CREATE TRIGGER {} AFTER INSERT OR UPDATE OR DELETE ON public.{} FOR EACH ROW EXECUTE FUNCTION sync_meta.capture_change('{}');", quote_ident(&trigger), quote_ident(spec.name), quote_ident(&trigger), quote_ident(spec.name), spec.key);
@@ -346,6 +390,10 @@ CREATE TABLE IF NOT EXISTS sync_meta.embedding_manifest (
     id UUID PRIMARY KEY, source_table TEXT NOT NULL, source_id UUID NOT NULL, model TEXT, dimension INT,
     created_at TIMESTAMPTZ, UNIQUE(source_table, source_id)
 );
+CREATE TABLE IF NOT EXISTS sync_meta.leases (
+    lease_name TEXT PRIMARY KEY, device_id TEXT NOT NULL, generation BIGINT NOT NULL DEFAULT 1,
+    expires_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 "#).execute(neon).await.context("creating Neon sync metadata")?;
     let captures: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid JOIN pg_namespace n ON n.oid=p.pronamespace WHERE NOT t.tgisinternal AND n.nspname='sync_meta' AND p.proname='capture_change'")
         .fetch_one(neon).await?;
@@ -355,73 +403,171 @@ CREATE TABLE IF NOT EXISTS sync_meta.embedding_manifest (
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct TargetLease {
+    device_id: String,
+    generation: i64,
+}
+
+async fn acquire_target_lease(neon: &PgPool) -> Result<TargetLease> {
+    let device_id = env::var("MEMORY_DEVICE_ID")
+        .context("MEMORY_DEVICE_ID is required for shared synchronization")?;
+    let row = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
+        "INSERT INTO sync_meta.leases(lease_name,device_id,generation,expires_at) VALUES('memory-platform-sync',$1,1,now()+interval '2 minutes') \
+         ON CONFLICT(lease_name) DO UPDATE SET device_id=EXCLUDED.device_id,generation=sync_meta.leases.generation+1,expires_at=EXCLUDED.expires_at,updated_at=now() \
+         WHERE sync_meta.leases.expires_at < now() OR sync_meta.leases.device_id=EXCLUDED.device_id \
+         RETURNING generation"
+    ).bind(&device_id).fetch_optional(neon))
+        .await
+        .map_err(|_| anyhow!("target lease acquisition timed out"))??
+        .ok_or_else(|| anyhow!("another device currently owns the Neon sync lease"))?;
+    Ok(TargetLease {
+        device_id,
+        generation: row.get(0),
+    })
+}
+
+async fn renew_target_lease(neon: &PgPool, lease: &TargetLease) -> Result<()> {
+    let changed = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
+        "UPDATE sync_meta.leases SET expires_at=now()+interval '2 minutes',updated_at=now() \
+         WHERE lease_name='memory-platform-sync' AND device_id=$1 AND generation=$2 AND expires_at > now()"
+    ).bind(&lease.device_id).bind(lease.generation).execute(neon))
+        .await
+        .map_err(|_| anyhow!("target lease renewal timed out"))??
+        .rows_affected();
+    if changed != 1 {
+        bail!("Neon sync lease was lost")
+    }
+    Ok(())
+}
+
+async fn release_target_lease(neon: &PgPool, lease: &TargetLease) {
+    let _ = sqlx::query("UPDATE sync_meta.leases SET expires_at=now() WHERE lease_name='memory-platform-sync' AND device_id=$1 AND generation=$2")
+        .bind(&lease.device_id).bind(lease.generation).execute(neon).await;
+}
+
 async fn queue(local: &PgPool, spec: TableSpec, key: &str, op: &str) -> Result<()> {
     sqlx::query("INSERT INTO sync_meta.outbox(table_name,record_key,generation,operation,changed_at) VALUES($1,$2,1,$3,now()) ON CONFLICT(table_name,record_key) DO UPDATE SET generation=sync_meta.outbox.generation+1, operation=EXCLUDED.operation, changed_at=EXCLUDED.changed_at, attempts=0,last_error=NULL")
         .bind(spec.name).bind(key).bind(op).execute(local).await?;
     Ok(())
 }
 
-async fn inventory(pool: &PgPool, spec: TableSpec) -> Result<BTreeMap<String, String>> {
-    let embedding = if spec.has_embedding {
-        ", coalesce(md5((embedding::text)::text), '')"
-    } else {
-        ""
-    };
-    // JSONB normalizes floating-point metadata differently across PostgreSQL
-    // clients. Metadata is replicated and preserved, but excluded from the
-    // transport fingerprint so semantically identical rows do not churn.
-    let metadata = if spec.name == "memories" {
-        " - 'metadata'"
-    } else {
-        ""
-    };
-    let sql = format!(
-        "SELECT {}::text, md5((to_jsonb(t) - 'fts' - 'embedding' - 'updated_at'{metadata})::text){} FROM public.{} t WHERE t.storage_tier='active'",
-        quote_ident(spec.key),
-        embedding,
-        quote_ident(spec.name)
-    );
-    let rows = sqlx::query(&sql)
-        .fetch_all(pool)
-        .await
-        .with_context(|| format!("reading complete {} inventory", spec.name))?;
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let key: String = row.get(0);
-            let scalar: String = row.get(1);
-            let vector: Option<String> = if spec.has_embedding {
-                Some(row.get(2))
-            } else {
-                None
-            };
-            (key, format!("{scalar}:{}", vector.unwrap_or_default()))
-        })
-        .collect())
+async fn push_events(local: &PgPool, neon: &PgPool, lease: &TargetLease) -> Result<usize> {
+    let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
+        "SELECT event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at \
+         FROM sync_meta.events WHERE pushed_at IS NULL ORDER BY created_at,event_id LIMIT $1"
+    ).bind(DEFAULT_BATCH_ROWS as i64).fetch_all(local))
+        .await.map_err(|_| anyhow!("local event read timed out"))??;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    renew_target_lease(neon, lease).await?;
+    let mut tx = neon.begin().await?;
+    for row in &rows {
+        sqlx::query(
+            "INSERT INTO sync_meta.events(event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at,received_at) \
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now()) ON CONFLICT(event_id) DO NOTHING"
+        )
+        .bind(row.try_get::<Uuid, _>(0)?)
+        .bind(row.try_get::<String, _>(1)?)
+        .bind(row.try_get::<i64, _>(2)?)
+        .bind(row.try_get::<String, _>(3)?)
+        .bind(row.try_get::<String, _>(4)?)
+        .bind(row.try_get::<String, _>(5)?)
+        .bind(row.try_get::<Value, _>(6)?)
+        .bind(row.try_get::<String, _>(7)?)
+        .bind(row.try_get::<Option<Uuid>, _>(8)?)
+        .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>(9)?)
+        .execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    let ids: Vec<Uuid> = rows
+        .iter()
+        .map(|r| r.try_get(0))
+        .collect::<std::result::Result<_, _>>()?;
+    sqlx::query("UPDATE sync_meta.events SET pushed_at=now() WHERE event_id = ANY($1)")
+        .bind(ids)
+        .execute(local)
+        .await?;
+    Ok(rows.len())
 }
 
-async fn archive_and_delete(
-    neon: &PgPool,
-    run_id: Uuid,
-    spec: TableSpec,
-    key: &str,
-    reason: &str,
-) -> Result<()> {
+async fn apply_remote_event(local: &PgPool, table: &str, key: &str, payload: &Value) -> Result<()> {
+    let spec = TABLES
+        .iter()
+        .find(|spec| spec.name == table)
+        .ok_or_else(|| anyhow!("remote event references unsupported table {table}"))?;
+    if payload.is_null() || payload == &Value::Object(Default::default()) {
+        return Ok(());
+    }
     let table = quote_ident(spec.name);
-    let column = quote_ident(spec.key);
-    let mut tx = neon.begin().await?;
-    let archive_sql = format!("INSERT INTO sync_meta.archive(run_id,table_name,record_key,row_data,reason) SELECT $1,$2,$3,to_jsonb(t),$4 FROM public.{table} t WHERE {column}::text=$3");
-    sqlx::query(&archive_sql)
-        .bind(run_id)
-        .bind(spec.name)
-        .bind(key)
-        .bind(reason)
+    let key_col = quote_ident(spec.key);
+    let columns = sqlx::query("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 AND is_generated='NEVER' AND column_name NOT IN ('fts','embedding') ORDER BY ordinal_position")
+        .bind(spec.name).fetch_all(local).await?;
+    let updates: Vec<String> = columns
+        .into_iter()
+        .map(|row| row.get::<String, _>(0))
+        .filter(|column| column != spec.key)
+        .map(|column| {
+            let col = quote_ident(&column);
+            format!("{col}=EXCLUDED.{col}")
+        })
+        .collect();
+    let sql = format!("INSERT INTO public.{table} SELECT (jsonb_populate_record(NULL::public.{table}, $1)).* ON CONFLICT ({key_col}) DO UPDATE SET {}", updates.join(","));
+    let mut tx = local.begin().await?;
+    sqlx::query("SET LOCAL memory.sync_replay='on'")
         .execute(&mut *tx)
         .await?;
-    let delete_sql = format!("DELETE FROM public.{table} WHERE {column}::text=$1");
-    sqlx::query(&delete_sql).bind(key).execute(&mut *tx).await?;
+    sqlx::query(&sql).bind(payload).execute(&mut *tx).await?;
     tx.commit().await?;
+    let _ = key;
     Ok(())
+}
+
+async fn pull_events(local: &PgPool, neon: &PgPool) -> Result<usize> {
+    let cursor_time: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT (cursor_value->>'created_at')::timestamptz FROM sync_meta.cursors WHERE cursor_name='neon_pull'"
+    ).fetch_optional(local).await?;
+    let cursor_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT (cursor_value->>'event_id')::uuid FROM sync_meta.cursors WHERE cursor_name='neon_pull'"
+    ).fetch_optional(local).await?;
+    let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
+        "SELECT event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at \
+         FROM sync_meta.events WHERE (created_at,event_id) > (COALESCE($1, '-infinity'::timestamptz),COALESCE($2,'00000000-0000-0000-0000-000000000000'::uuid)) ORDER BY created_at,event_id LIMIT $3"
+    ).bind(cursor_time).bind(cursor_id).bind(DEFAULT_BATCH_ROWS as i64).fetch_all(neon))
+        .await.map_err(|_| anyhow!("remote event read timed out"))??;
+    let mut newest = cursor_time.zip(cursor_id);
+    let mut imported = 0;
+    for row in rows {
+        let event_id: Uuid = row.try_get(0)?;
+        let inserted = sqlx::query("INSERT INTO sync_meta.events(event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at,received_at,pushed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),now()) ON CONFLICT(event_id) DO NOTHING")
+            .bind(event_id).bind(row.try_get::<String,_>(1)?).bind(row.try_get::<i64,_>(2)?)
+            .bind(row.try_get::<String,_>(3)?).bind(row.try_get::<String,_>(4)?).bind(row.try_get::<String,_>(5)?)
+            .bind(row.try_get::<Value,_>(6)?).bind(row.try_get::<String,_>(7)?).bind(row.try_get::<Option<Uuid>,_>(8)?)
+            .bind(row.try_get::<chrono::DateTime<chrono::Utc>,_>(9)?).execute(local).await?.rows_affected();
+        let created: chrono::DateTime<chrono::Utc> = row.try_get(9)?;
+        if newest.map_or(true, |current| (created, event_id) > current) {
+            newest = Some((created, event_id));
+        }
+        if inserted == 1 {
+            let operation: String = row.try_get(5)?;
+            if operation == "upsert" {
+                apply_remote_event(
+                    local,
+                    &row.try_get::<String, _>(3)?,
+                    &row.try_get::<String, _>(4)?,
+                    &row.try_get::<Value, _>(6)?,
+                )
+                .await?;
+            }
+            imported += 1;
+        }
+    }
+    if let Some((created_at, event_id)) = newest {
+        sqlx::query("INSERT INTO sync_meta.cursors(cursor_name,cursor_value) VALUES('neon_pull',jsonb_build_object('created_at',$1,'event_id',$2)) ON CONFLICT(cursor_name) DO UPDATE SET cursor_value=EXCLUDED.cursor_value,updated_at=now()")
+            .bind(created_at).bind(event_id).execute(local).await?;
+    }
+    Ok(imported)
 }
 
 async fn archive_and_delete_many(
@@ -452,142 +598,6 @@ async fn archive_and_delete_many(
         .await?;
     tx.commit().await?;
     Ok(())
-}
-
-async fn resolve_natural_conflicts(local: &PgPool, neon: &PgPool, run_id: Uuid) -> Result<()> {
-    for spec in TABLES.iter().copied().filter(|s| s.natural_key.is_some()) {
-        let natural = quote_ident(spec.natural_key.unwrap());
-        let table = quote_ident(spec.name);
-        let key = quote_ident(spec.key);
-        // Databases cannot be joined directly. Fetch each inventory once rather
-        // than issuing one remote query per local row.
-        let local_values = sqlx::query(&format!(
-            "SELECT {natural}::text, {key}::text FROM public.{table}"
-        ))
-        .fetch_all(local)
-        .await?;
-        let remote_values = sqlx::query(&format!(
-            "SELECT {natural}::text, {key}::text FROM public.{table}"
-        ))
-        .fetch_all(neon)
-        .await?;
-        let remote_by_natural: HashMap<String, String> = remote_values
-            .into_iter()
-            .filter_map(|row| Some((row.try_get(0).ok()?, row.try_get(1).ok()?)))
-            .collect();
-        for row in local_values {
-            let value: String = row.get(0);
-            let local_key: String = row.get(1);
-            if let Some(remote_key) = remote_by_natural.get(&value) {
-                if *remote_key != local_key {
-                    archive_and_delete(neon, run_id, spec, &remote_key, "natural-key-conflict")
-                        .await?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn reconcile(local: &PgPool, neon: &PgPool, run_id: Uuid) -> Result<usize> {
-    // Fetch all inventories first. A partial/incomplete read cannot mutate the target.
-    let mut local_maps = HashMap::new();
-    let mut neon_maps = HashMap::new();
-    for spec in TABLES {
-        local_maps.insert(spec.name, inventory(local, *spec).await?);
-        neon_maps.insert(spec.name, inventory(neon, *spec).await?);
-    }
-    resolve_natural_conflicts(local, neon, run_id).await?;
-    // Re-read after conflict removals, then archive stale target keys in reverse dependency order.
-    let mut changes = 0;
-    for spec in TABLES.iter().rev().copied() {
-        let source = local_maps.get(spec.name).expect("local inventory");
-        let target = neon_maps.get(spec.name).expect("target inventory");
-        for key in target.keys().filter(|key| !source.contains_key(*key)) {
-            archive_and_delete(neon, run_id, spec, key, "missing-from-local").await?;
-            changes += 1;
-        }
-    }
-    for spec in TABLES.iter().copied() {
-        let source = local_maps.get(spec.name).expect("local inventory");
-        let target = neon_maps.get(spec.name).expect("target inventory");
-        for (key, fingerprint) in source {
-            if target.get(key) != Some(fingerprint) {
-                queue(local, spec, key, "upsert").await?;
-                changes += 1;
-            }
-        }
-    }
-    sqlx::query("INSERT INTO sync_meta.state(state_key,state_value) VALUES('last_reconcile',jsonb_build_object('at',now(),'changes',$1)) ON CONFLICT(state_key) DO UPDATE SET state_value=EXCLUDED.state_value,updated_at=now()")
-        .bind(changes as i64).execute(local).await?;
-    Ok(changes)
-}
-
-async fn verify(local: &PgPool, neon: &PgPool) -> Result<()> {
-    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_meta.outbox")
-        .fetch_one(local)
-        .await?;
-    let mut mismatches = Vec::new();
-    for spec in TABLES {
-        if inventory(local, *spec).await? != inventory(neon, *spec).await? {
-            mismatches.push(spec.name.to_string());
-        }
-    }
-    for (label, pool) in [("local", local), ("neon", neon)] {
-        for spec in TABLES.iter().copied().filter(|spec| spec.has_embedding) {
-            let sql = format!(
-                "SELECT count(*)::bigint FROM public.{} WHERE embedding IS NULL OR vector_dims(embedding) <> 2048",
-                quote_ident(spec.name)
-            );
-            let invalid: i64 = sqlx::query_scalar(&sql).fetch_one(pool).await?;
-            if invalid != 0 {
-                mismatches.push(format!("{label}.{} embeddings={invalid}", spec.name));
-            }
-        }
-        let invalid_cache: i64 = sqlx::query_scalar(
-            "SELECT count(*)::bigint FROM public.embeddings WHERE embedding IS NULL OR vector_dims(embedding) <> 2048",
-        )
-        .fetch_one(pool)
-        .await?;
-        if invalid_cache != 0 {
-            mismatches.push(format!("{label}.embeddings cache={invalid_cache}"));
-        }
-    }
-    println!(
-        "{{\"queue_depth\":{pending},\"fingerprint_mismatches\":{:?}}}",
-        mismatches
-    );
-    if pending != 0 || !mismatches.is_empty() {
-        bail!("Neon verification failed: queue_depth={pending}, mismatches={mismatches:?}");
-    }
-    Ok(())
-}
-
-async fn reconciliation_due(local: &PgPool) -> Result<bool> {
-    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_meta.outbox")
-        .fetch_one(local)
-        .await?;
-    // Drain durable work before scheduling an expensive full inventory scan.
-    if pending > 0 {
-        return Ok(false);
-    }
-    let due: bool = sqlx::query_scalar(
-        "SELECT COALESCE((SELECT updated_at < now() - interval '7 days' FROM sync_meta.state WHERE state_key='last_reconcile'), true)",
-    )
-    .fetch_one(local)
-    .await?;
-    Ok(due)
-}
-
-async fn derived_rebuild_due(local: &PgPool, rows_applied: usize) -> Result<bool> {
-    if rows_applied != 0 {
-        return Ok(true);
-    }
-    let rebuilt: Option<i32> =
-        sqlx::query_scalar("SELECT 1 FROM sync_meta.state WHERE state_key='last_derived_rebuild'")
-            .fetch_optional(local)
-            .await?;
-    Ok(rebuilt.is_none())
 }
 
 async fn columns(neon: &PgPool, spec: TableSpec) -> Result<Vec<String>> {
@@ -663,40 +673,21 @@ async fn apply_batch(
             format!("{c}=EXCLUDED.{c}")
         })
         .collect();
-    let insert = format!(
-        "INSERT INTO public.{table} SELECT r.* FROM jsonb_populate_recordset(NULL::public.{table}, $1::jsonb) AS r ON CONFLICT ({key}) DO UPDATE SET {}",
-        updates.join(",")
-    );
+    let insert = format!("INSERT INTO public.{table} SELECT (jsonb_populate_record(NULL::public.{table}, $1)).* ON CONFLICT ({key}) DO UPDATE SET {}", updates.join(","));
+    let vector_sql = format!("UPDATE public.{table} SET embedding=$1::vector WHERE {key}::text=$2");
     let mut tx = neon.begin().await?;
     sqlx::query("SET LOCAL memory.sync_replay='on'")
         .execute(&mut *tx)
         .await?;
-    let records: Vec<Value> = rows.iter().map(|row| row.data.clone()).collect();
-    sqlx::query(&insert)
-        .bind(Value::Array(records))
-        .execute(&mut *tx)
-        .await?;
-    if spec.has_embedding {
-        let vectors: Vec<Value> = rows
-            .iter()
-            .filter_map(|row| {
-                row.vector.as_ref().map(|vector| {
-                    let text = vector
-                        .0
-                        .iter()
-                        .map(|value| value.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    serde_json::json!({"key": row.key, "embedding": format!("[{text}]")})
-                })
-            })
-            .collect();
-        if !vectors.is_empty() {
-            let vector_sql = format!(
-                "UPDATE public.{table} AS target SET embedding=source.embedding::vector FROM jsonb_to_recordset($1::jsonb) AS source(key text, embedding text) WHERE target.{key}::text=source.key"
-            );
+    for row in rows {
+        sqlx::query(&insert)
+            .bind(&row.data)
+            .execute(&mut *tx)
+            .await?;
+        if let Some(vector) = &row.vector {
             sqlx::query(&vector_sql)
-                .bind(Value::Array(vectors))
+                .bind(vector)
+                .bind(&row.key)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -721,7 +712,12 @@ async fn acknowledge(local: &PgPool, items: &[OutboxItem]) -> Result<()> {
     Ok(())
 }
 
-async fn run_queue(local: &PgPool, neon: &PgPool, run_id: Uuid) -> Result<(usize, usize)> {
+async fn run_queue(
+    local: &PgPool,
+    neon: &PgPool,
+    run_id: Uuid,
+    lease: &TargetLease,
+) -> Result<(usize, usize)> {
     let started = Instant::now();
     let mut applied = 0;
     let mut bytes = 0;
@@ -729,6 +725,7 @@ async fn run_queue(local: &PgPool, neon: &PgPool, run_id: Uuid) -> Result<(usize
     let mut committed_batches = 0usize;
     let mut consecutive_successes = 0usize;
     while started.elapsed() < RUN_BUDGET {
+        renew_target_lease(neon, lease).await?;
         let queue_rows = sqlx::query("SELECT table_name,record_key,generation,operation FROM sync_meta.outbox ORDER BY changed_at LIMIT 200")
             .fetch_all(local).await?;
         if queue_rows.is_empty() {
@@ -835,6 +832,94 @@ async fn run_queue(local: &PgPool, neon: &PgPool, run_id: Uuid) -> Result<(usize
     Ok((applied, bytes))
 }
 
+async fn bootstrap_events(local: &PgPool) -> Result<usize> {
+    let device_id =
+        env::var("MEMORY_DEVICE_ID").context("MEMORY_DEVICE_ID is required for bootstrap")?;
+    let mut created = 0;
+    for spec in TABLES {
+        let sql = format!(
+            "SELECT {}::text, to_jsonb(t) - 'fts' - 'embedding' FROM public.{} t WHERE storage_tier='active' AND NOT EXISTS (SELECT 1 FROM sync_meta.events e WHERE e.table_name=$1 AND e.record_key={}::text AND e.operation='upsert') ORDER BY {} LIMIT $2",
+            quote_ident(spec.key), quote_ident(spec.name), quote_ident(spec.key), quote_ident(spec.key)
+        );
+        let rows = sqlx::query(&sql)
+            .bind(spec.name)
+            .bind(DEFAULT_BATCH_ROWS as i64)
+            .fetch_all(local)
+            .await?;
+        for row in rows {
+            let key: String = row.get(0);
+            let payload: Value = row.get(1);
+            let inserted = sqlx::query(
+                "INSERT INTO sync_meta.events(event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum) \
+                 SELECT gen_random_uuid(),$1,nextval('sync_meta.logical_clock'),$2,$3,'upsert',$4,md5($4::text) \
+                 WHERE NOT EXISTS (SELECT 1 FROM sync_meta.events WHERE table_name=$2 AND record_key=$3 AND operation='upsert')"
+            ).bind(&device_id).bind(spec.name).bind(&key).bind(&payload).execute(local).await?.rows_affected();
+            created += inserted as usize;
+        }
+    }
+    Ok(created)
+}
+
+async fn audit_page(local: &PgPool, neon: &PgPool) -> Result<usize> {
+    let state: Option<Value> = sqlx::query_scalar(
+        "SELECT cursor_value FROM sync_meta.cursors WHERE cursor_name='audit_page'",
+    )
+    .fetch_optional(local)
+    .await?;
+    let table_index = state
+        .as_ref()
+        .and_then(|v| v.get("table_index"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let after_key = state
+        .as_ref()
+        .and_then(|v| v.get("after_key"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let spec = TABLES
+        .get(table_index % TABLES.len())
+        .ok_or_else(|| anyhow!("no sync tables configured"))?;
+    let sql = format!("SELECT {}::text, md5((to_jsonb(t) - 'fts' - 'embedding')::text) FROM public.{} t WHERE storage_tier='active' AND {}::text > $1 ORDER BY {} LIMIT $2", quote_ident(spec.key), quote_ident(spec.name), quote_ident(spec.key), quote_ident(spec.key));
+    let rows = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query(&sql)
+            .bind(&after_key)
+            .bind(DEFAULT_BATCH_ROWS as i64)
+            .fetch_all(local),
+    )
+    .await
+    .map_err(|_| anyhow!("local audit page timed out"))??;
+    let mut repaired = 0;
+    let mut last = None;
+    for row in rows {
+        let key: String = row.get(0);
+        let local_hash: String = row.get(1);
+        let remote_sql = format!("SELECT md5((to_jsonb(t) - 'fts' - 'embedding')::text) FROM public.{} t WHERE {}::text=$1", quote_ident(spec.name), quote_ident(spec.key));
+        let remote_hash: Option<String> = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query_scalar(&remote_sql)
+                .bind(&key)
+                .fetch_optional(neon),
+        )
+        .await
+        .map_err(|_| anyhow!("remote audit lookup timed out"))??;
+        if remote_hash.as_deref() != Some(&local_hash) {
+            queue(local, *spec, &key, "upsert").await?;
+            repaired += 1;
+        }
+        last = Some(key);
+    }
+    let next_index = if last.is_none() {
+        (table_index + 1) % TABLES.len()
+    } else {
+        table_index
+    };
+    sqlx::query("INSERT INTO sync_meta.cursors(cursor_name,cursor_value) VALUES('audit_page',jsonb_build_object('table_index',$1,'after_key',$2)) ON CONFLICT(cursor_name) DO UPDATE SET cursor_value=EXCLUDED.cursor_value,updated_at=now()")
+        .bind(next_index as i64).bind(last.unwrap_or_default()).execute(local).await?;
+    Ok(repaired)
+}
+
 async fn rebuild_derived(local: &PgPool, neon: &PgPool) -> Result<()> {
     let manifest = sqlx::query(
         "SELECT id,source_table,source_id,model,dimension,created_at,embedding::text FROM public.embeddings",
@@ -927,6 +1012,32 @@ async fn status(local: &PgPool, neon: &PgPool) -> Result<()> {
     Ok(())
 }
 
+async fn health(local: &PgPool, neon: &PgPool) -> Result<()> {
+    let local_identity = sqlx::query("SELECT current_database(), COALESCE(inet_server_addr()::text, 'local'), COALESCE(inet_server_port(), 0)").fetch_one(local).await?;
+    let neon_identity = sqlx::query("SELECT current_database(), COALESCE(inet_server_addr()::text, 'remote'), COALESCE(inet_server_port(), 0)").fetch_one(neon).await?;
+    let local_migrations: i64 = sqlx::query_scalar("SELECT count(*) FROM _migrations")
+        .fetch_one(local)
+        .await?;
+    let neon_migrations: i64 = sqlx::query_scalar("SELECT count(*) FROM _migrations")
+        .fetch_one(neon)
+        .await?;
+    println!(
+        "local database={} host={} port={} migrations={}",
+        local_identity.get::<String, _>(0),
+        local_identity.get::<String, _>(1),
+        local_identity.get::<i32, _>(2),
+        local_migrations
+    );
+    println!(
+        "neon database={} host={} port={} migrations={}",
+        neon_identity.get::<String, _>(0),
+        neon_identity.get::<String, _>(1),
+        neon_identity.get::<i32, _>(2),
+        neon_migrations
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -934,49 +1045,56 @@ async fn main() -> Result<()> {
     let (local_url, neon_url) = urls(&cli)?;
     let local = connect(&local_url, "local PostgreSQL").await?;
     let neon = connect(&neon_url, "Neon").await?;
-    Migrator::run(&local).await?;
-    Migrator::run(&neon).await?;
-    ensure_local_queue(&local).await?;
-    ensure_target_meta(&neon).await?;
     match cli.command {
         Command::Status => status(&local, &neon).await,
-        Command::Verify => verify(&local, &neon).await,
-        Command::Reconcile => {
-            let run = Uuid::new_v4();
-            let changes = reconcile(&local, &neon, run).await?;
-            println!("reconciliation queued or archived {changes} rows");
+        Command::Health => health(&local, &neon).await,
+        Command::Migrate => {
+            Migrator::run(&local).await?;
+            Migrator::run(&neon).await?;
+            ensure_local_queue(&local).await?;
+            ensure_target_meta(&neon).await?;
+            println!("migrations and local capture triggers are installed");
+            Ok(())
+        }
+        Command::Reconcile | Command::Audit => {
+            let repaired = audit_page(&local, &neon).await?;
+            println!("audit queued {repaired} local repair(s); no target rows were deleted");
+            Ok(())
+        }
+        Command::Bootstrap => {
+            let created = bootstrap_events(&local).await?;
+            println!("created {created} baseline event(s)");
+            Ok(())
+        }
+        Command::Pull => {
+            let imported = pull_events(&local, &neon).await?;
+            println!("pulled {imported} remote event(s)");
             Ok(())
         }
         Command::RebuildDerived => rebuild_derived(&local, &neon).await,
-        Command::Run => {
+        Command::Run | Command::Push => {
+            let lease = acquire_target_lease(&neon).await?;
             let run = Uuid::new_v4();
             sqlx::query("INSERT INTO sync_meta.runs(run_id,status) VALUES($1,'running')")
                 .bind(run)
                 .execute(&neon)
                 .await?;
             let result = async {
-                if reconciliation_due(&local).await? {
-                    reconcile(&local, &neon, run).await?;
-                }
-                let (rows, bytes) = run_queue(&local, &neon, run).await?;
-                if derived_rebuild_due(&local, rows).await? {
-                    rebuild_derived(&local, &neon).await?;
-                    sqlx::query("INSERT INTO sync_meta.state(state_key,state_value) VALUES('last_derived_rebuild',jsonb_build_object('at',now())) ON CONFLICT(state_key) DO UPDATE SET state_value=EXCLUDED.state_value,updated_at=now()")
-                        .execute(&local)
-                        .await?;
-                }
+                let event_count = push_events(&local, &neon, &lease).await?;
+                let (rows, bytes) = run_queue(&local, &neon, run, &lease).await?;
                 sqlx::query("INSERT INTO sync_meta.state(state_key,state_value) VALUES('last_success',jsonb_build_object('at',now(),'rows',$1,'bytes',$2)) ON CONFLICT(state_key) DO UPDATE SET state_value=EXCLUDED.state_value,updated_at=now()")
                     .bind(rows as i64)
                     .bind(bytes as i64)
                     .execute(&local)
                     .await?;
-                Ok::<_, anyhow::Error>((rows, bytes))
+                Ok::<_, anyhow::Error>((rows, bytes, event_count))
             }
             .await;
+            release_target_lease(&neon, &lease).await;
             match result {
-                Ok((rows, bytes)) => {
+                Ok((rows, bytes, event_count)) => {
                     sqlx::query("UPDATE sync_meta.runs SET status='success',finished_at=now(),rows_applied=$2,bytes_applied=$3 WHERE run_id=$1").bind(run).bind(rows as i64).bind(bytes as i64).execute(&neon).await?;
-                    println!("sync complete: {rows} rows, {bytes} bytes");
+                    println!("sync complete: {rows} projection rows, {event_count} event(s), {bytes} bytes");
                     Ok(())
                 }
                 Err(error) => {

@@ -2,10 +2,11 @@
 
 ## Authority and Secrets
 
-- Local PostgreSQL is authoritative. Neon is an exact, recoverable cloud mirror.
+- Each device's local PostgreSQL is its offline write cache. Neon is the shared
+  active event exchange and projection; Google Drive is encrypted cold storage.
 - Never print, commit, or pass database URLs, API keys, or tokens in command
-  arguments, logs, state tables, LaunchAgent files, or commits. Use environment
-  variables (normally from the ignored `.env`) only.
+  arguments, logs, state tables, LaunchAgent files, or commits. Use a protected
+  per-device environment file only; client JSON names the MCP wrapper, never secrets.
 - Preserve unrelated worktree changes and stage named task files only.
 
 ## Resumable Neon Sync

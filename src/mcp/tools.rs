@@ -167,6 +167,11 @@ pub fn list_tools() -> Value {
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
         },
         {
+            "name": "memory_health",
+            "description": "Read-only runtime health: database identity, migrations, embedding readiness, sync cursors, queue depth, and archive state.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        },
+        {
             "name": "session_context",
             "description": "Get all documents and memories accessed in a session. Returns a chronological list with interaction types and relevance scores.",
             "inputSchema": {
@@ -206,6 +211,7 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result
         "list" => tool_list(state, arguments).await,
         "status" => tool_status(state, arguments).await,
         "archive_status" => tool_archive_status(state, arguments).await,
+        "memory_health" => tool_memory_health(state).await,
         "session_context" => tool_session_context(state, arguments).await,
         _ => Err(anyhow::anyhow!("Unknown tool: {name}")),
     }
@@ -370,7 +376,10 @@ async fn tool_memory_context(state: &AppState, args: Value) -> Result<String> {
     let context = match &state.embedding_service {
         Some(svc) => {
             let embedding = svc.embed(&query).await?.as_vec().to_vec();
-            state.db.get_context_for_query(&query, &embedding, 10).await?
+            state
+                .db
+                .get_context_for_query(&query, &embedding, 10)
+                .await?
         }
         None => state.db.get_keyword_context_for_query(&query, 10).await?,
     };
@@ -412,7 +421,10 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
     let context = match &state.embedding_service {
         Some(svc) => {
             let embedding = svc.embed(&goal).await?.as_vec().to_vec();
-            state.db.get_context_for_query(&goal, &embedding, 10).await?
+            state
+                .db
+                .get_context_for_query(&goal, &embedding, 10)
+                .await?
         }
         None => state.db.get_keyword_context_for_query(&goal, 10).await?,
     };
@@ -926,6 +938,13 @@ async fn tool_status(state: &AppState, _args: Value) -> Result<String> {
     let stats = state.db.get_stats().await;
     let embedding_dimensions = state.db.embedding_dimensions().await.unwrap_or_default();
 
+    let retrieval_mode = if !healthy {
+        "degraded"
+    } else if state.embedding_service.is_some() {
+        "semantic"
+    } else {
+        "keyword-only"
+    };
     let result = json!({
         "healthy": healthy,
         "stats": stats,
@@ -934,12 +953,62 @@ async fn tool_status(state: &AppState, _args: Value) -> Result<String> {
             "embedding_dimension": state.config.embedding_dim,
             "active_embedding_dimensions": embedding_dimensions,
             "embedding_service": state.embedding_service.is_some(),
-            "search_mode": state.config.search_default_mode,
+            "search_mode": retrieval_mode,
             "decay_enabled": state.config.decay_enabled,
         },
     });
 
     Ok(serde_json::to_string(&result)?)
+}
+
+/// Read-only cross-client health contract.  This deliberately tolerates older
+/// databases so operators can diagnose a missing migration without mutation.
+async fn tool_memory_health(state: &AppState) -> Result<String> {
+    let identity = sqlx::query("SELECT current_database(), COALESCE(inet_server_addr()::text, 'local'), COALESCE(inet_server_port(), 0)")
+        .fetch_one(&state.db.pool)
+        .await
+        .context("Failed to identify PostgreSQL endpoint")?;
+    let migrations: Vec<String> =
+        sqlx::query_scalar("SELECT version FROM _migrations ORDER BY version")
+            .fetch_all(&state.db.pool)
+            .await
+            .unwrap_or_default();
+    let pending_sync: Option<i64> = sqlx::query_scalar("SELECT count(*) FROM sync_meta.outbox")
+        .fetch_one(&state.db.pool)
+        .await
+        .ok();
+    let cursor: Option<Value> = sqlx::query_scalar(
+        "SELECT cursor_value FROM sync_meta.cursors WHERE cursor_name='neon_pull'",
+    )
+    .fetch_optional(&state.db.pool)
+    .await
+    .ok()
+    .flatten();
+    let dimensions = state.db.embedding_dimensions().await.unwrap_or_default();
+    let retrieval_mode = if !state.db.health().await {
+        "degraded"
+    } else if state.embedding_service.is_some() {
+        "semantic"
+    } else {
+        "keyword-only"
+    };
+    Ok(json!({
+        "runtime": {
+            "database": identity.get::<String, _>(0),
+            "host": identity.get::<String, _>(1),
+            "port": identity.get::<i32, _>(2),
+            "build_version": env!("CARGO_PKG_VERSION"),
+            "build_revision": std::env::var("MEMORY_BUILD_REVISION").ok(),
+        },
+        "migrations": migrations,
+        "retrieval": {
+            "mode": retrieval_mode,
+            "configured_dimension": state.config.embedding_dim,
+            "active_dimensions": dimensions,
+        },
+        "sync": { "pending_outbox": pending_sync, "pull_cursor": cursor },
+    })
+    .to_string())
 }
 
 /// Read-only cold-archive and durable-sync health for MCP clients.
