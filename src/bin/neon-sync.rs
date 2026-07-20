@@ -421,6 +421,15 @@ async fn acquire_target_lease(neon: &PgPool) -> Result<TargetLease> {
         .await
         .map_err(|_| anyhow!("target lease acquisition timed out"))??
         .ok_or_else(|| anyhow!("another device currently owns the Neon sync lease"))?;
+    // A process can disappear after recording `running`. Once the lease window
+    // has elapsed, preserve the durable queue and record that interruption.
+    sqlx::query(
+        "UPDATE sync_meta.runs SET status='interrupted', finished_at=now(), \
+         error_summary=coalesce(error_summary, 'lease expired before completion') \
+         WHERE status='running' AND started_at < now() - interval '2 minutes'",
+    )
+    .execute(neon)
+    .await?;
     Ok(TargetLease {
         device_id,
         generation: row.get(0),
