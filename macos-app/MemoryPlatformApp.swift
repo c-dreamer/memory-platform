@@ -23,7 +23,11 @@ struct MemoryPlatformApp: App {
 struct DashboardWebView: NSViewRepresentable {
     func makeNSView(context: Context) -> WKWebView {
         let view = WKWebView()
-        view.load(URLRequest(url: URL(string: "http://127.0.0.1:8765")!))
+        let tokenPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/memory-platform/dashboard.token")
+        let token = (try? String(contentsOf: tokenPath, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let url = URL(string: "http://127.0.0.1:8765/?token=\(token)")!
+        view.load(URLRequest(url: url))
         return view
     }
 
