@@ -44,8 +44,10 @@
 ## Automation and Git
 
 - `scripts/install-neon-sync-launchd.sh` installs a user LaunchAgent that runs
-  daily at 03:00, exits quickly when idle, and retries on the next daily run if
-  Neon is unreachable. Use `./sync-to-neon.sh run` for an explicit manual sync.
+  daily at 03:00, exits quickly when idle, and records a retry if Neon is
+  unreachable. A retry checker runs hourly only after a failure, and
+  posts a macOS notification before retrying. Use `./sync-to-neon.sh run` for
+  an explicit manual sync.
 - The daily count audit and weekly fingerprint reconciliation are scheduled by
   dedicated LaunchAgents created by the installer.
 - Keep `main` deployable. Fetch before publishing; commit and stage only verified
