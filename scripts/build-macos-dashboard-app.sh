@@ -10,6 +10,7 @@ command -v swiftc >/dev/null || { echo "Swift is required to build the macOS app
 rm -rf "$APP" "$DMG"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/macos-app/Info.plist" "$APP/Contents/Info.plist"
+cp "$ROOT/macos-app/AppIcon.png" "$APP/Contents/Resources/AppIcon.png"
 swiftc -O -parse-as-library -framework SwiftUI -framework WebKit -framework AppKit \
   "$ROOT/macos-app/MemoryPlatformApp.swift" \
   -o "$APP/Contents/MacOS/MemoryPlatform"
