@@ -18,6 +18,16 @@ It never returns credentials, database URLs, raw session text, or archive data.
 - Resume maintenance.
 - Stop the current scheduled run and keep future maintenance paused.
 
+## Closing the app safely
+
+On macOS, Memory Platform owns the dashboard and maintenance LaunchAgents for
+the duration of the app session. Closing the app stops those background tasks.
+This does not discard sync work: the local event ledger and outbox are durable,
+and an outbox entry is acknowledged only after Neon commits its transaction.
+The next app launch replays an interrupted batch safely or resumes the remaining
+queue. Session ingestion is source-idempotent, so a partially observed session
+is updated rather than duplicated on the next run.
+
 The dashboard binds only to `127.0.0.1:8765`. On the VPS, use an SSH tunnel:
 
 ```sh
