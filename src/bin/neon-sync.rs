@@ -855,6 +855,12 @@ async fn bootstrap_events(local: &PgPool) -> Result<usize> {
                  WHERE NOT EXISTS (SELECT 1 FROM sync_meta.events WHERE table_name=$2 AND record_key=$3 AND operation='upsert')"
             ).bind(&device_id).bind(spec.name).bind(&key).bind(&payload).execute(local).await?.rows_affected();
             created += inserted as usize;
+            // A baseline event alone is not enough: queue the authoritative
+            // source row so the active Neon projection advances in the same
+            // resumable workflow.
+            if inserted == 1 {
+                queue(local, *spec, &key, "upsert").await?;
+            }
         }
     }
     Ok(created)
