@@ -8,6 +8,7 @@ ENV_FILE="${MEMORY_ENV_FILE:-$HOME/.config/memory-platform/memory.env}"
 INGEST="$ROOT/target/release/ingest"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/memory-platform"
 RETRY_FILE="$STATE_DIR/neon-maintenance.retry"
+PAUSE_FILE="$STATE_DIR/neon-maintenance.paused"
 MODE="${1:---daily}"
 
 notify() {
@@ -17,6 +18,10 @@ notify() {
 [[ -r "$ENV_FILE" ]] || { echo "memory environment file is missing: $ENV_FILE" >&2; exit 78; }
 [[ -x "$INGEST" ]] || { echo "memory ingest release is not installed" >&2; exit 78; }
 mkdir -p "$STATE_DIR"
+if [[ -e "$PAUSE_FILE" ]]; then
+  echo "Memory maintenance is paused by the local control panel."
+  exit 0
+fi
 if [[ "$MODE" == "--retry-only" && ! -e "$RETRY_FILE" ]]; then
   exit 0
 fi
