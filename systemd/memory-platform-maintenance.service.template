@@ -1,0 +1,7 @@
+[Unit]
+Description=Memory Platform bounded maintenance
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=__ROOT__/scripts/run-memory-maintenance.sh --daily

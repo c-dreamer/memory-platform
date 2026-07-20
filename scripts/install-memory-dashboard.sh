@@ -13,6 +13,7 @@ else
   units="$HOME/.config/systemd/user"
   mkdir -p "$units"
   sed "s|__ROOT__|$ROOT|g" "$ROOT/systemd/memory-platform-dashboard.service.template" > "$units/memory-platform-dashboard.service"
+  sed "s|__ROOT__|$ROOT|g" "$ROOT/systemd/memory-platform-maintenance.service.template" > "$units/memory-platform-maintenance.service"
   systemctl --user daemon-reload
   systemctl --user enable --now memory-platform-dashboard.service
 fi
