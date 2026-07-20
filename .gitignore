@@ -35,3 +35,4 @@ export-obsidian-index.sh
 
 # Runtime repair logs (state is stored under ~/.local/state/memory-platform)
 repair_embeddings*.log
+dist/
