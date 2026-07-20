@@ -26,7 +26,7 @@ struct DashboardWebView: NSViewRepresentable {
         let tokenPath = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config/memory-platform/dashboard.token")
         let token = (try? String(contentsOf: tokenPath, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let url = URL(string: "http://127.0.0.1:8765/?token=\(token)")!
+        let url = URL(string: "http://127.0.0.1:8765/operations?token=\(token)")!
         view.load(URLRequest(url: url))
         return view
     }
