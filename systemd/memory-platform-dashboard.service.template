@@ -1,0 +1,12 @@
+[Unit]
+Description=Memory Platform local dashboard
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=__ROOT__/scripts/start-memory-dashboard.sh
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target

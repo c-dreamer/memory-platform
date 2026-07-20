@@ -13,6 +13,7 @@ for template in "$ROOT"/launchd/*.plist.template; do
   runner="$RUNNER"
   [[ "$name" == "com.memory-platform.neon-sync.plist" ]] && runner="$ROOT/scripts/run-memory-maintenance.sh"
   [[ "$name" == "com.memory-platform.neon-retry.plist" ]] && runner="$ROOT/scripts/run-memory-maintenance.sh"
+  [[ "$name" == "com.memory-platform.dashboard.plist" ]] && runner="$ROOT/scripts/start-memory-dashboard.sh"
   [[ "$name" == "com.memory-platform.archive-verify.plist" ]] && runner="$ROOT/scripts/verify-memory-archive.sh"
   sed -e "s|__RUNNER__|$runner|g" -e "s|__STATE_HOME__|$STATE_HOME|g" "$template" > "$target"
   launchctl bootout "gui/$(id -u)/${name%.plist}" 2>/dev/null || true
