@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="${MEMORY_ENV_FILE:-$HOME/.config/memory-platform/memory.env}"
 TOKEN_FILE="${MEMORY_DASHBOARD_TOKEN_FILE:-$HOME/.config/memory-platform/dashboard.token}"

@@ -93,7 +93,7 @@ async fn status(State(state): State<Arc<DashboardState>>) -> Result<Json<Dashboa
         }
         _ => (None, None),
     };
-    let orbstack_containers = Command::new("docker").args(["ps", "--format", "{{.Names}}: {{.Status}}"])
+    let orbstack_containers = Command::new("docker").args(["ps", "-a", "--format", "{{.Names}} | {{.Image}} | {{.Status}} | {{.Ports}}"])
         .output().await.ok().and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|value| value.lines().map(str::to_string).collect()).unwrap_or_default();
     let automation_paths = if cfg!(target_os = "macos") {
