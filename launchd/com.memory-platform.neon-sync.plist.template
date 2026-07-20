@@ -9,10 +9,11 @@
     <string>__RUNNER__</string>
     <string>run</string>
   </array>
-  <key>StartInterval</key>
-  <integer>900</integer>
-  <key>RunAtLoad</key>
-  <true/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>
