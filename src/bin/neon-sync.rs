@@ -258,7 +258,6 @@ fn urls(cli: &Cli) -> Result<(String, String)> {
         .clone()
         .or_else(|| env::var("NEON_DIRECT").ok())
         .or_else(|| env::var("NEON_SYNC_URL").ok())
-        .or_else(|| env::var("NEON_DATABASE_URL").ok())
         .ok_or_else(|| anyhow!("NEON_SYNC_URL or NEON_DIRECT is required"))?;
     if neon.contains("-pooler") {
         bail!("NEON_SYNC_URL must be a direct endpoint; refusing to rewrite a pooler URL")

@@ -9,4 +9,7 @@ EnvironmentFile=-/home/humanoracle26/memory-platform-rust/.env
 Environment=MEMORY_ENV_FILE=%h/memory-platform-rust/.env
 Environment=MEMORY_ENV_FILE=/home/humanoracle26/memory-platform-rust/.env
 Environment=RUST_LOG=info
+# Sync requires a Neon direct endpoint. It is intentionally not derived from a
+# pooler URL: add NEON_DIRECT or NEON_SYNC_URL to the protected environment
+# file after obtaining the direct connection string from Neon.
 ExecStart=/home/humanoracle26/memory-platform-rust/sync-to-neon.sh
