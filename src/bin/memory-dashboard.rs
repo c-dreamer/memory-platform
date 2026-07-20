@@ -18,6 +18,7 @@ use tokio::process::Command;
 #[derive(Clone)]
 struct DashboardState {
     local: PgPool,
+    neon: Option<PgPool>,
     root: PathBuf,
     state_dir: PathBuf,
 }
@@ -34,6 +35,9 @@ struct DashboardStatus {
     paused: bool,
     retry_pending: bool,
     scheduler: &'static str,
+    neon_reachable: bool,
+    orbstack_containers: Vec<String>,
+    automation_paths: Vec<String>,
 }
 
 fn root() -> Result<PathBuf> {
@@ -69,6 +73,16 @@ async fn status(State(state): State<Arc<DashboardState>>) -> Result<Json<Dashboa
         .fetch_optional(&state.local).await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let pause = state.state_dir.join("neon-maintenance.paused");
     let retry = state.state_dir.join("neon-maintenance.retry");
+    let neon_reachable = match &state.neon {
+        Some(pool) => tokio::time::timeout(std::time::Duration::from_secs(3), sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(pool)).await.is_ok(),
+        None => false,
+    };
+    let orbstack_containers = Command::new("docker").args(["ps", "--format", "{{.Names}}: {{.Status}}"])
+        .output().await.ok().and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.lines().map(str::to_string).collect()).unwrap_or_default();
+    let automation_paths = if cfg!(target_os = "macos") {
+        vec!["~/Library/LaunchAgents/com.memory-platform.neon-sync.plist".into(), "~/Library/LaunchAgents/com.memory-platform.neon-retry.plist".into(), "~/Library/LaunchAgents/com.memory-platform.dashboard.plist".into()]
+    } else { vec!["~/.config/systemd/user/memory-platform-dashboard.service".into(), "~/.config/systemd/user/memory-platform-maintenance.service".into()] };
     Ok(Json(DashboardStatus {
         queue_depth,
         events_total,
@@ -80,6 +94,9 @@ async fn status(State(state): State<Arc<DashboardState>>) -> Result<Json<Dashboa
         paused: pause.exists(),
         retry_pending: retry.exists(),
         scheduler: if cfg!(target_os = "macos") { "launchd" } else { "systemd user service" },
+        neon_reachable,
+        orbstack_containers,
+        automation_paths,
     }))
 }
 
@@ -131,7 +148,8 @@ const PAGE: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Me
 async fn main() -> Result<()> {
     let database_url = env::var("DATABASE_URL").context("DATABASE_URL is required")?;
     let port = env::var("MEMORY_DASHBOARD_PORT").unwrap_or_else(|_| "8765".into()).parse::<u16>()?;
-    let state = Arc::new(DashboardState { local: PgPoolOptions::new().max_connections(2).connect(&database_url).await?, root: root()?, state_dir: state_dir() });
+    let neon = env::var("NEON_SYNC_URL").ok().and_then(|url| PgPoolOptions::new().max_connections(1).connect_lazy(&url).ok());
+    let state = Arc::new(DashboardState { local: PgPoolOptions::new().max_connections(2).connect(&database_url).await?, neon, root: root()?, state_dir: state_dir() });
     let app = Router::new().route("/", get(|| async { Html(PAGE) })).route("/api/status", get(status)).route("/api/action/{action}", post(control)).with_state(state);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     println!("Memory dashboard listening on http://{addr}");
