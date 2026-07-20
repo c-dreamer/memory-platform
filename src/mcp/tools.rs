@@ -4,6 +4,8 @@
 //! a `serde_json::Value` arguments map, returning a JSON string result.
 //! The `call_tool` dispatcher routes by tool name.
 
+use std::{env, path::PathBuf, process::Stdio};
+
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -172,6 +174,16 @@ pub fn list_tools() -> Value {
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
         },
         {
+            "name": "dashboard_status",
+            "description": "Read-only operations dashboard status: queue, event publication, archive totals, pause and retry state. Never returns secrets or raw content.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        },
+        {
+            "name": "dashboard_control",
+            "description": "Control the bounded local maintenance scheduler. Actions are limited to start, pause, resume, or stop.",
+            "inputSchema": { "type": "object", "properties": { "action": { "type": "string", "enum": ["start", "pause", "resume", "stop"] } }, "required": ["action"] }
+        },
+        {
             "name": "session_context",
             "description": "Get all documents and memories accessed in a session. Returns a chronological list with interaction types and relevance scores.",
             "inputSchema": {
@@ -212,6 +224,8 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result
         "status" => tool_status(state, arguments).await,
         "archive_status" => tool_archive_status(state, arguments).await,
         "memory_health" => tool_memory_health(state).await,
+        "dashboard_status" => tool_dashboard_status(state).await,
+        "dashboard_control" => tool_dashboard_control(arguments).await,
         "session_context" => tool_session_context(state, arguments).await,
         _ => Err(anyhow::anyhow!("Unknown tool: {name}")),
     }
@@ -1009,6 +1023,69 @@ async fn tool_memory_health(state: &AppState) -> Result<String> {
         "sync": { "pending_outbox": pending_sync, "pull_cursor": cursor },
     })
     .to_string())
+}
+
+fn dashboard_state_dir() -> PathBuf {
+    env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/state"))
+        .join("memory-platform")
+}
+
+async fn tool_dashboard_status(state: &AppState) -> Result<String> {
+    let queue_depth: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_meta.outbox")
+        .fetch_one(&state.db.pool).await?;
+    let (events_total, events_published): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE pushed_at IS NOT NULL) FROM sync_meta.events",
+    ).fetch_one(&state.db.pool).await?;
+    let state_dir = dashboard_state_dir();
+    Ok(json!({
+        "queue_depth": queue_depth,
+        "events_total": events_total,
+        "events_published": events_published,
+        "events_unpublished": events_total - events_published,
+        "paused": state_dir.join("neon-maintenance.paused").exists(),
+        "retry_pending": state_dir.join("neon-maintenance.retry").exists(),
+    }).to_string())
+}
+
+async fn tool_dashboard_control(args: Value) -> Result<String> {
+    let action = get_string(&args, "action")?;
+    let state_dir = dashboard_state_dir();
+    std::fs::create_dir_all(&state_dir)?;
+    let pause = state_dir.join("neon-maintenance.paused");
+    match action.as_str() {
+        "pause" => std::fs::write(&pause, "paused by MCP\n")?,
+        "resume" | "start" => {
+            let _ = std::fs::remove_file(&pause);
+            run_dashboard_scheduler("start").await?;
+        }
+        "stop" => {
+            std::fs::write(&pause, "stopped by MCP\n")?;
+            run_dashboard_scheduler("stop").await?;
+        }
+        _ => anyhow::bail!("action must be start, pause, resume, or stop"),
+    }
+    Ok(json!({"ok": true, "action": action}).to_string())
+}
+
+async fn run_dashboard_scheduler(action: &str) -> Result<()> {
+    let mut command = if cfg!(target_os = "macos") {
+        let output = tokio::process::Command::new("id").arg("-u").output().await?;
+        let uid = String::from_utf8(output.stdout)?.trim().to_string();
+        let label = format!("gui/{uid}/com.memory-platform.neon-sync");
+        let mut command = tokio::process::Command::new("launchctl");
+        if action == "stop" { command.args(["kill", "SIGTERM", &label]); }
+        else { command.args(["kickstart", "-k", &label]); }
+        command
+    } else {
+        let mut command = tokio::process::Command::new("systemctl");
+        command.args(["--user", action, "memory-platform-maintenance.service"]);
+        command
+    };
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    anyhow::ensure!(command.status().await?.success(), "scheduler action failed");
+    Ok(())
 }
 
 /// Read-only cold-archive and durable-sync health for MCP clients.

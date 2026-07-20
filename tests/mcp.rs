@@ -70,14 +70,14 @@ async fn test_mcp_tools_list() {
     let resp = response.unwrap();
 
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 15, "Should return 15 tools");
+    assert_eq!(tools.len(), 17, "Should return 17 tools");
 
     let names: Vec<&str> = tools.iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
     for name in &["memory_search", "memory_store", "memory_context",
                   "memory_initialize", "experience_find", "procedure_run",
-                  "session_start", "session_end", "recall", "forget", "list", "status", "session_context", "archive_status", "memory_health"] {
+                  "session_start", "session_end", "recall", "forget", "list", "status", "session_context", "archive_status", "memory_health", "dashboard_status", "dashboard_control"] {
         assert!(names.contains(name), "Missing tool: {name}");
     }
 }
