@@ -17,6 +17,7 @@ use memory_platform::ingest::{
     sessions as ingest_sessions, vault as ingest_vault,
 };
 use memory_platform::ingest::{IngestEngine, IngestReport};
+use memory_platform::migrations::Migrator;
 use sqlx::postgres::PgPoolOptions;
 use std::path::PathBuf;
 use tracing::{info, warn};
@@ -147,6 +148,8 @@ async fn main() -> Result<()> {
         .connect(&cli.db_url)
         .await
         .context("Failed to connect to PostgreSQL")?;
+
+    Migrator::run(&pool).await.context("Failed to run database migrations")?;
 
     let engine = IngestEngine::new(pool);
     let mut report = IngestReport::default();

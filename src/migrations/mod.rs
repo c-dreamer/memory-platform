@@ -84,6 +84,10 @@ impl Migrator {
                 "011_derived_embeddings_2048",
                 include_str!("../../migrations/011_derived_embeddings_2048.sql"),
             ),
+            (
+                "012_fts_input_size_guard",
+                include_str!("../../migrations/012_fts_input_size_guard.sql"),
+            ),
         ];
 
         // Apply pending migrations in order
