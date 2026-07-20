@@ -1,8 +1,8 @@
 [Unit]
-Description=Run Neon sync every 30 minutes
+Description=Run Neon sync daily
 
 [Timer]
-OnCalendar=*:0/30
+OnCalendar=*-*-* 03:45:00
 Persistent=true
 RandomizedDelaySec=5m
 Unit=memory-neon-sync.service

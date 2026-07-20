@@ -1,8 +1,8 @@
 [Unit]
-Description=Run memory freshness ingest hourly
+Description=Run memory freshness ingest daily
 
 [Timer]
-OnCalendar=hourly
+OnCalendar=*-*-* 03:25:00
 Persistent=true
 RandomizedDelaySec=10m
 Unit=memory-ingest.service

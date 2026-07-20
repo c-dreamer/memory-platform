@@ -12,7 +12,7 @@ if [[ -f "$ROOT/.env" ]]; then
 fi
 
 case "${1:-run}" in
-  run|reconcile|status|rebuild-derived)
+  run|reconcile|status|verify|rebuild-derived)
     command="${1:-run}"
     shift || true
     exec cargo run --quiet --manifest-path "$ROOT/Cargo.toml" --bin neon-sync -- "$command" "$@"
@@ -22,7 +22,7 @@ case "${1:-run}" in
     exit 2
     ;;
   *)
-    echo "Usage: $0 [run|reconcile|status|rebuild-derived]" >&2
+    echo "Usage: $0 [run|reconcile|status|verify|rebuild-derived]" >&2
     exit 2
     ;;
 esac
