@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::db::postgres::PostgresDb;
 use crate::db::postgres::ContextPackage;
+use crate::db::postgres::PostgresDb;
 
 /// Called when a new session starts.
 ///
@@ -156,10 +156,7 @@ pub fn format_context_banner(context: &ContextPackage) -> String {
         }
 
         if !context.experiences.is_empty() {
-            lines.push(format!(
-                "\nExperiences ({}):",
-                context.experiences.len()
-            ));
+            lines.push(format!("\nExperiences ({}):", context.experiences.len()));
             for e in context.experiences.iter().take(3) {
                 lines.push(format!(
                     "  - [score:{:.2}] {}",
@@ -184,10 +181,7 @@ pub fn format_context_banner(context: &ContextPackage) -> String {
         }
 
         if !context.procedures.is_empty() {
-            lines.push(format!(
-                "\nProcedures ({}):",
-                context.procedures.len()
-            ));
+            lines.push(format!("\nProcedures ({}):", context.procedures.len()));
             for p in &context.procedures {
                 lines.push(format!("  - [used:{}] {}", p.times_used, p.name));
             }
@@ -219,10 +213,8 @@ pub fn format_context_banner(context: &ContextPackage) -> String {
 ///
 /// Returns a value in [0.0, 1.0] where 1.0 means identical word sets.
 fn jaccard_similarity(a: &str, b: &str) -> f64 {
-    let words_a: std::collections::HashSet<&str> =
-        a.split_whitespace().collect();
-    let words_b: std::collections::HashSet<&str> =
-        b.split_whitespace().collect();
+    let words_a: std::collections::HashSet<&str> = a.split_whitespace().collect();
+    let words_b: std::collections::HashSet<&str> = b.split_whitespace().collect();
 
     if words_a.is_empty() && words_b.is_empty() {
         return 1.0;

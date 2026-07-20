@@ -32,9 +32,12 @@ impl McpTransport for StdioTransport {
     async fn recv(&self) -> Result<String> {
         let mut reader = BufReader::new(tokio::io::stdin());
         let mut line = String::new();
-        timeout(Duration::from_secs(STDIN_TIMEOUT_SECS), reader.read_line(&mut line))
-            .await
-            .map_err(|_| anyhow::anyhow!("stdin read timed out"))??;
+        timeout(
+            Duration::from_secs(STDIN_TIMEOUT_SECS),
+            reader.read_line(&mut line),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("stdin read timed out"))??;
 
         if line.len() > MAX_LINE_SIZE {
             anyhow::bail!("Request too large");
@@ -59,8 +62,8 @@ impl McpTransport for StdioTransport {
 pub async fn handle_http_request(state: Arc<AppState>, body: String) -> Result<String> {
     let server = McpServer::new(state);
 
-    let request_value: Value = serde_json::from_str(&body)
-        .map_err(|e| anyhow::anyhow!("Parse error: {e}"))?;
+    let request_value: Value =
+        serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("Parse error: {e}"))?;
 
     let is_notification = request_value.get("id").is_none();
     let response = server.handle_request(request_value).await?;

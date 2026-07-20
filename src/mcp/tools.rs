@@ -37,7 +37,7 @@ pub fn list_tools() -> Value {
         },
         {
             "name": "memory_store",
-            "description": "Store a new memory with optional tags, content type, and importance. Returns the created memory ID.",
+            "description": "Store a new memory with optional tags, content type, importance, and critical flag. Critical memories are tagged and included in the active sync queue; archived raw content is never forced to Neon.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -45,6 +45,7 @@ pub fn list_tools() -> Value {
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags for categorization", "default": [] },
                     "content_type": { "type": "string", "description": "Type: note, insight, decision, observation, error", "default": "note" },
                     "importance": { "type": "number", "description": "Importance 0.0-1.0 (default: 0.5)", "default": 0.5 },
+                    "critical": { "type": "boolean", "description": "Mark as critical. Sets importance to at least 0.9 and adds the critical tag.", "default": false },
                     "session_id": { "type": "string", "description": "Optional session UUID to create cross-reference", "default": null }
                 },
                 "required": ["content"]
@@ -180,8 +181,8 @@ pub fn list_tools() -> Value {
         },
         {
             "name": "dashboard_control",
-            "description": "Control the bounded local maintenance scheduler. Actions are limited to start, pause, resume, or stop.",
-            "inputSchema": { "type": "object", "properties": { "action": { "type": "string", "enum": ["start", "pause", "resume", "stop"] } }, "required": ["action"] }
+            "description": "Control the bounded local maintenance scheduler. Push critical starts the same durable, privacy-aware queue; it never sends archived raw content.",
+            "inputSchema": { "type": "object", "properties": { "action": { "type": "string", "enum": ["start", "pause", "resume", "retry", "push_critical", "stop"] } }, "required": ["action"] }
         },
         {
             "name": "session_context",
@@ -315,9 +316,19 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
 /// 2. memory_store — store a new memory.
 async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
     let content = get_string(&args, "content")?;
-    let tags = get_string_array(&args, "tags").unwrap_or_default();
+    let mut tags = get_string_array(&args, "tags").unwrap_or_default();
     let content_type = get_string(&args, "content_type").unwrap_or_else(|_| "note".to_string());
-    let importance = get_f64(&args, "importance").unwrap_or(0.5);
+    let critical = args
+        .get("critical")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut importance = get_f64(&args, "importance").unwrap_or(0.5);
+    if critical {
+        importance = importance.max(0.9);
+        if !tags.iter().any(|tag| tag == "critical") {
+            tags.push("critical".into());
+        }
+    }
     let session_id = args
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -342,7 +353,7 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
             &content_type,
             importance,
             &tags,
-            &json!({}),
+            &json!({"critical": critical}),
             None,
             None,
             embedding_slice,
@@ -1028,16 +1039,21 @@ async fn tool_memory_health(state: &AppState) -> Result<String> {
 fn dashboard_state_dir() -> PathBuf {
     env::var("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/state"))
+        .unwrap_or_else(|_| {
+            PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/state")
+        })
         .join("memory-platform")
 }
 
 async fn tool_dashboard_status(state: &AppState) -> Result<String> {
     let queue_depth: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_meta.outbox")
-        .fetch_one(&state.db.pool).await?;
+        .fetch_one(&state.db.pool)
+        .await?;
     let (events_total, events_published): (i64, i64) = sqlx::query_as(
         "SELECT count(*), count(*) FILTER (WHERE pushed_at IS NOT NULL) FROM sync_meta.events",
-    ).fetch_one(&state.db.pool).await?;
+    )
+    .fetch_one(&state.db.pool)
+    .await?;
     let state_dir = dashboard_state_dir();
     Ok(json!({
         "queue_depth": queue_depth,
@@ -1046,7 +1062,8 @@ async fn tool_dashboard_status(state: &AppState) -> Result<String> {
         "events_unpublished": events_total - events_published,
         "paused": state_dir.join("neon-maintenance.paused").exists(),
         "retry_pending": state_dir.join("neon-maintenance.retry").exists(),
-    }).to_string())
+    })
+    .to_string())
 }
 
 async fn tool_dashboard_control(args: Value) -> Result<String> {
@@ -1056,7 +1073,7 @@ async fn tool_dashboard_control(args: Value) -> Result<String> {
     let pause = state_dir.join("neon-maintenance.paused");
     match action.as_str() {
         "pause" => std::fs::write(&pause, "paused by MCP\n")?,
-        "resume" | "start" => {
+        "resume" | "start" | "retry" | "push_critical" => {
             let _ = std::fs::remove_file(&pause);
             run_dashboard_scheduler("start").await?;
         }
@@ -1064,19 +1081,25 @@ async fn tool_dashboard_control(args: Value) -> Result<String> {
             std::fs::write(&pause, "stopped by MCP\n")?;
             run_dashboard_scheduler("stop").await?;
         }
-        _ => anyhow::bail!("action must be start, pause, resume, or stop"),
+        _ => anyhow::bail!("action must be start, pause, resume, retry, push_critical, or stop"),
     }
     Ok(json!({"ok": true, "action": action}).to_string())
 }
 
 async fn run_dashboard_scheduler(action: &str) -> Result<()> {
     let mut command = if cfg!(target_os = "macos") {
-        let output = tokio::process::Command::new("id").arg("-u").output().await?;
+        let output = tokio::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .await?;
         let uid = String::from_utf8(output.stdout)?.trim().to_string();
         let label = format!("gui/{uid}/com.memory-platform.neon-sync");
         let mut command = tokio::process::Command::new("launchctl");
-        if action == "stop" { command.args(["kill", "SIGTERM", &label]); }
-        else { command.args(["kickstart", "-k", &label]); }
+        if action == "stop" {
+            command.args(["kill", "SIGTERM", &label]);
+        } else {
+            command.args(["kickstart", "-k", &label]);
+        }
         command
     } else {
         let mut command = tokio::process::Command::new("systemctl");
@@ -1288,10 +1311,10 @@ mod tests {
     }
 
     #[test]
-    fn list_tools_returns_14_tools() {
+    fn list_tools_returns_17_tools() {
         let tools = list_tools();
         let arr = tools.as_array().expect("tools should be an array");
-        assert_eq!(arr.len(), 14, "Expected 14 tools");
+        assert_eq!(arr.len(), 17, "Expected 17 tools");
     }
 
     #[test]

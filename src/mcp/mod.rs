@@ -317,7 +317,7 @@ mod tests {
 
         let tools = response["result"]["tools"].as_array().unwrap();
         assert!(!tools.is_empty(), "Should return non-empty tools list");
-        assert_eq!(tools.len(), 15, "Should return exactly 15 tools");
+        assert_eq!(tools.len(), 17, "Should return exactly 17 tools");
     }
 
     #[tokio::test]
