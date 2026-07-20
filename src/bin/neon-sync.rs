@@ -461,7 +461,7 @@ async fn queue(local: &PgPool, spec: TableSpec, key: &str, op: &str) -> Result<(
     Ok(())
 }
 
-async fn push_events(local: &PgPool, neon: &PgPool, lease: &TargetLease) -> Result<usize> {
+async fn push_event_batch(local: &PgPool, neon: &PgPool, lease: &TargetLease) -> Result<usize> {
     let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
         "SELECT event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at \
          FROM sync_meta.events WHERE pushed_at IS NULL ORDER BY created_at,event_id LIMIT $1"
@@ -499,6 +499,19 @@ async fn push_events(local: &PgPool, neon: &PgPool, lease: &TargetLease) -> Resu
         .execute(local)
         .await?;
     Ok(rows.len())
+}
+
+async fn push_events(local: &PgPool, neon: &PgPool, lease: &TargetLease) -> Result<usize> {
+    let started = Instant::now();
+    let mut published = 0;
+    while started.elapsed() < RUN_BUDGET {
+        let batch = push_event_batch(local, neon, lease).await?;
+        published += batch;
+        if batch < DEFAULT_BATCH_ROWS {
+            break;
+        }
+    }
+    Ok(published)
 }
 
 async fn apply_remote_event(local: &PgPool, table: &str, key: &str, payload: &Value) -> Result<()> {
