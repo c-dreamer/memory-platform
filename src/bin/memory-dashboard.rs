@@ -38,6 +38,10 @@ struct DashboardStatus {
     neon_reachable: bool,
     orbstack_containers: Vec<String>,
     automation_paths: Vec<String>,
+    local_database_mb: f64,
+    neon_database_mb: Option<f64>,
+    pending_upload_bytes: i64,
+    neon_documents: Option<i64>,
 }
 
 fn root() -> Result<PathBuf> {
@@ -77,6 +81,18 @@ async fn status(State(state): State<Arc<DashboardState>>) -> Result<Json<Dashboa
         Some(pool) => tokio::time::timeout(std::time::Duration::from_secs(3), sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(pool)).await.is_ok(),
         None => false,
     };
+    let local_database_mb: f64 = sqlx::query_scalar("SELECT pg_database_size(current_database())::float8 / 1024 / 1024")
+        .fetch_one(&state.local).await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let pending_upload_bytes: i64 = sqlx::query_scalar("SELECT coalesce(sum(pg_column_size(payload)),0)::bigint FROM sync_meta.events WHERE pushed_at IS NULL")
+        .fetch_one(&state.local).await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let (neon_database_mb, neon_documents) = match &state.neon {
+        Some(pool) if neon_reachable => {
+            let size = sqlx::query_scalar("SELECT pg_database_size(current_database())::float8 / 1024 / 1024").fetch_one(pool).await.ok();
+            let documents = sqlx::query_scalar("SELECT count(*) FROM documents").fetch_one(pool).await.ok();
+            (size, documents)
+        }
+        _ => (None, None),
+    };
     let orbstack_containers = Command::new("docker").args(["ps", "--format", "{{.Names}}: {{.Status}}"])
         .output().await.ok().and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|value| value.lines().map(str::to_string).collect()).unwrap_or_default();
@@ -97,6 +113,10 @@ async fn status(State(state): State<Arc<DashboardState>>) -> Result<Json<Dashboa
         neon_reachable,
         orbstack_containers,
         automation_paths,
+        local_database_mb,
+        neon_database_mb,
+        pending_upload_bytes,
+        neon_documents,
     }))
 }
 
