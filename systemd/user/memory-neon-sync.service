@@ -6,5 +6,7 @@ After=network-online.target
 Type=oneshot
 WorkingDirectory=/home/humanoracle26/memory-platform-rust
 EnvironmentFile=-/home/humanoracle26/memory-platform-rust/.env
+Environment=MEMORY_ENV_FILE=%h/memory-platform-rust/.env
+Environment=MEMORY_ENV_FILE=/home/humanoracle26/memory-platform-rust/.env
 Environment=RUST_LOG=info
 ExecStart=/home/humanoracle26/memory-platform-rust/sync-to-neon.sh
