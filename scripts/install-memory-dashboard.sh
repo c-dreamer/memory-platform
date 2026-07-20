@@ -8,7 +8,6 @@ if [[ "$(uname)" == "Darwin" ]]; then
   target="$agents/com.memory-platform.dashboard.plist"
   sed -e "s|__RUNNER__|$ROOT/scripts/start-memory-dashboard.sh|g" -e "s|__STATE_HOME__|$state|g" "$ROOT/launchd/com.memory-platform.dashboard.plist.template" > "$target"
   launchctl bootout "gui/$(id -u)/com.memory-platform.dashboard" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$target"
 else
   units="$HOME/.config/systemd/user"
   mkdir -p "$units"
@@ -17,4 +16,4 @@ else
   systemctl --user daemon-reload
   systemctl --user enable --now memory-platform-dashboard.service
 fi
-echo "Dashboard available locally at http://127.0.0.1:8765"
+echo "Dashboard definition installed. Memory Platform starts it while the app is open."

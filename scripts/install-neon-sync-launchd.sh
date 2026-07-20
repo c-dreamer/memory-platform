@@ -17,7 +17,6 @@ for template in "$ROOT"/launchd/*.plist.template; do
   [[ "$name" == "com.memory-platform.archive-verify.plist" ]] && runner="$ROOT/scripts/verify-memory-archive.sh"
   sed -e "s|__RUNNER__|$runner|g" -e "s|__STATE_HOME__|$STATE_HOME|g" "$template" > "$target"
   launchctl bootout "gui/$(id -u)/${name%.plist}" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$target"
 done
 
-echo "Installed resumable Neon sync LaunchAgents. Credentials remain in the protected environment file."
+echo "Installed app-managed LaunchAgent definitions. Memory Platform starts them only while the app is open."
