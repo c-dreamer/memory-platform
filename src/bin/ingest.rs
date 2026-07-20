@@ -77,6 +77,13 @@ enum Commands {
         #[arg(short = 'p', long = "path", default_value = "~/.codex/sessions")]
         sessions_path: PathBuf,
     },
+    /// Read-only inventory of Codex archive identities and settled state.
+    CodexInventory {
+        #[arg(long, default_value = "~/.codex/sessions")]
+        sessions_path: PathBuf,
+        #[arg(long, default_value_t = 120)]
+        settle_seconds: i64,
+    },
     /// Run all ingest steps
     All {
         /// Path to opencode.db (SQLite)
@@ -124,6 +131,7 @@ fn expand_path(path: &PathBuf) -> PathBuf {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .with_target(false)
@@ -169,6 +177,19 @@ async fn main() -> Result<()> {
         Commands::Codex { sessions_path } => {
             let path = expand_path(sessions_path);
             ingest_codex_sessions::ingest_codex_sessions(&engine, &path, &mut report).await?;
+        }
+        Commands::CodexInventory {
+            sessions_path,
+            settle_seconds,
+        } => {
+            let path = expand_path(sessions_path);
+            let inventory =
+                ingest_codex_sessions::inventory_codex_sessions(&engine, &path, *settle_seconds)
+                    .await?;
+            println!("{}", serde_json::to_string_pretty(&inventory)?);
+            if !inventory.missing_source_ids.is_empty() || !inventory.changed_documents.is_empty() {
+                anyhow::bail!("Codex inventory is not synchronized");
+            }
         }
         Commands::All {
             sessions_db,

@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use memory_platform::migrations::Migrator;
 
-const DEFAULT_BATCH_ROWS: usize = 25;
+const DEFAULT_BATCH_ROWS: usize = 200;
 const MIN_BATCH_ROWS: usize = 1;
 const MAX_BATCH_BYTES: usize = 2 * 1024 * 1024;
 const RUN_BUDGET: Duration = Duration::from_secs(10 * 60);
@@ -53,6 +53,8 @@ enum Command {
     Reconcile,
     /// Show queue state and count parity without changing either corpus.
     Status,
+    /// Verify exact active-row fingerprints, embedding integrity, and queue emptiness.
+    Verify,
     /// Rebuild Neon full-text search and derived embedding cache without NVIDIA calls.
     RebuildDerived,
     /// Emergency-only destructive target reset. Never runs automatically.
@@ -365,8 +367,16 @@ async fn inventory(pool: &PgPool, spec: TableSpec) -> Result<BTreeMap<String, St
     } else {
         ""
     };
+    // JSONB normalizes floating-point metadata differently across PostgreSQL
+    // clients. Metadata is replicated and preserved, but excluded from the
+    // transport fingerprint so semantically identical rows do not churn.
+    let metadata = if spec.name == "memories" {
+        " - 'metadata'"
+    } else {
+        ""
+    };
     let sql = format!(
-        "SELECT {}::text, md5((to_jsonb(t) - 'fts' - 'embedding')::text){} FROM public.{} t WHERE t.storage_tier='active'",
+        "SELECT {}::text, md5((to_jsonb(t) - 'fts' - 'embedding' - 'updated_at'{metadata})::text){} FROM public.{} t WHERE t.storage_tier='active'",
         quote_ident(spec.key),
         embedding,
         quote_ident(spec.name)
@@ -449,30 +459,32 @@ async fn resolve_natural_conflicts(local: &PgPool, neon: &PgPool, run_id: Uuid) 
         let natural = quote_ident(spec.natural_key.unwrap());
         let table = quote_ident(spec.name);
         let key = quote_ident(spec.key);
-        let sql = format!("SELECT l.{key}::text, n.{key}::text FROM public.{table} l JOIN public.{table} n ON l.{natural}=n.{natural} WHERE l.{key} IS DISTINCT FROM n.{key}");
-        // This query must run across databases, so obtain local natural keys then look each up remotely.
+        // Databases cannot be joined directly. Fetch each inventory once rather
+        // than issuing one remote query per local row.
         let local_values = sqlx::query(&format!(
             "SELECT {natural}::text, {key}::text FROM public.{table}"
         ))
         .fetch_all(local)
         .await?;
+        let remote_values = sqlx::query(&format!(
+            "SELECT {natural}::text, {key}::text FROM public.{table}"
+        ))
+        .fetch_all(neon)
+        .await?;
+        let remote_by_natural: HashMap<String, String> = remote_values
+            .into_iter()
+            .filter_map(|row| Some((row.try_get(0).ok()?, row.try_get(1).ok()?)))
+            .collect();
         for row in local_values {
             let value: String = row.get(0);
             let local_key: String = row.get(1);
-            let remote_sql =
-                format!("SELECT {key}::text FROM public.{table} WHERE {natural}::text=$1");
-            if let Some(remote_key) = sqlx::query_scalar::<_, String>(&remote_sql)
-                .bind(&value)
-                .fetch_optional(neon)
-                .await?
-            {
-                if remote_key != local_key {
+            if let Some(remote_key) = remote_by_natural.get(&value) {
+                if *remote_key != local_key {
                     archive_and_delete(neon, run_id, spec, &remote_key, "natural-key-conflict")
                         .await?;
                 }
             }
         }
-        let _ = sql; // Documents the invariant while keeping inventories database-local.
     }
     Ok(())
 }
@@ -509,6 +521,46 @@ async fn reconcile(local: &PgPool, neon: &PgPool, run_id: Uuid) -> Result<usize>
     sqlx::query("INSERT INTO sync_meta.state(state_key,state_value) VALUES('last_reconcile',jsonb_build_object('at',now(),'changes',$1)) ON CONFLICT(state_key) DO UPDATE SET state_value=EXCLUDED.state_value,updated_at=now()")
         .bind(changes as i64).execute(local).await?;
     Ok(changes)
+}
+
+async fn verify(local: &PgPool, neon: &PgPool) -> Result<()> {
+    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_meta.outbox")
+        .fetch_one(local)
+        .await?;
+    let mut mismatches = Vec::new();
+    for spec in TABLES {
+        if inventory(local, *spec).await? != inventory(neon, *spec).await? {
+            mismatches.push(spec.name.to_string());
+        }
+    }
+    for (label, pool) in [("local", local), ("neon", neon)] {
+        for spec in TABLES.iter().copied().filter(|spec| spec.has_embedding) {
+            let sql = format!(
+                "SELECT count(*)::bigint FROM public.{} WHERE embedding IS NULL OR vector_dims(embedding) <> 2048",
+                quote_ident(spec.name)
+            );
+            let invalid: i64 = sqlx::query_scalar(&sql).fetch_one(pool).await?;
+            if invalid != 0 {
+                mismatches.push(format!("{label}.{} embeddings={invalid}", spec.name));
+            }
+        }
+        let invalid_cache: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM public.embeddings WHERE embedding IS NULL OR vector_dims(embedding) <> 2048",
+        )
+        .fetch_one(pool)
+        .await?;
+        if invalid_cache != 0 {
+            mismatches.push(format!("{label}.embeddings cache={invalid_cache}"));
+        }
+    }
+    println!(
+        "{{\"queue_depth\":{pending},\"fingerprint_mismatches\":{:?}}}",
+        mismatches
+    );
+    if pending != 0 || !mismatches.is_empty() {
+        bail!("Neon verification failed: queue_depth={pending}, mismatches={mismatches:?}");
+    }
+    Ok(())
 }
 
 async fn reconciliation_due(local: &PgPool) -> Result<bool> {
@@ -611,21 +663,40 @@ async fn apply_batch(
             format!("{c}=EXCLUDED.{c}")
         })
         .collect();
-    let insert = format!("INSERT INTO public.{table} SELECT (jsonb_populate_record(NULL::public.{table}, $1)).* ON CONFLICT ({key}) DO UPDATE SET {}", updates.join(","));
-    let vector_sql = format!("UPDATE public.{table} SET embedding=$1::vector WHERE {key}::text=$2");
+    let insert = format!(
+        "INSERT INTO public.{table} SELECT r.* FROM jsonb_populate_recordset(NULL::public.{table}, $1::jsonb) AS r ON CONFLICT ({key}) DO UPDATE SET {}",
+        updates.join(",")
+    );
     let mut tx = neon.begin().await?;
     sqlx::query("SET LOCAL memory.sync_replay='on'")
         .execute(&mut *tx)
         .await?;
-    for row in rows {
-        sqlx::query(&insert)
-            .bind(&row.data)
-            .execute(&mut *tx)
-            .await?;
-        if let Some(vector) = &row.vector {
+    let records: Vec<Value> = rows.iter().map(|row| row.data.clone()).collect();
+    sqlx::query(&insert)
+        .bind(Value::Array(records))
+        .execute(&mut *tx)
+        .await?;
+    if spec.has_embedding {
+        let vectors: Vec<Value> = rows
+            .iter()
+            .filter_map(|row| {
+                row.vector.as_ref().map(|vector| {
+                    let text = vector
+                        .0
+                        .iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    serde_json::json!({"key": row.key, "embedding": format!("[{text}]")})
+                })
+            })
+            .collect();
+        if !vectors.is_empty() {
+            let vector_sql = format!(
+                "UPDATE public.{table} AS target SET embedding=source.embedding::vector FROM jsonb_to_recordset($1::jsonb) AS source(key text, embedding text) WHERE target.{key}::text=source.key"
+            );
             sqlx::query(&vector_sql)
-                .bind(vector)
-                .bind(&row.key)
+                .bind(Value::Array(vectors))
                 .execute(&mut *tx)
                 .await?;
         }
@@ -818,10 +889,13 @@ async fn status(local: &PgPool, neon: &PgPool) -> Result<()> {
             "last run: status={} started={} finished={} batch_rows={} bytes={} replay_state={}",
             row.try_get::<String, _>(0)?,
             row.try_get::<chrono::DateTime<chrono::Utc>, _>(1)?,
-            row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(2)?.map(|v| v.to_rfc3339()).unwrap_or_else(|| "-".into()),
+            row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(2)?
+                .map(|v| v.to_rfc3339())
+                .unwrap_or_else(|| "-".into()),
             row.try_get::<i64, _>(3).unwrap_or_default(),
             row.try_get::<i64, _>(4).unwrap_or_default(),
-            row.try_get::<Option<String>, _>(5)?.unwrap_or_else(|| "clean".into()),
+            row.try_get::<Option<String>, _>(5)?
+                .unwrap_or_else(|| "clean".into()),
         );
     }
     let state = sqlx::query(
@@ -866,6 +940,7 @@ async fn main() -> Result<()> {
     ensure_target_meta(&neon).await?;
     match cli.command {
         Command::Status => status(&local, &neon).await,
+        Command::Verify => verify(&local, &neon).await,
         Command::Reconcile => {
             let run = Uuid::new_v4();
             let changes = reconcile(&local, &neon, run).await?;

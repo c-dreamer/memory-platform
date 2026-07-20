@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -25,6 +26,18 @@ pub struct CodexSessionSummary {
     pub imported: usize,
     pub skipped_duplicate: usize,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CodexInventory {
+    pub source_count: usize,
+    pub database_source_count: usize,
+    pub missing_source_ids: Vec<String>,
+    pub duplicate_source_keys: HashMap<String, i64>,
+    pub changed_documents: Vec<String>,
+    pub active_path: Option<String>,
+    pub active_age_seconds: Option<i64>,
+    pub settled: bool,
 }
 
 fn scan_sessions(root: &Path) -> Result<Vec<CodexSessionFile>> {
@@ -70,6 +83,77 @@ fn scan_sessions(root: &Path) -> Result<Vec<CodexSessionFile>> {
     });
 
     Ok(files)
+}
+
+/// Compare archive identities and checksums with the canonical database rows.
+/// This is read-only and is safe to run while the active Codex archive grows.
+pub async fn inventory_codex_sessions(
+    engine: &IngestEngine,
+    sessions_root: &Path,
+    settle_seconds: i64,
+) -> Result<CodexInventory> {
+    let files = scan_sessions(sessions_root)?;
+    let mut source_ids = HashSet::new();
+    let mut changed_documents = Vec::new();
+    for file in &files {
+        let parsed = parse_session_summary(&file.content);
+        let session_id = session_id_from_summary(&parsed, &file.path);
+        source_ids.insert(session_id);
+        let rel_path = file
+            .path
+            .strip_prefix(sessions_root)
+            .unwrap_or(&file.path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let doc_path = format!("codex://{rel_path}");
+        let checksum: Option<String> =
+            sqlx::query_scalar("SELECT checksum FROM documents WHERE path=$1 LIMIT 1")
+                .bind(&doc_path)
+                .fetch_optional(engine.pool())
+                .await?;
+        if checksum.as_deref() != Some(file.checksum.as_str()) {
+            changed_documents.push(doc_path);
+        }
+    }
+
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT source_key, count(*)::bigint FROM sessions WHERE source_key LIKE 'codex:%' GROUP BY source_key",
+    ).fetch_all(engine.pool()).await?;
+    let database_source_count = rows.len();
+    let duplicate_source_keys = rows.into_iter().filter(|(_, count)| *count > 1).collect();
+    let db_ids: HashSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT substring(source_key from 7) FROM sessions WHERE source_key LIKE 'codex:%'",
+    ).fetch_all(engine.pool()).await?.into_iter().collect();
+    let mut missing_source_ids: Vec<_> = source_ids.difference(&db_ids).cloned().collect();
+    missing_source_ids.sort();
+
+    let (active_path, active_age_seconds) = files
+        .first()
+        .map(|file| {
+            (
+                Some(file.path.display().to_string()),
+                Some(
+                    Utc::now()
+                        .signed_duration_since(file.modified_at)
+                        .num_seconds()
+                        .max(0),
+                ),
+            )
+        })
+        .unwrap_or((None, None));
+    let settled = active_age_seconds
+        .map(|age| age >= settle_seconds)
+        .unwrap_or(true);
+    Ok(CodexInventory {
+        source_count: source_ids.len(),
+        database_source_count,
+        missing_source_ids,
+        duplicate_source_keys,
+        changed_documents,
+        active_path,
+        active_age_seconds,
+        settled,
+    })
 }
 
 fn session_id_from_summary(summary: &CodexSessionSummaryData, fallback: &Path) -> String {

@@ -15,8 +15,22 @@ use sqlx::{PgPool, Row};
 use walkdir::WalkDir;
 
 use crate::db::postgres::PostgresDb;
-use crate::models::{Document, Experience, Memory, Session};
+use crate::models::{Document, Embedding, Experience, Memory, Session};
 use crate::services::embedding::EmbeddingService;
+
+const REPAIR_EMBED_TIMEOUT_SECS: u64 = 900;
+const REQUIRED_EMBEDDING_DIMENSION: usize = 2048;
+
+fn validate_repair_embedding(embedding: Embedding) -> Result<Embedding> {
+    if embedding.as_vec().len() != REQUIRED_EMBEDDING_DIMENSION {
+        anyhow::bail!(
+            "provider returned {} dimensions; expected {}",
+            embedding.as_vec().len(),
+            REQUIRED_EMBEDDING_DIMENSION
+        );
+    }
+    Ok(embedding)
+}
 
 /// Report produced after an ingestion run.
 #[derive(Debug, Clone)]
@@ -267,12 +281,19 @@ impl IngestionService {
             }
 
             match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(REPAIR_EMBED_TIMEOUT_SECS),
                 self.embedder.embed(&memory.content),
             )
             .await
             {
                 Ok(Ok(embedding)) => {
+                    let embedding = match validate_repair_embedding(embedding) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            errors.push(format!("memories/{} (dimension): {error:#}", memory.id));
+                            continue;
+                        }
+                    };
                     let result = sqlx::query(
                     "UPDATE memories SET embedding = $1::vector, updated_at = now() WHERE id = $2",
                 )
@@ -283,17 +304,24 @@ impl IngestionService {
 
                     match result {
                         Ok(_) => {
-                            let _ = self
+                            match self
                                 .db
                                 .store_embedding("memories", memory.id, embedding.as_vec())
-                                .await;
-                            rows_fixed += 1;
+                                .await
+                            {
+                                Ok(()) => rows_fixed += 1,
+                                Err(error) => errors
+                                    .push(format!("memories/{} (cache): {error:#}", memory.id)),
+                            }
                         }
                         Err(e) => errors.push(format!("memories/{}: {e}", memory.id)),
                     }
                 }
                 Ok(Err(e)) => errors.push(format!("memories/{} (embed): {e:#}", memory.id)),
-                Err(_) => errors.push(format!("memories/{} (embed): timeout after 30s", memory.id)),
+                Err(_) => errors.push(format!(
+                    "memories/{} (embed): timeout after {REPAIR_EMBED_TIMEOUT_SECS}s",
+                    memory.id
+                )),
             }
         }
 
@@ -319,12 +347,22 @@ impl IngestionService {
             }
             let text = compose_experience_text(experience);
             match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(REPAIR_EMBED_TIMEOUT_SECS),
                 self.embedder.embed(&text),
             )
             .await
             {
                 Ok(Ok(embedding)) => {
+                    let embedding = match validate_repair_embedding(embedding) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            errors.push(format!(
+                                "experiences/{} (dimension): {error:#}",
+                                experience.id
+                            ));
+                            continue;
+                        }
+                    };
                     let result =
                         sqlx::query("UPDATE experiences SET embedding = $1::vector WHERE id = $2")
                             .bind(embedding.as_vec())
@@ -334,18 +372,24 @@ impl IngestionService {
 
                     match result {
                         Ok(_) => {
-                            let _ = self
+                            match self
                                 .db
                                 .store_embedding("experiences", experience.id, embedding.as_vec())
-                                .await;
-                            rows_fixed += 1;
+                                .await
+                            {
+                                Ok(()) => rows_fixed += 1,
+                                Err(error) => errors.push(format!(
+                                    "experiences/{} (cache): {error:#}",
+                                    experience.id
+                                )),
+                            }
                         }
                         Err(e) => errors.push(format!("experiences/{}: {e}", experience.id)),
                     }
                 }
                 Ok(Err(e)) => errors.push(format!("experiences/{} (embed): {e:#}", experience.id)),
                 Err(_) => errors.push(format!(
-                    "experiences/{} (embed): timeout after 30s",
+                    "experiences/{} (embed): timeout after {REPAIR_EMBED_TIMEOUT_SECS}s",
                     experience.id
                 )),
             }
@@ -365,6 +409,13 @@ impl IngestionService {
             let text = compose_session_text(session);
             match self.embedder.embed(&text).await {
                 Ok(embedding) => {
+                    let embedding = match validate_repair_embedding(embedding) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            errors.push(format!("sessions/{} (dimension): {error:#}", session.id));
+                            continue;
+                        }
+                    };
                     let result = sqlx::query(
                         "UPDATE sessions SET embedding = $1::vector, updated_at = now() WHERE id = $2",
                     )
@@ -374,7 +425,16 @@ impl IngestionService {
                     .await;
 
                     match result {
-                        Ok(_) => rows_fixed += 1,
+                        Ok(_) => match self
+                            .db
+                            .store_embedding("sessions", session.id, embedding.as_vec())
+                            .await
+                        {
+                            Ok(()) => rows_fixed += 1,
+                            Err(error) => {
+                                errors.push(format!("sessions/{} (cache): {error:#}", session.id))
+                            }
+                        },
                         Err(e) => errors.push(format!("sessions/{}: {e}", session.id)),
                     }
                 }
@@ -409,6 +469,13 @@ impl IngestionService {
                 };
                 match self.embedder.embed(embed_text).await {
                     Ok(embedding) => {
+                        let embedding = match validate_repair_embedding(embedding) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                errors.push(format!("{table}/{id} (dimension): {error:#}"));
+                                continue;
+                            }
+                        };
                         let update =
                             format!("UPDATE {table} SET embedding = $1::vector WHERE id = $2");
                         match sqlx::query(&update)

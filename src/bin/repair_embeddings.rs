@@ -1,6 +1,7 @@
 //! Repair null embeddings across operational tables.
 
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use memory_platform::services::embedding::{
     EmbeddingConfig, EmbeddingService, EmbeddingServiceFactory,
 };
@@ -11,6 +12,83 @@ use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+const EMBEDDING_TABLES: &[&str] = &[
+    "documents",
+    "memories",
+    "experiences",
+    "sessions",
+    "summaries",
+    "code_changes",
+    "trading_results",
+];
+
+#[derive(Parser)]
+#[command(
+    name = "repair-embeddings",
+    about = "Repair and verify 2048-dimensional embeddings"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum Command {
+    /// Repair eligible null embeddings and fail unless verification passes.
+    Run,
+    /// Print current embedding progress as JSON without starting a provider.
+    Status,
+    /// Verify null counts, dimensions, and derived cache integrity.
+    Verify,
+}
+
+async fn connect(config: &Config) -> Result<sqlx::PgPool> {
+    PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(std::time::Duration::from_secs(60))
+        .connect(&config.database_url)
+        .await
+        .context("Failed to connect to PostgreSQL")
+}
+
+async fn embedding_status(pool: &sqlx::PgPool) -> Result<serde_json::Value> {
+    let mut tables = serde_json::Map::new();
+    let mut nulls = 0_i64;
+    let mut mismatched = 0_i64;
+    let mut rows = 0_i64;
+    for table in EMBEDDING_TABLES {
+        let sql = format!(
+            "SELECT count(*)::bigint, count(*) FILTER (WHERE embedding IS NULL)::bigint, count(*) FILTER (WHERE embedding IS NOT NULL AND vector_dims(embedding) <> 2048)::bigint FROM {table}"
+        );
+        let (total, table_nulls, table_bad): (i64, i64, i64) = sqlx::query_as(&sql)
+            .fetch_one(pool)
+            .await
+            .with_context(|| format!("checking {table} embeddings"))?;
+        rows += total;
+        nulls += table_nulls;
+        mismatched += table_bad;
+        tables.insert(
+            (*table).to_string(),
+            serde_json::json!({"rows": total, "null": table_nulls, "invalid_dimension": table_bad}),
+        );
+    }
+    let cache_invalid: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM embeddings WHERE embedding IS NULL OR vector_dims(embedding) <> 2048",
+    )
+    .fetch_one(pool)
+    .await?;
+    mismatched += cache_invalid;
+    Ok(serde_json::json!({
+        "status": if nulls == 0 && mismatched == 0 { "succeeded" } else { "incomplete" },
+        "expected_dimension": 2048,
+        "rows": rows,
+        "null_embeddings": nulls,
+        "invalid_dimensions": mismatched,
+        "derived_cache_invalid": cache_invalid,
+        "tables": tables,
+    }))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -19,12 +97,19 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Command::Run);
     let config = Config::from_env().context("Failed to load config")?;
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&config.database_url)
-        .await
-        .context("Failed to connect to PostgreSQL")?;
+    let pool = connect(&config).await?;
+
+    if matches!(command, Command::Status | Command::Verify) {
+        let status = embedding_status(&pool).await?;
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        if matches!(command, Command::Verify) && status["status"].as_str() != Some("succeeded") {
+            anyhow::bail!("embedding verification incomplete: {}", status);
+        }
+        return Ok(());
+    }
 
     let embedding_config = EmbeddingConfig {
         model: config.embedding_model.clone(),
@@ -59,17 +144,23 @@ async fn main() -> Result<()> {
 
     let mut remaining_nulls = 0_i64;
     let mut mismatched = 0_i64;
-    for table in ["documents", "memories", "experiences", "sessions", "summaries", "code_changes", "trading_results"] {
-        let nulls: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE embedding IS NULL"))
-            .fetch_one(&pool).await?;
+    for table in EMBEDDING_TABLES {
+        let nulls: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {table} WHERE embedding IS NULL"
+        ))
+        .fetch_one(&pool)
+        .await?;
         let bad_dims: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE embedding IS NOT NULL AND vector_dims(embedding) <> 2048"))
             .fetch_one(&pool).await?;
         remaining_nulls += nulls;
         mismatched += bad_dims;
         println!("  {table}: null_embeddings={nulls} mismatched_dimensions={bad_dims}");
     }
-    let cache_bad: i64 = sqlx::query_scalar("SELECT count(*) FROM embeddings WHERE embedding IS NULL OR vector_dims(embedding) <> 2048")
-        .fetch_one(&pool).await?;
+    let cache_bad: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM embeddings WHERE embedding IS NULL OR vector_dims(embedding) <> 2048",
+    )
+    .fetch_one(&pool)
+    .await?;
     mismatched += cache_bad;
     println!("  embeddings cache: invalid_rows={cache_bad}");
 

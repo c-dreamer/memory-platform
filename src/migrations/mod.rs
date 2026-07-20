@@ -76,6 +76,10 @@ impl Migrator {
                 "010_session_source_keys",
                 include_str!("../../migrations/010_session_source_keys.sql"),
             ),
+            (
+                "011_derived_embeddings_2048",
+                include_str!("../../migrations/011_derived_embeddings_2048.sql"),
+            ),
         ];
 
         // Apply pending migrations in order
