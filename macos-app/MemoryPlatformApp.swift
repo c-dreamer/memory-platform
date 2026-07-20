@@ -51,15 +51,41 @@ final class AppLifecycle: NSObject, NSApplicationDelegate {
 }
 
 struct DashboardWebView: NSViewRepresentable {
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
     func makeNSView(context: Context) -> WKWebView {
         let view = WKWebView()
+        view.navigationDelegate = context.coordinator
         let tokenPath = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config/memory-platform/dashboard.token")
         let token = (try? String(contentsOf: tokenPath, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let url = URL(string: "http://127.0.0.1:8765/operations?token=\(token)")!
-        view.load(URLRequest(url: url))
+        context.coordinator.request = URLRequest(url: url)
+        context.coordinator.loadWhenReady(in: view)
         return view
     }
 
     func updateNSView(_ view: WKWebView, context: Context) {}
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        var request: URLRequest?
+        private var attempts = 0
+
+        func loadWhenReady(in view: WKWebView) {
+            guard let request, attempts < 12 else { return }
+            attempts += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak view] in
+                guard let view else { return }
+                view.load(request)
+            }
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation?, withError error: Error) {
+            loadWhenReady(in: webView)
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation?, withError error: Error) {
+            loadWhenReady(in: webView)
+        }
+    }
 }
