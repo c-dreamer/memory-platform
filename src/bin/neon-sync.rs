@@ -23,6 +23,7 @@ use uuid::Uuid;
 use memory_platform::migrations::Migrator;
 
 const DEFAULT_BATCH_ROWS: usize = 25;
+const FULL_BASELINE_PAGE_ROWS: usize = 500;
 const MIN_BATCH_ROWS: usize = 1;
 const MAX_BATCH_BYTES: usize = 2 * 1024 * 1024;
 const RUN_BUDGET: Duration = Duration::from_secs(10 * 60);
@@ -929,6 +930,10 @@ async fn run_queue(
 }
 
 async fn bootstrap_events(local: &PgPool) -> Result<usize> {
+    bootstrap_events_with_limit(local, DEFAULT_BATCH_ROWS).await
+}
+
+async fn bootstrap_events_with_limit(local: &PgPool, limit: usize) -> Result<usize> {
     let device_id =
         env::var("MEMORY_DEVICE_ID").context("MEMORY_DEVICE_ID is required for bootstrap")?;
     let mut created = 0;
@@ -939,7 +944,7 @@ async fn bootstrap_events(local: &PgPool) -> Result<usize> {
         );
         let rows = sqlx::query(&sql)
             .bind(spec.name)
-            .bind(DEFAULT_BATCH_ROWS as i64)
+            .bind(limit as i64)
             .fetch_all(local)
             .await?;
         for row in rows {
@@ -1214,7 +1219,7 @@ async fn main() -> Result<()> {
             }
             let mut pages = 0usize;
             loop {
-                let created = bootstrap_events(&local).await?;
+                let created = bootstrap_events_with_limit(&local, FULL_BASELINE_PAGE_ROWS).await?;
                 let (rows, bytes, events) = push_once(&local, &neon).await?;
                 pages += 1;
                 println!("full page {pages}: baseline={created} rows={rows} events={events} bytes={bytes}");
