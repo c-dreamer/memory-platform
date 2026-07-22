@@ -66,6 +66,12 @@ enum Command {
     Audit,
     /// Create bounded baseline events for an existing local corpus.
     Bootstrap,
+    /// Manually enqueue and drain the complete active corpus. Never runs automatically.
+    Full {
+        /// Required acknowledgement for a potentially long, network-intensive recovery.
+        #[arg(long)]
+        confirm_full_push: bool,
+    },
     /// Rebuild Neon full-text search and derived embedding cache without NVIDIA calls.
     RebuildDerived,
     /// Emergency-only destructive target reset. Never runs automatically.
@@ -185,7 +191,7 @@ struct OutboxItem {
     op: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SourceRow {
     key: String,
     data: Value,
@@ -412,7 +418,7 @@ async fn acquire_target_lease(neon: &PgPool) -> Result<TargetLease> {
     let device_id = env::var("MEMORY_DEVICE_ID")
         .context("MEMORY_DEVICE_ID is required for shared synchronization")?;
     let row = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
-        "INSERT INTO sync_meta.leases(lease_name,device_id,generation,expires_at) VALUES('memory-platform-sync',$1,1,now()+interval '2 minutes') \
+        "INSERT INTO sync_meta.leases(lease_name,device_id,generation,expires_at) VALUES('memory-platform-sync',$1,1,now()+interval '10 minutes') \
          ON CONFLICT(lease_name) DO UPDATE SET device_id=EXCLUDED.device_id,generation=sync_meta.leases.generation+1,expires_at=EXCLUDED.expires_at,updated_at=now() \
          WHERE sync_meta.leases.expires_at < now() OR sync_meta.leases.device_id=EXCLUDED.device_id \
          RETURNING generation"
@@ -425,7 +431,7 @@ async fn acquire_target_lease(neon: &PgPool) -> Result<TargetLease> {
     sqlx::query(
         "UPDATE sync_meta.runs SET status='interrupted', finished_at=now(), \
          error_summary=coalesce(error_summary, 'lease expired before completion') \
-         WHERE status='running' AND started_at < now() - interval '2 minutes'",
+         WHERE status='running' AND started_at < now() - interval '10 minutes'",
     )
     .execute(neon)
     .await?;
@@ -437,7 +443,7 @@ async fn acquire_target_lease(neon: &PgPool) -> Result<TargetLease> {
 
 async fn renew_target_lease(neon: &PgPool, lease: &TargetLease) -> Result<()> {
     let changed = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
-        "UPDATE sync_meta.leases SET expires_at=now()+interval '2 minutes',updated_at=now() \
+        "UPDATE sync_meta.leases SET expires_at=now()+interval '10 minutes',updated_at=now() \
          WHERE lease_name='memory-platform-sync' AND device_id=$1 AND generation=$2 AND expires_at > now()"
     ).bind(&lease.device_id).bind(lease.generation).execute(neon))
         .await
@@ -450,8 +456,40 @@ async fn renew_target_lease(neon: &PgPool, lease: &TargetLease) -> Result<()> {
 }
 
 async fn release_target_lease(neon: &PgPool, lease: &TargetLease) {
-    let _ = sqlx::query("UPDATE sync_meta.leases SET expires_at=now() WHERE lease_name='memory-platform-sync' AND device_id=$1 AND generation=$2")
-        .bind(&lease.device_id).bind(lease.generation).execute(neon).await;
+    let _ = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query("UPDATE sync_meta.leases SET expires_at=now() WHERE lease_name='memory-platform-sync' AND device_id=$1 AND generation=$2")
+            .bind(&lease.device_id)
+            .bind(lease.generation)
+            .execute(neon),
+    )
+    .await;
+}
+
+async fn record_batch_failure(
+    local: &PgPool,
+    entries: &[OutboxItem],
+    error: &impl std::fmt::Display,
+) {
+    let message: String = error.to_string().chars().take(500).collect();
+    let mut tx = match local.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return,
+    };
+    for entry in entries {
+        if sqlx::query("UPDATE sync_meta.outbox SET attempts=attempts+1,last_error=$4 WHERE table_name=$1 AND record_key=$2 AND generation=$3")
+            .bind(&entry.table)
+            .bind(&entry.key)
+            .bind(entry.generation)
+            .bind(&message)
+            .execute(&mut *tx)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    let _ = tx.commit().await;
 }
 
 async fn queue(local: &PgPool, spec: TableSpec, key: &str, op: &str) -> Result<()> {
@@ -680,6 +718,7 @@ fn batches(rows: Vec<SourceRow>, max_rows: usize) -> Vec<Vec<SourceRow>> {
 
 async fn apply_batch(
     neon: &PgPool,
+    run_id: Uuid,
     spec: TableSpec,
     cols: &[String],
     rows: &[SourceRow],
@@ -701,6 +740,32 @@ async fn apply_batch(
         .execute(&mut *tx)
         .await?;
     for row in rows {
+        if let Some(natural_key) = spec.natural_key {
+            if let Some(value) = row.data.get(natural_key).and_then(Value::as_str) {
+                // A different target ID with the same natural key is stale
+                // projection data. Preserve it before the local authority wins.
+                let natural = quote_ident(natural_key);
+                let archive = format!(
+                    "INSERT INTO sync_meta.archive(run_id,table_name,record_key,row_data,reason) \
+                     SELECT $1,$2,{key}::text,to_jsonb(t),'natural-key-conflict-replaced-by-local' \
+                     FROM public.{table} t WHERE {natural}=$3 AND {key}::text <> $4"
+                );
+                sqlx::query(&archive)
+                    .bind(run_id)
+                    .bind(spec.name)
+                    .bind(value)
+                    .bind(&row.key)
+                    .execute(&mut *tx)
+                    .await?;
+                let delete =
+                    format!("DELETE FROM public.{table} WHERE {natural}=$1 AND {key}::text <> $2");
+                sqlx::query(&delete)
+                    .bind(value)
+                    .bind(&row.key)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
         sqlx::query(&insert)
             .bind(&row.data)
             .execute(&mut *tx)
@@ -788,7 +853,10 @@ async fn run_queue(
             let rows = source_rows(local, *spec, &keys).await?;
             let by_key: HashMap<&str, &OutboxItem> =
                 upserts.iter().map(|i| (i.key.as_str(), i)).collect();
-            for batch in batches(rows, batch_size) {
+            // A retry must split the already-materialized payload. Merely reducing
+            // `batch_size` here would otherwise retry the same oversized batch.
+            let mut pending_batches = batches(rows, batch_size);
+            while let Some(batch) = pending_batches.pop() {
                 let entries: Vec<OutboxItem> = batch
                     .iter()
                     .filter_map(|r| {
@@ -809,7 +877,7 @@ async fn run_queue(
                     .sum();
                 let mut attempt = 0;
                 loop {
-                    match apply_batch(neon, *spec, &cols, &batch).await {
+                    match apply_batch(neon, run_id, *spec, &cols, &batch).await {
                         Ok(count) => {
                             committed_batches += 1;
                             if env::var("NEON_SYNC_FAIL_AFTER_TARGET_COMMIT")
@@ -830,12 +898,19 @@ async fn run_queue(
                             break;
                         }
                         Err(error) if attempt < MAX_RETRIES => {
+                            record_batch_failure(local, &entries, &error).await;
                             attempt += 1;
                             consecutive_successes = 0;
                             batch_size = (batch_size / 2).max(MIN_BATCH_ROWS);
                             tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
                             if attempt == MAX_RETRIES {
-                                return Err(error).context("batch retries exhausted");
+                                if batch.len() > MIN_BATCH_ROWS {
+                                    let midpoint = batch.len() / 2;
+                                    pending_batches.push(batch[midpoint..].to_vec());
+                                    pending_batches.push(batch[..midpoint].to_vec());
+                                    break;
+                                }
+                                return Err(error).context("batch retries exhausted for one row");
                             }
                         }
                         Err(error) => return Err(error).context("applying Neon batch"),
@@ -1065,6 +1140,46 @@ async fn health(local: &PgPool, neon: &PgPool) -> Result<()> {
     Ok(())
 }
 
+async fn push_once(local: &PgPool, neon: &PgPool) -> Result<(usize, usize, usize)> {
+    let lease = acquire_target_lease(neon).await?;
+    let run = Uuid::new_v4();
+    sqlx::query("INSERT INTO sync_meta.runs(run_id,status) VALUES($1,'running')")
+        .bind(run)
+        .execute(neon)
+        .await?;
+    let result = async {
+        let event_count = push_events(local, neon, &lease).await?;
+        let (rows, bytes) = run_queue(local, neon, run, &lease).await?;
+        sqlx::query("INSERT INTO sync_meta.state(state_key,state_value) VALUES('last_success',jsonb_build_object('at',now(),'rows',$1,'bytes',$2)) ON CONFLICT(state_key) DO UPDATE SET state_value=EXCLUDED.state_value,updated_at=now()")
+            .bind(rows as i64)
+            .bind(bytes as i64)
+            .execute(local)
+            .await?;
+        Ok::<_, anyhow::Error>((rows, bytes, event_count))
+    }
+    .await;
+    release_target_lease(neon, &lease).await;
+    match result {
+        Ok((rows, bytes, event_count)) => {
+            sqlx::query("UPDATE sync_meta.runs SET status='success',finished_at=now(),rows_applied=$2,bytes_applied=$3 WHERE run_id=$1")
+                .bind(run)
+                .bind(rows as i64)
+                .bind(bytes as i64)
+                .execute(neon)
+                .await?;
+            Ok((rows, bytes, event_count))
+        }
+        Err(error) => {
+            let _ = sqlx::query("UPDATE sync_meta.runs SET status='failed',finished_at=now(),error_summary=$2 WHERE run_id=$1")
+                .bind(run)
+                .bind(error.to_string())
+                .execute(neon)
+                .await;
+            Err(error)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -1093,6 +1208,26 @@ async fn main() -> Result<()> {
             println!("created {created} baseline event(s)");
             Ok(())
         }
+        Command::Full { confirm_full_push } => {
+            if !confirm_full_push {
+                bail!("refusing full recovery; pass --confirm-full-push explicitly");
+            }
+            let mut pages = 0usize;
+            loop {
+                let created = bootstrap_events(&local).await?;
+                let (rows, bytes, events) = push_once(&local, &neon).await?;
+                pages += 1;
+                println!("full page {pages}: baseline={created} rows={rows} events={events} bytes={bytes}");
+                let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_meta.outbox")
+                    .fetch_one(&local)
+                    .await?;
+                if created == 0 && remaining == 0 {
+                    break;
+                }
+            }
+            println!("full active-corpus recovery complete after {pages} page(s)");
+            Ok(())
+        }
         Command::Pull => {
             let imported = pull_events(&local, &neon).await?;
             println!("pulled {imported} remote event(s)");
@@ -1100,35 +1235,11 @@ async fn main() -> Result<()> {
         }
         Command::RebuildDerived => rebuild_derived(&local, &neon).await,
         Command::Run | Command::Push => {
-            let lease = acquire_target_lease(&neon).await?;
-            let run = Uuid::new_v4();
-            sqlx::query("INSERT INTO sync_meta.runs(run_id,status) VALUES($1,'running')")
-                .bind(run)
-                .execute(&neon)
-                .await?;
-            let result = async {
-                let event_count = push_events(&local, &neon, &lease).await?;
-                let (rows, bytes) = run_queue(&local, &neon, run, &lease).await?;
-                sqlx::query("INSERT INTO sync_meta.state(state_key,state_value) VALUES('last_success',jsonb_build_object('at',now(),'rows',$1,'bytes',$2)) ON CONFLICT(state_key) DO UPDATE SET state_value=EXCLUDED.state_value,updated_at=now()")
-                    .bind(rows as i64)
-                    .bind(bytes as i64)
-                    .execute(&local)
-                    .await?;
-                Ok::<_, anyhow::Error>((rows, bytes, event_count))
-            }
-            .await;
-            release_target_lease(&neon, &lease).await;
-            match result {
-                Ok((rows, bytes, event_count)) => {
-                    sqlx::query("UPDATE sync_meta.runs SET status='success',finished_at=now(),rows_applied=$2,bytes_applied=$3 WHERE run_id=$1").bind(run).bind(rows as i64).bind(bytes as i64).execute(&neon).await?;
-                    println!("sync complete: {rows} projection rows, {event_count} event(s), {bytes} bytes");
-                    Ok(())
-                }
-                Err(error) => {
-                    let _=sqlx::query("UPDATE sync_meta.runs SET status='failed',finished_at=now(),error_summary=$2 WHERE run_id=$1").bind(run).bind(error.to_string()).execute(&neon).await;
-                    Err(error)
-                }
-            }
+            let (rows, bytes, event_count) = push_once(&local, &neon).await?;
+            println!(
+                "sync complete: {rows} projection rows, {event_count} event(s), {bytes} bytes"
+            );
+            Ok(())
         }
         Command::ResetTarget { confirm_neon_reset } => {
             if !confirm_neon_reset {
