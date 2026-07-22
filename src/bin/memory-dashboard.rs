@@ -37,6 +37,16 @@ struct ParityRow {
 }
 
 #[derive(Serialize)]
+struct SyncRun {
+    status: String,
+    started_at: String,
+    finished_at: Option<String>,
+    rows: i64,
+    bytes: i64,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
 struct DashboardStatus {
     queue_depth: i64,
     events_total: i64,
@@ -55,6 +65,7 @@ struct DashboardStatus {
     neon_database_mb: Option<f64>,
     pending_upload_bytes: i64,
     source_parity: Vec<ParityRow>,
+    recent_runs: Vec<SyncRun>,
     next_action: String,
 }
 
@@ -235,6 +246,18 @@ async fn status(
     let source_parity = source_parity(&state.local, usable_neon)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let recent_runs = match usable_neon {
+        Some(pool) => sqlx::query_as::<_, (String, String, Option<String>, i64, i64, Option<String>)>(
+            "SELECT status,started_at::text,finished_at::text,coalesce(rows_applied,0),coalesce(bytes_applied,0),left(error_summary,300) FROM sync_meta.runs ORDER BY started_at DESC LIMIT 8",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(status, started_at, finished_at, rows, bytes, error)| SyncRun { status, started_at, finished_at, rows, bytes, error })
+        .collect(),
+        None => Vec::new(),
+    };
     let orbstack_containers = Command::new("docker")
         .args([
             "ps",
@@ -293,6 +316,7 @@ async fn status(
         neon_database_mb,
         pending_upload_bytes,
         source_parity,
+        recent_runs,
         next_action,
     }))
 }
@@ -362,11 +386,11 @@ const OPERATIONS_PAGE: &str = r#"<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Memory Platform</title><style>
 :root{--ink:#e8efe5;--muted:#9eb2a8;--paper:#11201d;--panel:#172b26;--panel2:#1e3730;--line:#35564a;--lime:#d5ed63;--coral:#ff9277;--amber:#ffc86a}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 88% 0,#52734d 0,transparent 37%),radial-gradient(ellipse at 4% 96%,#203f35 0,transparent 44%),#0d1916;color:var(--ink);font:16px Georgia,serif}.shell{max-width:1280px;margin:auto;padding:32px 24px 56px}.eyebrow,.kicker,.muted{font:12px ui-monospace,SFMono-Regular,monospace;letter-spacing:.08em;color:var(--muted);text-transform:uppercase}.head{display:flex;justify-content:space-between;align-items:end;gap:20px;border-bottom:1px solid var(--line);padding-bottom:25px}.head h1{font-size:clamp(2.7rem,7vw,5.5rem);line-height:.82;letter-spacing:-.065em;margin:8px 0 0}.state{min-width:235px;padding:14px 16px;border:1px solid var(--line);background:#13251f}.state b{display:block;color:var(--lime);font:700 13px ui-monospace,monospace;margin-top:6px}.next{margin:24px 0;padding:20px 22px;background:linear-gradient(110deg,#d5ed63,#dff08d);color:#17271f;border-radius:3px;display:flex;gap:18px;align-items:start}.next b{font:700 12px ui-monospace,monospace;letter-spacing:.08em}.next span{font-size:18px;line-height:1.35}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:22px 0}.metric,.panel{background:linear-gradient(150deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:4px}.metric{padding:18px;min-height:118px}.metric strong{display:block;margin-top:14px;font:700 clamp(1.7rem,3vw,2.5rem)/.9 ui-monospace,monospace}.metric .good{color:var(--lime)}.metric .warn{color:var(--amber)}.split{display:grid;grid-template-columns:1.45fr .85fr;gap:14px}.panel{padding:20px}.panel h2{font-size:24px;letter-spacing:-.03em;margin:4px 0 18px}.panel p{color:var(--muted);line-height:1.45}.table{width:100%;border-collapse:collapse;font:14px ui-monospace,monospace}.table th{text-align:left;color:var(--muted);font-weight:400}.table th,.table td{padding:11px 7px;border-bottom:1px solid #2c493f}.table td:last-child,.table th:last-child{text-align:right}.match{color:var(--lime)}.drift{color:var(--amber)}.actions{display:flex;flex-wrap:wrap;gap:8px}.actions button{appearance:none;border:1px solid #587565;background:#203a31;color:var(--ink);font:700 13px Georgia,serif;padding:11px 13px;cursor:pointer}.actions button.primary{background:var(--lime);color:#14241c;border-color:var(--lime)}.actions button.stop{background:transparent;color:var(--coral);border-color:var(--coral)}.actions button:hover{filter:brightness(1.12)}#notice{min-height:22px;color:var(--muted);font:13px ui-monospace,monospace}.compact{font:13px ui-monospace,monospace;white-space:pre-wrap;line-height:1.55;color:#c4d2c8}.foot{margin-top:16px;color:var(--muted);font:12px ui-monospace,monospace}@media(max-width:760px){.shell{padding:22px 15px}.head{align-items:start;flex-direction:column}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.split{grid-template-columns:1fr}.next{flex-direction:column;gap:8px}.table{font-size:12px}}
-</style></head><body><main class="shell"><header class="head"><div><div class="eyebrow">Private local control room</div><h1>Memory<br>Platform</h1></div><div class="state"><span class="kicker">Live state</span><b id="state">Checking local services</b></div></header><section class="next"><b>NEXT SAFE ACTION</b><span id="next">Reading the durable queue...</span></section><section class="metrics" id="metrics"></section><section class="split"><section class="panel"><span class="kicker">Projection coverage</span><h2>Local vs Neon</h2><p>Only active, sync-eligible records are expected in Neon. Archived raw content stays local by design.</p><table class="table"><thead><tr><th>Record group</th><th>Local</th><th>Neon</th></tr></thead><tbody id="parity"></tbody></table></section><aside class="panel"><span class="kicker">Controls</span><h2>Bounded work</h2><p>Start and retry use the existing resumable queue. Closing the app pauses background maintenance safely; every committed batch is preserved.</p><div class="actions"><button class="primary" onclick="act('start')">Start sync</button><button onclick="act('retry')">Retry now</button><button onclick="act('push_critical')">Push critical</button><button onclick="act('pause')">Pause</button><button onclick="act('resume')">Resume</button><button class="stop" onclick="act('stop')">Stop run</button></div><p id="notice">No action in progress.</p></aside></section><section class="split" style="margin-top:14px"><section class="panel"><span class="kicker">Transfer plan</span><h2>Data and freshness</h2><div class="compact" id="transfer">Loading...</div></section><aside class="panel"><span class="kicker">Local runtime</span><h2>OrbStack and automation</h2><div class="compact" id="runtime">Loading...</div></aside></section><div class="foot">Operational data only. No credentials or raw session content are shown. Refreshes every 10 seconds.</div></main><script>
+</style></head><body><main class="shell"><header class="head"><div><div class="eyebrow">Private local control room</div><h1>Memory<br>Platform</h1></div><div class="state"><span class="kicker">Live state</span><b id="state">Checking local services</b></div></header><section class="next"><b>NEXT SAFE ACTION</b><span id="next">Reading the durable queue...</span></section><section class="metrics" id="metrics"></section><section class="split"><section class="panel"><span class="kicker">Projection coverage</span><h2>Local vs Neon</h2><p>Only active, sync-eligible records are expected in Neon. Archived raw content stays local by design.</p><table class="table"><thead><tr><th>Record group</th><th>Local</th><th>Neon</th></tr></thead><tbody id="parity"></tbody></table></section><aside class="panel"><span class="kicker">Controls</span><h2>Bounded work</h2><p>Start and retry use the existing resumable queue. Closing the app pauses background maintenance safely; every committed batch is preserved.</p><div class="actions"><button class="primary" onclick="act('start')">Start sync</button><button onclick="act('retry')">Retry now</button><button onclick="act('push_critical')">Push critical</button><button onclick="act('pause')">Pause</button><button onclick="act('resume')">Resume</button><button class="stop" onclick="act('stop')">Stop run</button></div><p id="notice">No action in progress.</p></aside></section><section class="split" style="margin-top:14px"><section class="panel"><span class="kicker">Transfer plan</span><h2>Data and freshness</h2><div class="compact" id="transfer">Loading...</div></section><aside class="panel"><span class="kicker">Local runtime</span><h2>OrbStack and automation</h2><div class="compact" id="runtime">Loading...</div></aside></section><section class="panel" style="margin-top:14px"><span class="kicker">Sync debugger</span><h2>Recent Neon runs</h2><div class="compact" id="recent">Loading redacted sync events...</div></section><div class="foot">Operational data only. No credentials or raw session content are shown. Refreshes every 10 seconds.</div></main><script>
 const token=new URLSearchParams(location.search).get('token')||'';const auth={'X-Memory-Dashboard-Token':token};const fmt=n=>new Intl.NumberFormat().format(n||0);const mb=n=>n==null?'Unavailable':n.toFixed(2)+' MB';
 async function load(){try{let r=await fetch('/api/status',{headers:auth});if(!r.ok)throw new Error(r.status===401?'Dashboard token rejected':'Local service unavailable');let s=await r.json();state.textContent=s.paused?'Paused':s.neon_reachable?'Ready for bounded work':'Neon unavailable';next.textContent=s.next_action;metrics.innerHTML=[['Projection queue',fmt(s.queue_depth),s.queue_depth?'warn':'good'],['Unpublished events',fmt(s.events_unpublished),s.events_unpublished?'warn':'good'],['Neon',''+(s.neon_reachable?'Connected':'Offline'),s.neon_reachable?'good':'warn'],['OrbStack',fmt(s.orbstack_containers.length)+' containers','good']].map(x=>`<article class="metric"><span class="kicker">${x[0]}</span><strong class="${x[2]}">${x[1]}</strong></article>`).join('');parity.innerHTML=s.source_parity.map(r=>{let d=r.neon===null?'unavailable':r.local-r.neon;return `<tr><td>${r.label}</td><td>${fmt(r.local)}</td><td class="${d===0?'match':'drift'}">${r.neon===null?'Unavailable':fmt(r.neon)+(d===0?'':' ('+(d>0?'+':'')+d+')')}</td></tr>`}).join('');transfer.textContent=`Local database: ${mb(s.local_database_mb)}\nNeon database: ${mb(s.neon_database_mb)}\nUnpublished event payload: ${fmt(s.pending_upload_bytes)} bytes\nLast successful transfer: ${s.last_success?.at||'Not recorded'}\nActive documents: ${fmt(s.documents_active)}\nArchived local documents: ${fmt(s.documents_archived)}`;runtime.textContent=`Scheduler: ${s.scheduler}\n\nOrbStack\n${s.orbstack_containers.join('\n')||'No containers reported'}\n\nAutomation definitions\n${s.automation_paths.join('\n')}`;}catch(e){state.textContent='Needs attention';notice.textContent=e.message}}
 async function act(a){notice.textContent='Applying '+a+' safely...';try{let r=await fetch('/api/action/'+a,{method:'POST',headers:auth});let x=await r.json();if(!r.ok)throw new Error(x||'Action failed');notice.textContent=x.note||'Action accepted.';await load()}catch(e){notice.textContent='Action was not applied: '+e.message}}load();setInterval(load,10000);
-</script></body></html>"#;
+</script><script>async function loadRecent(){try{let r=await fetch('/api/status',{headers:auth});if(!r.ok)return;let s=await r.json();recent.textContent=(s.recent_runs.length?s.recent_runs.map(x=>`${x.status.toUpperCase()} | ${x.started_at}${x.finished_at?' -> '+x.finished_at:''}\nrows: ${fmt(x.rows)} | bytes: ${fmt(x.bytes)}${x.error?'\nerror: '+x.error:''}`).join('\n\n'):'No Neon run records yet.')}catch(_){}}loadRecent();setInterval(loadRecent,10000);</script></body></html>"#;
 
 async fn page(
     State(state): State<Arc<DashboardState>>,
