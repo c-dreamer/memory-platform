@@ -510,8 +510,11 @@ async fn push_event_batch(local: &PgPool, neon: &PgPool, lease: &TargetLease) ->
     }
     renew_target_lease(neon, lease).await?;
     let mut tx = neon.begin().await?;
+    // A lost response after Neon accepts an event must not leave this worker
+    // waiting for the operating system's TCP timeout. Events are idempotent,
+    // so the guarded writes and commit below can safely be retried.
     for row in &rows {
-        sqlx::query(
+        tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
             "INSERT INTO sync_meta.events(event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at,received_at) \
              VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now()) ON CONFLICT(event_id) DO NOTHING"
         )
@@ -525,9 +528,13 @@ async fn push_event_batch(local: &PgPool, neon: &PgPool, lease: &TargetLease) ->
         .bind(row.try_get::<String, _>(7)?)
         .bind(row.try_get::<Option<Uuid>, _>(8)?)
         .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>(9)?)
-        .execute(&mut *tx).await?;
+        .execute(&mut *tx))
+        .await
+        .map_err(|_| anyhow!("Neon event write timed out"))??;
     }
-    tx.commit().await?;
+    tokio::time::timeout(QUERY_TIMEOUT, tx.commit())
+        .await
+        .map_err(|_| anyhow!("Neon event commit timed out"))??;
     let ids: Vec<Uuid> = rows
         .iter()
         .map(|r| r.try_get(0))
