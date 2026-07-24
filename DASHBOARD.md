@@ -8,6 +8,8 @@ separate from the MCP process and can run on either the Mac or the VPS.
 - Pending local projection rows, published and unpublished sync events.
 - Active and archived document totals.
 - Last successful transfer, pause state, retry state, and scheduler type.
+- Local database size, pending transfer bytes, active/archive tiers, source
+  categories, and archive-bundle verification status through the storage audit.
 
 It never returns credentials, database URLs, raw session text, or archive data.
 
@@ -42,8 +44,10 @@ Build the verified release, then install the dashboard service:
 
 ```sh
 scripts/install-memory-release.sh
-scripts/install-memory-dashboard.sh
+scripts/install-dashboard-runtime.sh
 ```
 
-macOS installs a user LaunchAgent. Linux installs a systemd user service and a
-matching maintenance service used by the dashboard controls.
+macOS installs a versioned runtime under `~/Library/Application Support/Memory
+Platform/runtime/` and a user LaunchAgent pointing there. This intentionally
+avoids using a temporary checkout path. Linux installs a systemd user service
+and a matching maintenance service used by the dashboard controls.
