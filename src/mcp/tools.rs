@@ -170,6 +170,11 @@ pub fn list_tools() -> Value {
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
         },
         {
+            "name": "storage_catalog",
+            "description": "Read-only redacted storage audit: local database size, active/archive tiers, source categories, generated-output candidates, archive verification, and pending transfer bytes. Never returns raw content.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        },
+        {
             "name": "memory_health",
             "description": "Read-only runtime health: database identity, migrations, embedding readiness, sync cursors, queue depth, and archive state.",
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
@@ -224,6 +229,7 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result
         "list" => tool_list(state, arguments).await,
         "status" => tool_status(state, arguments).await,
         "archive_status" => tool_archive_status(state, arguments).await,
+        "storage_catalog" => tool_storage_catalog(state).await,
         "memory_health" => tool_memory_health(state).await,
         "dashboard_status" => tool_dashboard_status(state).await,
         "dashboard_control" => tool_dashboard_control(arguments).await,
@@ -1137,6 +1143,73 @@ async fn tool_archive_status(state: &AppState, _args: Value) -> Result<String> {
         json!({"document_tiers": tier_counts, "bundles": bundle_status, "pending_sync": pending})
             .to_string(),
     )
+}
+
+/// Aggregate-only storage inventory shared with clients. Keeping this metadata
+/// in the MCP makes archive decisions inspectable without exposing transcript
+/// bodies or credentials to an agent.
+async fn tool_storage_catalog(state: &AppState) -> Result<String> {
+    let database_mb: f64 = sqlx::query_scalar(
+        "SELECT pg_database_size(current_database())::float8 / 1024 / 1024",
+    )
+    .fetch_one(&state.db.pool)
+    .await?;
+    let pending_upload_bytes: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(pg_column_size(payload)),0)::bigint FROM sync_meta.events WHERE pushed_at IS NULL",
+    )
+    .fetch_one(&state.db.pool)
+    .await?;
+    let categories = sqlx::query(
+        "SELECT category, storage_tier, count(*)::bigint AS records, coalesce(sum(bytes),0)::bigint AS bytes FROM ( \
+         SELECT 'documents'::text AS category, storage_tier, pg_column_size(to_jsonb(d))::bigint AS bytes FROM documents d \
+         UNION ALL SELECT 'memories', storage_tier, pg_column_size(to_jsonb(m))::bigint FROM memories m \
+         UNION ALL SELECT 'sessions', storage_tier, pg_column_size(to_jsonb(s))::bigint FROM sessions s \
+         ) inventory GROUP BY category, storage_tier ORDER BY category, storage_tier",
+    )
+    .fetch_all(&state.db.pool)
+    .await?
+    .into_iter()
+    .map(|row| json!({
+        "category": row.get::<String, _>(0), "tier": row.get::<String, _>(1),
+        "records": row.get::<i64, _>(2), "bytes": row.get::<i64, _>(3),
+    }))
+    .collect::<Vec<_>>();
+    let sources = sqlx::query(
+        "SELECT CASE \
+          WHEN path LIKE 'codex://%' OR coalesce(frontmatter->>'source','') LIKE 'codex%' THEN 'Codex' \
+          WHEN path LIKE 'config://opencode%' OR path LIKE 'log://opencode%' OR coalesce(frontmatter->>'source','') LIKE 'opencode%' THEN 'OpenCode' \
+          WHEN path LIKE 'vault://%' OR path LIKE 'obsidian://%' OR coalesce(frontmatter->>'source','') LIKE 'vault%' THEN 'Vault' \
+          WHEN path LIKE '%playwright%' OR path LIKE '%browser%' THEN 'Generated browser output' \
+          ELSE 'Other' END, storage_tier, count(*)::bigint, coalesce(sum(pg_column_size(to_jsonb(documents))),0)::bigint \
+         FROM documents GROUP BY 1, storage_tier ORDER BY 1, storage_tier",
+    )
+    .fetch_all(&state.db.pool)
+    .await?
+    .into_iter()
+    .map(|row| json!({
+        "source": row.get::<String, _>(0), "tier": row.get::<String, _>(1),
+        "records": row.get::<i64, _>(2), "bytes": row.get::<i64, _>(3),
+    }))
+    .collect::<Vec<_>>();
+    let archive = sqlx::query(
+        "SELECT (SELECT count(*) FROM archive_meta.bundles), \
+                (SELECT count(*) FROM archive_meta.bundles WHERE verified_at IS NOT NULL), \
+                (SELECT count(*) FROM archive_meta.records)",
+    )
+    .fetch_one(&state.db.pool)
+    .await?;
+    Ok(json!({
+        "local_database_mb": database_mb,
+        "pending_upload_bytes": pending_upload_bytes,
+        "categories": categories,
+        "document_sources": sources,
+        "archive": {
+            "bundles": archive.get::<i64, _>(0),
+            "verified_bundles": archive.get::<i64, _>(1),
+            "records": archive.get::<i64, _>(2),
+        },
+        "policy": "Active records are eligible for Neon. Archive candidates remain local until an encrypted bundle is verified; raw content is excluded from this response.",
+    }).to_string())
 }
 
 /// 13. session_context — get all documents and memories accessed in a session.
