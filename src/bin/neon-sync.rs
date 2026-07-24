@@ -273,9 +273,18 @@ fn urls(cli: &Cli) -> Result<(String, String)> {
 }
 
 async fn connect(url: &str, label: &str) -> Result<PgPool> {
-    let options = url
+    let mut options = url
         .parse::<PgConnectOptions>()
         .context("invalid PostgreSQL URL")?;
+    if label == "Neon" {
+        // Enforce the same bound inside PostgreSQL. If a network response is
+        // lost after a write, Neon closes the idle transaction and the local
+        // outbox replays the idempotent batch on the next connection.
+        options = options.options([
+            ("statement_timeout", "20s"),
+            ("idle_in_transaction_session_timeout", "25s"),
+        ]);
+    }
     let mut last_error = None;
     for attempt in 0..=MAX_RETRIES {
         let connection = PgPoolOptions::new()
