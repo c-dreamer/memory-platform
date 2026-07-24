@@ -547,16 +547,10 @@ async fn push_event_batch(local: &PgPool, neon: &PgPool, lease: &TargetLease) ->
 }
 
 async fn push_events(local: &PgPool, neon: &PgPool, lease: &TargetLease) -> Result<usize> {
-    let started = Instant::now();
-    let mut published = 0;
-    while started.elapsed() < RUN_BUDGET {
-        let batch = push_event_batch(local, neon, lease).await?;
-        published += batch;
-        if batch < DEFAULT_BATCH_ROWS {
-            break;
-        }
-    }
-    Ok(published)
+    // Keep event publication interleaved with projection writes. A full event
+    // backlog must not consume the entire run budget before one authoritative
+    // record reaches Neon; the outer recovery loop repeats safely.
+    push_event_batch(local, neon, lease).await
 }
 
 async fn apply_remote_event(local: &PgPool, table: &str, key: &str, payload: &Value) -> Result<()> {
@@ -651,19 +645,23 @@ async fn archive_and_delete_many(
     let column = quote_ident(spec.key);
     let mut tx = neon.begin().await?;
     let archive_sql = format!("INSERT INTO sync_meta.archive(run_id,table_name,record_key,row_data,reason) SELECT $1,$2,{column}::text,to_jsonb(t),$4 FROM public.{table} t WHERE {column}::text = ANY($3)");
-    sqlx::query(&archive_sql)
+    tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(&archive_sql)
         .bind(run_id)
         .bind(spec.name)
         .bind(keys)
         .bind(reason)
-        .execute(&mut *tx)
-        .await?;
+        .execute(&mut *tx))
+    .await
+    .map_err(|_| anyhow!("Neon archive write timed out"))??;
     let delete_sql = format!("DELETE FROM public.{table} WHERE {column}::text = ANY($1)");
-    sqlx::query(&delete_sql)
+    tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(&delete_sql)
         .bind(keys)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
+        .execute(&mut *tx))
+    .await
+    .map_err(|_| anyhow!("Neon archive delete timed out"))??;
+    tokio::time::timeout(QUERY_TIMEOUT, tx.commit())
+        .await
+        .map_err(|_| anyhow!("Neon archive commit timed out"))??;
     Ok(())
 }
 
@@ -744,9 +742,11 @@ async fn apply_batch(
     let insert = format!("INSERT INTO public.{table} SELECT (jsonb_populate_record(NULL::public.{table}, $1)).* ON CONFLICT ({key}) DO UPDATE SET {}", updates.join(","));
     let vector_sql = format!("UPDATE public.{table} SET embedding=$1::vector WHERE {key}::text=$2");
     let mut tx = neon.begin().await?;
-    sqlx::query("SET LOCAL memory.sync_replay='on'")
+    tokio::time::timeout(QUERY_TIMEOUT, sqlx::query("SET LOCAL memory.sync_replay='on'")
         .execute(&mut *tx)
-        .await?;
+    )
+    .await
+    .map_err(|_| anyhow!("Neon sync transaction setup timed out"))??;
     for row in rows {
         if let Some(natural_key) = spec.natural_key {
             if let Some(value) = row.data.get(natural_key).and_then(Value::as_str) {
@@ -758,35 +758,41 @@ async fn apply_batch(
                      SELECT $1,$2,{key}::text,to_jsonb(t),'natural-key-conflict-replaced-by-local' \
                      FROM public.{table} t WHERE {natural}=$3 AND {key}::text <> $4"
                 );
-                sqlx::query(&archive)
+                tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(&archive)
                     .bind(run_id)
                     .bind(spec.name)
                     .bind(value)
                     .bind(&row.key)
-                    .execute(&mut *tx)
-                    .await?;
+                    .execute(&mut *tx))
+                .await
+                .map_err(|_| anyhow!("Neon conflict archive timed out"))??;
                 let delete =
                     format!("DELETE FROM public.{table} WHERE {natural}=$1 AND {key}::text <> $2");
-                sqlx::query(&delete)
+                tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(&delete)
                     .bind(value)
                     .bind(&row.key)
-                    .execute(&mut *tx)
-                    .await?;
+                    .execute(&mut *tx))
+                .await
+                .map_err(|_| anyhow!("Neon conflict delete timed out"))??;
             }
         }
-        sqlx::query(&insert)
+        tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(&insert)
             .bind(&row.data)
-            .execute(&mut *tx)
-            .await?;
+            .execute(&mut *tx))
+        .await
+        .map_err(|_| anyhow!("Neon projection write timed out"))??;
         if let Some(vector) = &row.vector {
-            sqlx::query(&vector_sql)
+            tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(&vector_sql)
                 .bind(vector)
                 .bind(&row.key)
-                .execute(&mut *tx)
-                .await?;
+                .execute(&mut *tx))
+            .await
+            .map_err(|_| anyhow!("Neon vector write timed out"))??;
         }
     }
-    tx.commit().await?;
+    tokio::time::timeout(QUERY_TIMEOUT, tx.commit())
+        .await
+        .map_err(|_| anyhow!("Neon projection commit timed out"))??;
     Ok(rows.len())
 }
 
