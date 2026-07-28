@@ -18,6 +18,20 @@ the protected per-device environment file.
   reports only aggregate operational data.
 - The dashboard runtime is installed under `~/Library/Application Support/Memory
   Platform/runtime/<git-revision>/`. It must never rely on `/private/tmp`.
+- `mcp-entrypoint.sh` starts `mcp-transport-guard.sh`. The guard records each
+  stdio launch, clears only dead transport records, and distinguishes a normal
+  peer closure from a server error without writing secrets to logs.
+
+## MCP Transport Recovery
+
+MCP stdio is scoped to one Codex/OpenCode client session. A server process
+cannot reattach after its client closes the pipe, so a `Transport closed` error
+requires that client task to be restarted once. The next launch runs through the
+transport guard and starts a fresh server process automatically.
+
+The guard must never terminate a live MCP child to "repair" another session.
+It is safe because memory records are in PostgreSQL; the MCP process is
+stateless and does not own the outbox or archive lifecycle.
 
 ## Storage Audit
 
