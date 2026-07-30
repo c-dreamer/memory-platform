@@ -279,7 +279,10 @@ impl PostgresDb {
 
     /// Get a session by UUID.
     pub async fn get_session(&self, id: Uuid) -> Result<Option<Session>, sqlx::Error> {
-        sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = $1")
+        sqlx::query_as::<_, Session>(
+            "SELECT id, agent_id, parent_session_id, goal, status, summary, embedding::TEXT AS embedding, \
+             started_at, ended_at, created_at, updated_at FROM sessions WHERE id = $1",
+        )
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -315,7 +318,9 @@ impl PostgresDb {
     /// Get recently completed sessions.
     pub async fn get_recent_sessions(&self, limit: i64) -> Result<Vec<Session>, sqlx::Error> {
         sqlx::query_as::<_, Session>(
-            "SELECT * FROM sessions WHERE status = 'completed' ORDER BY created_at DESC LIMIT $1",
+            "SELECT id, agent_id, parent_session_id, goal, status, summary, embedding::TEXT AS embedding, \
+             started_at, ended_at, created_at, updated_at \
+             FROM sessions WHERE status = 'completed' ORDER BY created_at DESC LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -530,7 +535,7 @@ impl PostgresDb {
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::vector) \
              RETURNING id, agent_id, ea_version, strategy, symbol, timeframe, trade_type, direction, \
                        entry_price, exit_price, profit_factor, drawdown, win_rate, total_trades, \
-                       net_profit, duration_days, indicators, inputs, notes, embedding, created_at",
+                       net_profit, duration_days, indicators, inputs, notes, embedding::TEXT AS embedding, created_at",
         )
         .bind(data.agent_id)
         .bind(&data.ea_version)
@@ -581,7 +586,7 @@ impl PostgresDb {
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::vector) \
              RETURNING id, agent_id, session_id, goal, reasoning_summary, actions, files_changed, \
                        result, lessons_learned, confidence, duration_seconds, tags, \
-                       related_project, embedding, is_procedurized, created_at",
+                       related_project, embedding::TEXT AS embedding, is_procedurized, created_at",
         )
         .bind(data.agent_id)
         .bind(data.session_id)

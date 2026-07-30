@@ -197,7 +197,7 @@ impl IngestionService {
 
         // Find documents with null embedding
         let docs: Vec<Document> = sqlx::query_as::<_, Document>(
-            "SELECT id, path, vault_section, title, content, checksum, frontmatter, embedding, \
+            "SELECT id, path, vault_section, title, content, checksum, frontmatter, embedding::TEXT AS embedding, \
                     token_count, file_size_bytes, file_modified_at, created_at, updated_at \
              FROM documents WHERE embedding IS NULL",
         )
@@ -261,7 +261,7 @@ impl IngestionService {
         let mut errors: Vec<String> = Vec::new();
 
         let memories: Vec<Memory> = sqlx::query_as::<_, Memory>(
-            "SELECT id, agent_id, session_id, content, content_type, embedding, importance, \
+            "SELECT id, agent_id, session_id, content, content_type, embedding::TEXT AS embedding, importance, \
          tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at \
          FROM memories WHERE embedding IS NULL ORDER BY created_at ASC",
         )
@@ -328,7 +328,7 @@ impl IngestionService {
         let experiences: Vec<Experience> = sqlx::query_as::<_, Experience>(
             "SELECT id, agent_id, session_id, goal, reasoning_summary, actions, files_changed, \
                     result, lessons_learned, confidence, duration_seconds, tags, related_project, \
-                    embedding, is_procedurized, created_at \
+                    embedding::TEXT AS embedding, is_procedurized, created_at \
              FROM experiences WHERE embedding IS NULL ORDER BY created_at ASC",
         )
         .fetch_all(&self.db.pool)

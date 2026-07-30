@@ -37,7 +37,7 @@ impl ContextService {
     pub async fn recent_memories(&self, agent_id: &str, limit: i64) -> Result<Vec<Memory>> {
         let agent_id = Uuid::parse_str(agent_id).unwrap_or_default();
         let memories = sqlx::query_as::<_, Memory>(
-            "SELECT id, agent_id, session_id, content, content_type, embedding, importance, \
+            "SELECT id, agent_id, session_id, content, content_type, embedding::TEXT AS embedding, importance, \
                     tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at \
              FROM memories WHERE agent_id = $1 ORDER BY created_at DESC LIMIT $2",
         )
@@ -71,7 +71,7 @@ impl ContextService {
         let sql = format!(
             "SELECT id, agent_id, session_id, goal, reasoning_summary, actions, \
                     files_changed, result, lessons_learned, confidence, \
-                    duration_seconds, tags, related_project, embedding, \
+                    duration_seconds, tags, related_project, embedding::TEXT AS embedding, \
                     is_procedurized, created_at \
              FROM experiences WHERE id IN ({})",
             placeholders.join(",")

@@ -273,7 +273,7 @@ impl ContradictionDetector {
     /// Fetch all memories that have embeddings.
     async fn fetch_all_memories_with_embeddings(&self) -> Result<Vec<Memory>> {
         sqlx::query_as::<_, Memory>(
-            "SELECT id, agent_id, session_id, content, content_type, embedding, \
+            "SELECT id, agent_id, session_id, content, content_type, embedding::TEXT AS embedding, \
                     importance, tags, metadata, last_accessed_at, access_count, \
                     decay_score, created_at, updated_at \
              FROM memories WHERE embedding IS NOT NULL",

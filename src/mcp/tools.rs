@@ -899,7 +899,7 @@ async fn tool_list(state: &AppState, args: Value) -> Result<String> {
         }
         "sessions" => {
             let rows = sqlx::query_as::<_, Session>(
-                "SELECT id, agent_id, parent_session_id, goal, status, summary, embedding, \
+                "SELECT id, agent_id, parent_session_id, goal, status, summary, embedding::TEXT AS embedding, \
                  started_at, ended_at, created_at, updated_at \
                  FROM sessions ORDER BY created_at DESC LIMIT $1 OFFSET $2",
             )
@@ -941,7 +941,7 @@ async fn tool_list(state: &AppState, args: Value) -> Result<String> {
                 "SELECT id, agent_id, ea_version, strategy, symbol, timeframe, trade_type, \
                  direction, entry_price, exit_price, profit_factor, drawdown, win_rate, \
                  total_trades, net_profit, duration_days, indicators, inputs, notes, \
-                 embedding, created_at \
+                 embedding::TEXT AS embedding, created_at \
                  FROM trading_results ORDER BY created_at DESC LIMIT $1 OFFSET $2",
             )
             .bind(limit)
@@ -1323,7 +1323,7 @@ async fn fetch_experiences_by_ids(
     let sql = format!(
         "SELECT id, agent_id, session_id, goal, reasoning_summary, actions, \
          files_changed, result, lessons_learned, confidence, \
-         duration_seconds, tags, related_project, embedding, \
+         duration_seconds, tags, related_project, embedding::TEXT AS embedding, \
          is_procedurized, created_at \
          FROM experiences WHERE id IN ({})",
         placeholders.join(",")
@@ -1345,7 +1345,7 @@ async fn fetch_experience_by_id(
     sqlx::query_as::<_, Experience>(
         "SELECT id, agent_id, session_id, goal, reasoning_summary, actions, \
          files_changed, result, lessons_learned, confidence, \
-         duration_seconds, tags, related_project, embedding, \
+         duration_seconds, tags, related_project, embedding::TEXT AS embedding, \
          is_procedurized, created_at \
          FROM experiences WHERE id = $1",
     )
