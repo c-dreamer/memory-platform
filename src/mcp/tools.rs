@@ -369,7 +369,7 @@ async fn tool_memory_context(state: &AppState, args: Value) -> Result<String> {
 
     let embedding = match &state.embedding_service {
         Some(svc) => svc.embed(&query).await?.as_vec().to_vec(),
-        None => vec![0.0_f32; state.config.embedding_dim],
+        None => Vec::new(), // keyword-only: no vector to compare
     };
 
     let context = state
@@ -414,7 +414,7 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
 
     let embedding = match &state.embedding_service {
         Some(svc) => svc.embed(&goal).await?.as_vec().to_vec(),
-        None => vec![0.0_f32; state.config.embedding_dim],
+        None => Vec::new(), // keyword-only: no vector to compare
     };
 
     let context = state
@@ -557,7 +557,7 @@ async fn tool_experience_find(state: &AppState, args: Value) -> Result<String> {
             // Fallback: search experiences table directly
             let embedding = match &state.embedding_service {
                 Some(svc) => svc.embed(&goal).await?.as_vec().to_vec(),
-                None => vec![0.0_f32; state.config.embedding_dim],
+                None => Vec::new(), // keyword-only: no vector to compare
             };
             let results = state
                 .search
@@ -931,14 +931,44 @@ async fn tool_status(state: &AppState, _args: Value) -> Result<String> {
     let healthy = state.db.health().await;
     let stats = state.db.get_stats().await;
 
+    let embedding = match &state.embedding_mode {
+        Some(mode) => match mode {
+            crate::services::embedding_guard::EmbeddingMode::Semantic {
+                dimension,
+                model,
+                generation,
+            } => json!({
+                "mode": "semantic",
+                "dimension": dimension,
+                "model": model,
+                "generation": generation,
+            }),
+            crate::services::embedding_guard::EmbeddingMode::KeywordOnly { reason } => json!({
+                "mode": "keyword_only",
+                "reason": reason,
+            }),
+            crate::services::embedding_guard::EmbeddingMode::Degraded { reason } => json!({
+                "mode": "degraded",
+                "reason": reason,
+            }),
+        },
+        None => json!({
+            "mode": "unknown",
+            "reason": "dimension guard did not run",
+        }),
+    };
+
     let result = json!({
         "healthy": healthy,
         "stats": stats,
         "config": {
             "embedding_model": state.config.embedding_model,
+            "embedding_dim": state.config.embedding_dim,
+            "embedding_generation": state.config.embedding_generation,
             "search_mode": state.config.search_default_mode,
             "decay_enabled": state.config.decay_enabled,
         },
+        "embedding": embedding,
     });
 
     Ok(serde_json::to_string(&result)?)
@@ -1137,6 +1167,7 @@ mod tests {
             contradiction_detector: None,
             decay_engine: None,
             embedding_service: None,
+            embedding_mode: None,
             experience_service: None,
             ingestion_service: None,
             procedure_service: None,
@@ -1144,10 +1175,10 @@ mod tests {
     }
 
     #[test]
-    fn list_tools_returns_13_tools() {
+    fn list_tools_returns_14_tools() {
         let tools = list_tools();
         let arr = tools.as_array().expect("tools should be an array");
-        assert_eq!(arr.len(), 13, "Expected 13 tools");
+        assert_eq!(arr.len(), 14, "Expected 14 tools");
     }
 
     #[test]

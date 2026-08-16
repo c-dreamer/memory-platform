@@ -71,6 +71,12 @@ pub struct SearchResult {
     pub content: Option<String>,
     pub source_info: String,
     pub score: f64,
+    /// Embedding model that produced this row's vector (vector queries only).
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+    /// Embedding generation label for this row's vector (vector queries only).
+    #[serde(default)]
+    pub embedding_generation: Option<String>,
 }
 
 /// An RRF-fused search result with optional decay and rank metadata.
@@ -713,6 +719,13 @@ impl PostgresDb {
         limit: i64,
         threshold: f64,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
+        // An empty embedding means "no vector available" — never substitute a
+        // zero vector for a missing one (would rank everything at 0.0 and hide
+        // real keyword matches). Callers in keyword-only mode pass `&[]`.
+        if embedding.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let (text_col, extra_col) = Self::table_schema(table);
         let emb_text = vec_to_pgvector(embedding);
         // Cast TEXT[] arrays to TEXT for source_info
@@ -723,7 +736,8 @@ impl PostgresDb {
         };
         let sql = format!(
             "SELECT s.id, COALESCE(s.{text_col}, '') AS content, COALESCE({extra_col_sql}, '') AS source_info, \
-                    (1 - (e.embedding <=> $1::vector))::float8 AS score \
+                    (1 - (e.embedding <=> $1::vector))::float8 AS score, \
+                    e.model AS embedding_model, e.embedding_generation AS embedding_generation \
              FROM embeddings e \
              INNER JOIN {table} s ON s.id = e.source_id \
              WHERE e.source_table = $2 \
@@ -775,7 +789,8 @@ impl PostgresDb {
             // Try tsvector first
             let ts_sql = format!(
                 "SELECT id, COALESCE({text_col}, '') AS content, COALESCE({extra_col_sql}, '') AS source_info, \
-                        ts_rank(fts, plainto_tsquery('english', $1), 32)::float8 AS score \
+                        ts_rank(fts, plainto_tsquery('english', $1), 32)::float8 AS score, \
+                        NULL AS embedding_model, NULL AS embedding_generation \
                  FROM {table} \
                  WHERE fts @@ plainto_tsquery('english', $1) \
                  ORDER BY score DESC \
@@ -798,7 +813,8 @@ impl PostgresDb {
         // Fallback to trigram similarity
         let pg_sql = format!(
             "SELECT id, COALESCE({text_col}, '') AS content, COALESCE({extra_col_sql}, '') AS source_info, \
-                    similarity({text_col}, $1)::float8 AS score \
+                    similarity({text_col}, $1)::float8 AS score, \
+                    NULL AS embedding_model, NULL AS embedding_generation \
              FROM {table} \
              WHERE {text_col} % $1 \
              ORDER BY score DESC \
@@ -1394,13 +1410,15 @@ mod tests {
     fn search_result_serde_roundtrip() {
         let sr = SearchResult {
             id: Uuid::new_v4(),
-            content: "Rust is memory-safe".into(),
+            content: Some("Rust is memory-safe".into()),
             source_info: "rust,memory".into(),
             score: 0.95,
+            embedding_model: None,
+            embedding_generation: None,
         };
         let json = serde_json::to_string(&sr).unwrap();
         let decoded: SearchResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.content, "Rust is memory-safe");
+        assert_eq!(decoded.content.as_deref(), Some("Rust is memory-safe"));
         assert_eq!(decoded.score, 0.95);
     }
 

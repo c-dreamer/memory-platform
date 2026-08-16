@@ -54,20 +54,52 @@ async fn main() -> anyhow::Result<()> {
     // Initialize services
     let search = Arc::new(SearchEngine::new(Arc::clone(&db), Arc::clone(&config)));
 
-    // Embedding service is optional — tools fall back to keyword search if unavailable
-    let embedding_service: Option<Arc<dyn EmbeddingService>> = {
-        let embedding_config = EmbeddingConfig {
-            model: config.embedding_model.clone(),
-            nvidia_api_url: Some(config.nvidia_api_url.clone()),
-            nvidia_api_key: Some(config.nvidia_api_key.clone()),
-            nvidia_embedding_model: config.nvidia_embedding_model.clone(),
-            cache_size: config.embedding_cache_size,
+    // Embedding service is optional — tools fall back to keyword search if
+    // unavailable. Before enabling it, the dimension guard verifies the
+    // configured dimension matches the live schema and stored vectors; a
+    // mismatch fails closed (keyword-only) rather than comparing vectors
+    // across generations. The server always stays alive so memory_search and
+    // other tools continue on BM25/keyword while degraded.
+    let (embedding_service, embedding_mode): (Option<Arc<dyn EmbeddingService>>, _) = {
+        use memory_platform::services::embedding_guard;
+
+        let mode = match embedding_guard::probe_dimensions(&db.pool, &config).await {
+            Ok(probe) => embedding_guard::classify(&probe),
+            Err(e) => embedding_guard::EmbeddingMode::KeywordOnly {
+                reason: format!("database unavailable for dimension probe: {e}"),
+            },
         };
-        match EmbeddingServiceFactory::new(embedding_config).await {
-            Ok(svc) => Some(Arc::new(svc)),
-            Err(e) => {
-                tracing::warn!("Embedding service unavailable (keyword-only fallback): {e}");
-                None
+
+        match &mode {
+            embedding_guard::EmbeddingMode::Semantic { dimension, .. } => {
+                tracing::info!(
+                    "Embedding dimension guard: semantic search enabled (dim={dimension})"
+                );
+            }
+            embedding_guard::EmbeddingMode::KeywordOnly { reason }
+            | embedding_guard::EmbeddingMode::Degraded { reason } => {
+                tracing::warn!("Embedding dimension guard: keyword-only mode ({reason})");
+            }
+        }
+
+        if !mode.semantic_enabled() {
+            tracing::error!("Semantic search disabled; running keyword-only.");
+            (None, Some(mode))
+        } else {
+            let embedding_config = EmbeddingConfig {
+                model: config.embedding_model.clone(),
+                expected_dim: config.embedding_dim,
+                nvidia_api_url: Some(config.nvidia_api_url.clone()),
+                nvidia_api_key: Some(config.nvidia_api_key.clone()),
+                nvidia_embedding_model: config.nvidia_embedding_model.clone(),
+                cache_size: config.embedding_cache_size,
+            };
+            match EmbeddingServiceFactory::new(embedding_config).await {
+                Ok(svc) => (Some(Arc::new(svc)), Some(mode)),
+                Err(e) => {
+                    tracing::warn!("Embedding service unavailable (keyword-only fallback): {e}");
+                    (None, Some(mode))
+                }
             }
         }
     };
@@ -92,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
         contradiction_detector: None,
         decay_engine: Some(decay_engine),
         embedding_service,
+        embedding_mode,
         experience_service: Some(experience_service),
         ingestion_service: None,
         procedure_service: Some(procedure_service),

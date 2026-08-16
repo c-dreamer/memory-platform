@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
 
     let embedding_config = EmbeddingConfig {
         model: config.embedding_model.clone(),
+        expected_dim: config.embedding_dim,
         nvidia_api_url: Some(config.nvidia_api_url.clone()),
         nvidia_api_key: if config.nvidia_api_key.is_empty() {
             None

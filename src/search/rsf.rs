@@ -126,6 +126,8 @@ impl RsfFusion {
                 },
                 kw_rank: e.kw_factor.map(|_| e.rank),
                 decay_factor: None,
+                embedding_model: None,
+                embedding_generation: None,
             })
             .collect()
     }
@@ -159,6 +161,8 @@ mod tests {
             vec_rank: None,
             kw_rank: None,
             decay_factor: None,
+            embedding_model: None,
+            embedding_generation: None,
         }
     }
 

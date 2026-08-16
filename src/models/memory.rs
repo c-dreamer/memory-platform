@@ -33,6 +33,7 @@ pub struct Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_EMBEDDING_DIM;
     use chrono::Utc;
 
     #[test]
@@ -70,7 +71,7 @@ mod tests {
             session_id: None,
             content: "Test memory".into(),
             content_type: "note".into(),
-            embedding: Some(Embedding::new(vec![0.5; 384])),
+            embedding: Some(Embedding::new(vec![0.5; DEFAULT_EMBEDDING_DIM])),
             fts: None,
             importance: 0.5,
             tags: vec![],

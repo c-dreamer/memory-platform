@@ -28,6 +28,7 @@ pub struct Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_EMBEDDING_DIM;
     use chrono::Utc;
 
     #[test]
@@ -62,14 +63,17 @@ mod tests {
             goal: None,
             status: "completed".into(),
             summary: Some("Done".into()),
-            embedding: Some(Embedding::new(vec![0.1; 384])),
+            embedding: Some(Embedding::new(vec![0.1; DEFAULT_EMBEDDING_DIM])),
             started_at: now,
             ended_at: Some(now),
             created_at: now,
             updated_at: now,
         };
         assert!(session.embedding.is_some());
-        assert_eq!(session.embedding.unwrap().as_vec().len(), 384);
+        assert_eq!(
+            session.embedding.unwrap().as_vec().len(),
+            DEFAULT_EMBEDDING_DIM
+        );
     }
 
     #[test]

@@ -56,6 +56,12 @@ pub struct SearchResult {
     /// Memory decay factor (only populated for "memories" table when decay is enabled).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decay_factor: Option<f64>,
+    /// Embedding model that produced the vector for this result (vector queries only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+    /// Embedding generation label for this result's vector (vector queries only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_generation: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +258,8 @@ mod tests {
             vec_rank: Some(1),
             kw_rank: Some(3),
             decay_factor: Some(0.5),
+            embedding_model: Some("nvidia/llama-nemotron-embed-1b-v2".into()),
+            embedding_generation: Some("nvidia-2048-v1".into()),
         };
         let json = serde_json::to_string(&sr).unwrap();
         let decoded: SearchResult = serde_json::from_str(&json).unwrap();
@@ -260,6 +268,10 @@ mod tests {
         assert_eq!(decoded.vec_rank, Some(1));
         assert_eq!(decoded.kw_rank, Some(3));
         assert_eq!(decoded.decay_factor, Some(0.5));
+        assert_eq!(
+            decoded.embedding_generation.as_deref(),
+            Some("nvidia-2048-v1")
+        );
     }
 
     #[test]
@@ -272,11 +284,15 @@ mod tests {
             vec_rank: None,
             kw_rank: None,
             decay_factor: None,
+            embedding_model: None,
+            embedding_generation: None,
         };
         let json = serde_json::to_string(&sr).unwrap();
         assert!(!json.contains("vec_rank"));
         assert!(!json.contains("kw_rank"));
         assert!(!json.contains("decay_factor"));
+        assert!(!json.contains("embedding_model"));
+        assert!(!json.contains("embedding_generation"));
     }
 
     #[tokio::test]

@@ -21,6 +21,15 @@ pub enum ConfigError {
 /// Default embedding dimension for the active production embedding backend.
 pub const DEFAULT_EMBEDDING_DIM: usize = 2048;
 
+/// Canonical embedding generation label. Every vector stored must be tagged
+/// with this generation so 2048-dim records are never compared against legacy
+/// 384-dim records.
+pub const DEFAULT_EMBEDDING_GENERATION: &str = "nvidia-2048-v1";
+
+/// Canonical embedding model. The configured dimension and generation must
+/// match this model's output dimension.
+pub const DEFAULT_EMBEDDING_MODEL: &str = "nvidia/llama-nemotron-embed-1b-v2";
+
 /// Application configuration loaded from environment variables.
 ///
 /// Every field maps to an environment variable (see `.env.example`).
@@ -79,6 +88,8 @@ pub struct Config {
 
     // --- NVIDIA embedding model ---
     pub nvidia_embedding_model: String,
+    /// Canonical embedding generation label (e.g. `nvidia-2048-v1`).
+    pub embedding_generation: String,
 
     // --- Logging ---
     pub rust_log: String,
@@ -99,6 +110,7 @@ impl fmt::Debug for Config {
             .field("api_port", &self.api_port)
             .field("embedding_model", &self.embedding_model)
             .field("embedding_dim", &self.embedding_dim)
+            .field("embedding_generation", &self.embedding_generation)
             .field("nvidia_api_key", &"***redacted***")
             .field("openai_api_key", &"***redacted***")
             .field("vault_path", &self.vault_path)
@@ -142,7 +154,7 @@ impl Config {
 
             // --- Embeddings ---
             embedding_model: env_var("EMBEDDING_MODEL").unwrap_or_else(|| "local".into()),
-            embedding_dim: parse_env("EMBEDDING_DIM", 384)?,
+            embedding_dim: parse_env("EMBEDDING_DIM", DEFAULT_EMBEDDING_DIM)?,
             nvidia_api_url: env_var("NVIDIA_API_URL")
                 .unwrap_or_else(|| "https://integrate.api.nvidia.com/v1/embeddings".into()),
             nvidia_api_key: env_var("NVIDIA_API_KEY").unwrap_or_default(),
@@ -182,7 +194,9 @@ impl Config {
 
             // --- NVIDIA embedding model ---
             nvidia_embedding_model: env_var("NVIDIA_EMBEDDING_MODEL")
-                .unwrap_or_else(|| "nvidia/llama-nemotron-embed-1b-v2".into()),
+                .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.into()),
+            embedding_generation: env_var("EMBEDDING_GENERATION")
+                .unwrap_or_else(|| DEFAULT_EMBEDDING_GENERATION.into()),
 
             // --- Logging ---
             rust_log: env_var("RUST_LOG").unwrap_or_else(|| "info".into()),
@@ -204,7 +218,7 @@ impl Default for Config {
             api_key: String::new(),
             api_port: 8000,
             embedding_model: "local".into(),
-            embedding_dim: 384,
+            embedding_dim: DEFAULT_EMBEDDING_DIM,
             nvidia_api_url: "https://integrate.api.nvidia.com/v1/embeddings".into(),
             nvidia_api_key: String::new(),
             openai_api_key: String::new(),
@@ -229,7 +243,8 @@ impl Default for Config {
             chunk_size: 512,
             chunk_overlap: 64,
             max_chunks_per_doc: 100,
-            nvidia_embedding_model: "nvidia/llama-nemotron-embed-1b-v2".into(),
+            nvidia_embedding_model: DEFAULT_EMBEDDING_MODEL.into(),
+            embedding_generation: DEFAULT_EMBEDDING_GENERATION.into(),
             rust_log: "info".into(),
             embedding_cache_size: 1000,
         }
@@ -369,7 +384,8 @@ mod tests {
         assert_eq!(cfg.api_key, "");
         assert_eq!(cfg.api_port, 8000);
         assert_eq!(cfg.embedding_model, "local");
-        assert_eq!(cfg.embedding_dim, 384);
+        assert_eq!(cfg.embedding_dim, DEFAULT_EMBEDDING_DIM);
+        assert_eq!(cfg.embedding_generation, DEFAULT_EMBEDDING_GENERATION);
         assert_eq!(cfg.nvidia_api_key, "");
         assert_eq!(cfg.openai_api_key, "");
         assert_eq!(cfg.vault_path, "/vault");
@@ -533,7 +549,7 @@ mod tests {
             || {
                 let cfg = Config::from_env().expect("from_env should succeed");
                 assert_eq!(cfg.api_port, 8000);
-                assert_eq!(cfg.embedding_dim, 384);
+                assert_eq!(cfg.embedding_dim, DEFAULT_EMBEDDING_DIM);
                 assert_eq!(
                     cfg.database_url,
                     "postgresql://memory:password@memory-postgres:5432/memory"
@@ -612,6 +628,7 @@ mod tests {
                 ("CHUNK_OVERLAP", "32"),
                 ("MAX_CHUNKS_PER_DOC", "50"),
                 ("NVIDIA_EMBEDDING_MODEL", "nvidia/custom"),
+                ("EMBEDDING_GENERATION", "nvidia-2048-v2"),
                 ("RUST_LOG", "trace"),
                 ("EMBEDDING_CACHE_SIZE", "500"),
             ],
@@ -650,6 +667,7 @@ mod tests {
                 assert_eq!(cfg.chunk_overlap, 32);
                 assert_eq!(cfg.max_chunks_per_doc, 50);
                 assert_eq!(cfg.nvidia_embedding_model, "nvidia/custom");
+                assert_eq!(cfg.embedding_generation, "nvidia-2048-v2");
                 assert_eq!(cfg.rust_log, "trace");
                 assert_eq!(cfg.embedding_cache_size, 500);
             },

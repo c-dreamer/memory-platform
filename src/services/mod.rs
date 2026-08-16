@@ -7,6 +7,7 @@ pub mod context;
 pub mod contradiction;
 pub mod decay;
 pub mod embedding;
+pub mod embedding_guard;
 pub mod experience;
 pub mod ingestion;
 pub mod procedure;

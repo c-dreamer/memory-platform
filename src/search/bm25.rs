@@ -46,6 +46,8 @@ impl Bm25Search {
                 vec_rank: None,
                 kw_rank: None,
                 decay_factor: None,
+                embedding_model: None,
+                embedding_generation: None,
             })
             .collect())
     }

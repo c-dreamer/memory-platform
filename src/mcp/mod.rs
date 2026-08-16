@@ -63,15 +63,18 @@ impl McpServer {
         let mut reader = BufReader::new(reader);
         let mut writer = writer;
         let mut line = String::new();
-        
+
         info!("MCP server listening on stdin");
-        
+
         loop {
             line.clear();
 
-            let bytes_read = timeout(Duration::from_secs(STDIN_TIMEOUT_SECS), reader.read_line(&mut line))
-                .await
-                .map_err(|_| anyhow::anyhow!("stdin read timed out after {STDIN_TIMEOUT_SECS}s"))??;
+            let bytes_read = timeout(
+                Duration::from_secs(STDIN_TIMEOUT_SECS),
+                reader.read_line(&mut line),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("stdin read timed out after {STDIN_TIMEOUT_SECS}s"))??;
 
             if bytes_read == 0 {
                 // EOF
@@ -90,9 +93,9 @@ impl McpServer {
                 writer.flush().await?;
                 continue;
             }
-            
+
             debug!("Received request: {}", line.trim());
-            
+
             let request_value: Value = match serde_json::from_str(line.trim()) {
                 Ok(v) => v,
                 Err(e) => {
@@ -133,7 +136,7 @@ impl McpServer {
             writer.write_all(response_str.as_bytes()).await?;
             writer.flush().await?;
         }
-        
+
         Ok(())
     }
 
@@ -247,7 +250,7 @@ impl McpServer {
 mod tests {
     use super::*;
     use serde_json::json;
-    
+
     fn minimal_state() -> Arc<AppState> {
         Arc::new(AppState {
             config: crate::config::Config::default(),
@@ -259,66 +262,73 @@ mod tests {
             contradiction_detector: None,
             decay_engine: None,
             embedding_service: None,
+            embedding_mode: None,
             experience_service: None,
             ingestion_service: None,
             procedure_service: None,
         })
     }
-    
+
     #[tokio::test]
     async fn test_handle_initialize() {
         let state = minimal_state();
         let server = McpServer::new(state);
-        
+
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
             "params": {},
         });
-        
+
         let response = server.handle_request(request).await.unwrap();
         assert_eq!(response["id"], 1);
         assert_eq!(response["jsonrpc"], "2.0");
         assert!(response["result"].get("serverInfo").is_some());
     }
-    
+
     #[tokio::test]
     async fn test_handle_tools_list() {
         let state = minimal_state();
         let server = McpServer::new(state);
-        
+
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list",
             "params": {},
         });
-        
+
         let response = server.handle_request(request).await.unwrap();
         assert_eq!(response["id"], 1);
         assert_eq!(response["jsonrpc"], "2.0");
-        
+
         let tools = response["result"]["tools"].as_array().unwrap();
         assert!(!tools.is_empty(), "Should return non-empty tools list");
-        assert_eq!(tools.len(), 13, "Should return exactly 13 tools");
+        assert_eq!(tools.len(), 14, "Should return exactly 14 tools");
     }
 
     #[tokio::test]
     async fn test_handle_unknown_method() {
         let state = minimal_state();
         let server = McpServer::new(state);
-        
+
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "nonexistent/method",
             "params": {},
         });
-        
+
         let response = server.handle_request(request).await.unwrap();
-        assert!(response.get("error").is_some(), "Should return error for unknown method");
-        assert_eq!(response["error"]["code"], ERROR_METHOD_NOT_FOUND, "Error code should be -32601");
+        assert!(
+            response.get("error").is_some(),
+            "Should return error for unknown method"
+        );
+        assert_eq!(
+            response["error"]["code"], ERROR_METHOD_NOT_FOUND,
+            "Error code should be -32601"
+        );
         assert_eq!(response["error"]["message"], "Method not found");
     }
 
@@ -336,21 +346,24 @@ mod tests {
         });
         let response = server.handle_request(request).await.unwrap();
         assert_eq!(response["jsonrpc"], "2.0");
-        assert!(response.get("id").is_none(), "Notification response should have no id");
+        assert!(
+            response.get("id").is_none(),
+            "Notification response should have no id"
+        );
     }
 
     #[tokio::test]
     async fn test_handle_tools_call_missing_name() {
         let state = minimal_state();
         let server = McpServer::new(state);
-        
+
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
             "params": {"arguments": {}},
         });
-        
+
         let result = server.handle_request(request).await;
         assert!(result.is_err(), "Should error on missing tool name");
     }
@@ -359,26 +372,32 @@ mod tests {
     async fn test_handle_tools_call_unknown_tool() {
         let state = minimal_state();
         let server = McpServer::new(state);
-        
+
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
             "params": {"name": "nonexistent_tool", "arguments": {}},
         });
-        
+
         let response = server.handle_request(request).await.unwrap();
         let content = &response["result"]["content"][0]["text"];
         let content_str = content.as_str().unwrap();
-        assert!(content_str.contains("error"), "Should contain error in content");
-        assert!(content_str.contains("Unknown tool"), "Should mention unknown tool");
+        assert!(
+            content_str.contains("error"),
+            "Should contain error in content"
+        );
+        assert!(
+            content_str.contains("Unknown tool"),
+            "Should mention unknown tool"
+        );
     }
 
     #[tokio::test]
     async fn test_initialize_response_structure() {
         let state = minimal_state();
         let server = McpServer::new(state);
-        
+
         let response = server.handle_initialize(json!(42)).await;
         assert_eq!(response["id"], 42);
         assert_eq!(response["jsonrpc"], "2.0");

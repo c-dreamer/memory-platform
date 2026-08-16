@@ -26,6 +26,7 @@ use services::context::ContextService;
 use services::contradiction::ContradictionDetector;
 use services::decay::DecayEngine;
 use services::embedding::EmbeddingService;
+use services::embedding_guard::EmbeddingMode;
 use services::experience::ExperienceService;
 use services::ingestion::IngestionService;
 use services::procedure::ProcedureService;
@@ -42,6 +43,9 @@ pub struct AppState {
     pub contradiction_detector: Option<Arc<ContradictionDetector>>,
     pub decay_engine: Option<Arc<DecayEngine>>,
     pub embedding_service: Option<Arc<dyn EmbeddingService>>,
+    /// Result of the embedding dimension guard at startup. `None` when the
+    /// guard never ran (e.g. degraded database). Used for `tool_status`.
+    pub embedding_mode: Option<EmbeddingMode>,
     pub experience_service: Option<Arc<ExperienceService>>,
     pub ingestion_service: Option<Arc<IngestionService>>,
     pub procedure_service: Option<Arc<ProcedureService>>,
@@ -53,14 +57,32 @@ impl std::fmt::Debug for AppState {
             .field("config", &self.config)
             .field("db", &self.db)
             .field("search", &self.search)
-            .field("neo4j_client", &self.neo4j_client.as_ref().map(|_| "(GraphClient)"))
-            .field("redis_cache", &self.redis_cache.as_ref().map(|_| "(RedisCache)"))
+            .field(
+                "neo4j_client",
+                &self.neo4j_client.as_ref().map(|_| "(GraphClient)"),
+            )
+            .field(
+                "redis_cache",
+                &self.redis_cache.as_ref().map(|_| "(RedisCache)"),
+            )
             .field("context_service", &self.context_service)
             .field("contradiction_detector", &self.contradiction_detector)
             .field("decay_engine", &self.decay_engine)
-            .field("embedding_service", &self.embedding_service.as_ref().map(|_| "(EmbeddingService)"))
+            .field(
+                "embedding_service",
+                &self
+                    .embedding_service
+                    .as_ref()
+                    .map(|_| "(EmbeddingService)"),
+            )
             .field("experience_service", &self.experience_service)
-            .field("ingestion_service", &self.ingestion_service.as_ref().map(|_| "(IngestionService)"))
+            .field(
+                "ingestion_service",
+                &self
+                    .ingestion_service
+                    .as_ref()
+                    .map(|_| "(IngestionService)"),
+            )
             .field("procedure_service", &self.procedure_service)
             .finish()
     }

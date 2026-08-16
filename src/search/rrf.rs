@@ -61,6 +61,8 @@ impl RrfFusion {
                     rrf_score,
                     vec_rank: Some(rank as i32 + 1),
                     kw_rank: None,
+                    embedding_model: r.embedding_model.clone(),
+                    embedding_generation: r.embedding_generation.clone(),
                 },
             );
         }
@@ -80,6 +82,8 @@ impl RrfFusion {
                     rrf_score: kw_score,
                     vec_rank: None,
                     kw_rank: Some(rank as i32 + 1),
+                    embedding_model: r.embedding_model.clone(),
+                    embedding_generation: r.embedding_generation.clone(),
                 });
         }
 
@@ -101,6 +105,8 @@ impl RrfFusion {
                 vec_rank: e.vec_rank,
                 kw_rank: e.kw_rank,
                 decay_factor: None,
+                embedding_model: e.embedding_model,
+                embedding_generation: e.embedding_generation,
             })
             .collect()
     }
@@ -114,6 +120,8 @@ struct FuseEntry {
     rrf_score: f64,
     vec_rank: Option<i32>,
     kw_rank: Option<i32>,
+    embedding_model: Option<String>,
+    embedding_generation: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +141,8 @@ mod tests {
             vec_rank: None,
             kw_rank: None,
             decay_factor: None,
+            embedding_model: None,
+            embedding_generation: None,
         }
     }
 

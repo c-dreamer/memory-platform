@@ -89,33 +89,60 @@ async fn main() -> anyhow::Result<()> {
     // Build search engine
     let search = Arc::new(SearchEngine::new(Arc::clone(&db), Arc::clone(&config)));
 
-    // Build embedding service
-    let embedding_config = EmbeddingConfig {
-        model: config.embedding_model.clone(),
-        nvidia_api_url: if config.nvidia_api_url.is_empty() {
-            None
-        } else {
-            Some(config.nvidia_api_url.clone())
-        },
-        nvidia_api_key: if config.nvidia_api_key.is_empty() {
-            None
-        } else {
-            Some(config.nvidia_api_key.clone())
-        },
-        nvidia_embedding_model: config.nvidia_embedding_model.clone(),
-        cache_size: config.embedding_cache_size,
-    };
-    let embedding_service: Option<Arc<dyn memory_platform::services::embedding::EmbeddingService>> =
-        match EmbeddingServiceFactory::new(embedding_config).await {
-            Ok(factory) => {
-                tracing::info!("Embedding service initialized ({})", config.embedding_model);
-                Some(Arc::new(factory))
-            }
-            Err(e) => {
-                tracing::warn!("Embedding service unavailable: {:#}", e);
-                None
-            }
+    // Build embedding service — gated by the dimension guard so a dimension
+    // mismatch fails closed to keyword-only instead of comparing vectors
+    // across generations.
+    let (embedding_service, embedding_mode): (
+        Option<Arc<dyn memory_platform::services::embedding::EmbeddingService>>,
+        Option<memory_platform::services::embedding_guard::EmbeddingMode>,
+    ) = {
+        use memory_platform::services::embedding_guard;
+
+        let mode = match embedding_guard::probe_dimensions(&db.pool, &config).await {
+            Ok(probe) => embedding_guard::classify(&probe),
+            Err(e) => embedding_guard::EmbeddingMode::KeywordOnly {
+                reason: format!("database unavailable for dimension probe: {e}"),
+            },
         };
+
+        if !mode.semantic_enabled() {
+            tracing::warn!("Embedding dimension guard: keyword-only mode ({mode:?})");
+            (None, Some(mode))
+        } else {
+            tracing::info!("Embedding dimension guard: semantic search enabled ({mode:?})");
+            let embedding_config = EmbeddingConfig {
+                model: config.embedding_model.clone(),
+                expected_dim: config.embedding_dim,
+                nvidia_api_url: if config.nvidia_api_url.is_empty() {
+                    None
+                } else {
+                    Some(config.nvidia_api_url.clone())
+                },
+                nvidia_api_key: if config.nvidia_api_key.is_empty() {
+                    None
+                } else {
+                    Some(config.nvidia_api_key.clone())
+                },
+                nvidia_embedding_model: config.nvidia_embedding_model.clone(),
+                cache_size: config.embedding_cache_size,
+            };
+            let svc: Option<Arc<dyn memory_platform::services::embedding::EmbeddingService>> =
+                match EmbeddingServiceFactory::new(embedding_config).await {
+                    Ok(factory) => {
+                        tracing::info!(
+                            "Embedding service initialized ({})",
+                            config.embedding_model
+                        );
+                        Some(Arc::new(factory))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Embedding service unavailable: {:#}", e);
+                        None
+                    }
+                };
+            (svc, Some(mode))
+        }
+    };
 
     // Build business-logic services
     let decay_engine = Arc::new(DecayEngine::new(Arc::clone(&config)));
@@ -154,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
         contradiction_detector: Some(contradiction_detector),
         decay_engine: Some(decay_engine),
         embedding_service,
+        embedding_mode,
         experience_service: Some(experience_service),
         ingestion_service,
         procedure_service: Some(procedure_service),

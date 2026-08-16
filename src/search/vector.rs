@@ -45,6 +45,8 @@ impl VectorSearch {
                 vec_rank: None,
                 kw_rank: None,
                 decay_factor: None,
+                embedding_model: r.embedding_model,
+                embedding_generation: r.embedding_generation,
             })
             .collect())
     }
