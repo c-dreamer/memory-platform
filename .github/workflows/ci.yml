@@ -15,25 +15,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     runs-on: ${{ matrix.os }}
 
-    services:
-      postgres:
-        image: pgvector/pgvector:pg17
-        env:
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-          POSTGRES_DB: memory_platform_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
+    # No services: block. GitHub-hosted macOS/Windows runners have no Docker
+    # daemon, and the two DB-gated tests in tests/integration.rs are #[ignore]
+    # and never run here (see the `--include-ignored` note in that file) - so
+    # this container was never actually exercised by this workflow.
     steps:
       - uses: actions/checkout@v4
 
@@ -46,17 +35,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Secret scan
+        shell: bash
         run: ./scripts/check_secrets.sh
 
       - name: Build (all targets)
         run: cargo build --all-targets --verbose
-        env:
-          DATABASE_URL: postgres://test:test@localhost:5432/memory_platform_test
 
       - name: Run tests
         run: cargo test --verbose
-        env:
-          DATABASE_URL: postgres://test:test@localhost:5432/memory_platform_test
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
