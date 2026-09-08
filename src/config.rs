@@ -16,6 +16,8 @@ pub enum ConfigError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    #[error("MEMORY_LOCAL_ONLY=1 but {reason} — refusing to start with a possible network egress path configured")]
+    LocalOnly { reason: String },
 }
 
 /// Default embedding dimension for the active production embedding backend.
@@ -85,6 +87,13 @@ pub struct Config {
 
     // --- Embedding Cache ---
     pub embedding_cache_size: usize,
+
+    // --- Local-only mode ---
+    /// When true, this deployment must never reach the network except for the
+    /// (separately gated) OneDrive cold-storage archive. Validated at load
+    /// time: refuses to start if a cloud embedding or Neon credential is
+    /// also configured.
+    pub local_only: bool,
 }
 
 impl fmt::Debug for Config {
@@ -107,6 +116,7 @@ impl fmt::Debug for Config {
             .field("search_default_mode", &self.search_default_mode)
             .field("decay_enabled", &self.decay_enabled)
             .field("embedding_cache_size", &self.embedding_cache_size)
+            .field("local_only", &self.local_only)
             .finish()
     }
 }
@@ -126,7 +136,7 @@ impl Config {
         // Load .env file if present; ignore errors (file may not exist).
         dotenvy::dotenv().ok();
 
-        Ok(Self {
+        let cfg = Self {
             // --- Database ---
             database_url: env_var("DATABASE_URL").unwrap_or_else(|| {
                 "postgresql://memory:password@memory-postgres:5432/memory".into()
@@ -189,7 +199,50 @@ impl Config {
 
             // --- Embedding Cache ---
             embedding_cache_size: parse_env("EMBEDDING_CACHE_SIZE", 1000)?,
-        })
+
+            // --- Local-only mode ---
+            local_only: local_only_enabled(),
+        };
+
+        if cfg.local_only {
+            if cfg.embedding_model != "local" {
+                return Err(ConfigError::LocalOnly {
+                    reason: format!(
+                        "EMBEDDING_MODEL is \"{}\", must be \"local\"",
+                        cfg.embedding_model
+                    ),
+                });
+            }
+            if !cfg.nvidia_api_key.is_empty() {
+                return Err(ConfigError::LocalOnly {
+                    reason: "NVIDIA_API_KEY is set".into(),
+                });
+            }
+            if !cfg.openai_api_key.is_empty() {
+                return Err(ConfigError::LocalOnly {
+                    reason: "OPENAI_API_KEY is set".into(),
+                });
+            }
+            if !cfg.obsidian_api_key.is_empty() {
+                return Err(ConfigError::LocalOnly {
+                    reason: "OBSIDIAN_API_KEY is set".into(),
+                });
+            }
+        }
+
+        Ok(cfg)
+    }
+}
+
+/// Whether `MEMORY_LOCAL_ONLY` is set truthy in the environment.
+///
+/// Reads the environment directly rather than going through a `Config`, so
+/// binaries that don't build a full `Config` (`neon-sync`, `memory-dashboard`)
+/// can still refuse a Neon connection attempt under local-only mode.
+pub fn local_only_enabled() -> bool {
+    match env_var("MEMORY_LOCAL_ONLY") {
+        Some(raw) => matches!(raw.to_lowercase().as_str(), "true" | "1" | "yes"),
+        None => false,
     }
 }
 
@@ -232,6 +285,7 @@ impl Default for Config {
             nvidia_embedding_model: "nvidia/llama-nemotron-embed-1b-v2".into(),
             rust_log: "info".into(),
             embedding_cache_size: 1000,
+            local_only: false,
         }
     }
 }
@@ -395,6 +449,7 @@ mod tests {
         );
         assert_eq!(cfg.rust_log, "info");
         assert_eq!(cfg.embedding_cache_size, 1000);
+        assert!(!cfg.local_only);
     }
 
     // ------------------------------------------------------------------
@@ -568,6 +623,60 @@ mod tests {
                 msg.contains("RRF_VECTOR_WEIGHT"),
                 "error should mention key: {msg}"
             );
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // MEMORY_LOCAL_ONLY
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn local_only_off_by_default() {
+        with_env_vars(&[], || {
+            let cfg = Config::from_env().expect("from_env should succeed");
+            assert!(!cfg.local_only);
+        });
+    }
+
+    #[test]
+    fn local_only_rejects_non_local_embedding_model() {
+        with_env_vars(
+            &[("MEMORY_LOCAL_ONLY", "1"), ("EMBEDDING_MODEL", "nvidia")],
+            || {
+                let err = Config::from_env().unwrap_err();
+                assert!(err.to_string().contains("EMBEDDING_MODEL"));
+            },
+        );
+    }
+
+    #[test]
+    fn local_only_rejects_nvidia_api_key() {
+        with_env_vars(
+            &[("MEMORY_LOCAL_ONLY", "1"), ("NVIDIA_API_KEY", "nv-key")],
+            || {
+                let err = Config::from_env().unwrap_err();
+                assert!(err.to_string().contains("NVIDIA_API_KEY"));
+            },
+        );
+    }
+
+    #[test]
+    fn local_only_rejects_openai_api_key() {
+        with_env_vars(
+            &[("MEMORY_LOCAL_ONLY", "1"), ("OPENAI_API_KEY", "oa-key")],
+            || {
+                let err = Config::from_env().unwrap_err();
+                assert!(err.to_string().contains("OPENAI_API_KEY"));
+            },
+        );
+    }
+
+    #[test]
+    fn local_only_allows_clean_config() {
+        with_env_vars(&[("MEMORY_LOCAL_ONLY", "true")], || {
+            let cfg = Config::from_env().expect("local-only with no cloud creds should load");
+            assert!(cfg.local_only);
+            assert_eq!(cfg.embedding_model, "local");
         });
     }
 

@@ -20,6 +20,7 @@ use sqlx::{
 };
 use uuid::Uuid;
 
+use memory_platform::config::local_only_enabled;
 use memory_platform::migrations::Migrator;
 
 const DEFAULT_BATCH_ROWS: usize = 25;
@@ -1210,6 +1211,9 @@ async fn push_once(local: &PgPool, neon: &PgPool) -> Result<(usize, usize, usize
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+    if local_only_enabled() {
+        bail!("MEMORY_LOCAL_ONLY=1 — neon-sync refuses to run; this device must not reach Neon");
+    }
     let cli = Cli::parse();
     let (local_url, neon_url) = urls(&cli)?;
     let local = connect(&local_url, "local PostgreSQL").await?;

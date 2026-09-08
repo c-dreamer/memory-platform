@@ -10,6 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use memory_platform::config::local_only_enabled;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -497,12 +498,19 @@ async fn main() -> Result<()> {
         .parse::<u16>()?;
     let token = env::var("MEMORY_DASHBOARD_TOKEN").context("MEMORY_DASHBOARD_TOKEN is required")?;
     anyhow::ensure!(token.len() >= 32, "MEMORY_DASHBOARD_TOKEN is too short");
-    let neon = env::var("NEON_SYNC_URL").ok().and_then(|url| {
-        PgPoolOptions::new()
-            .max_connections(1)
-            .connect_lazy(&url)
-            .ok()
-    });
+    let neon = match env::var("NEON_SYNC_URL") {
+        Ok(url) => {
+            anyhow::ensure!(
+                !local_only_enabled(),
+                "MEMORY_LOCAL_ONLY=1 but NEON_SYNC_URL is set — refusing to start rather than silently dial Neon"
+            );
+            PgPoolOptions::new()
+                .max_connections(1)
+                .connect_lazy(&url)
+                .ok()
+        }
+        Err(_) => None,
+    };
     let state = Arc::new(DashboardState {
         local: PgPoolOptions::new()
             .max_connections(2)
