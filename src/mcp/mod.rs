@@ -1,6 +1,6 @@
 //! MCP module — Model Context Protocol stdio server.
 //!
-//! Implements JSON-RPC 2.0 over stdin/stdout with 12 tools.
+//! Implements JSON-RPC 2.0 over stdin/stdout with 18 tools.
 //! Logs to stderr via `tracing` (stdout is protocol-only).
 
 use std::sync::Arc;
@@ -191,7 +191,7 @@ impl McpServer {
             "jsonrpc": "2.0",
             "id": id,
             "result": {
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": "2025-06-18",
                 "capabilities": {
                     "tools": {
                         "list": true,
@@ -317,7 +317,7 @@ mod tests {
 
         let tools = response["result"]["tools"].as_array().unwrap();
         assert!(!tools.is_empty(), "Should return non-empty tools list");
-        assert_eq!(tools.len(), 17, "Should return exactly 17 tools");
+        assert_eq!(tools.len(), 18, "Should return exactly 18 tools");
     }
 
     #[tokio::test]
@@ -413,7 +413,7 @@ mod tests {
         let response = server.handle_initialize(json!(42)).await;
         assert_eq!(response["id"], 42);
         assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["result"]["protocolVersion"], "2025-03-26");
+        assert_eq!(response["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(response["result"]["serverInfo"]["name"], "memory-mcp");
         assert_eq!(response["result"]["serverInfo"]["version"], "2.0.0");
         assert!(response["result"]["capabilities"]["tools"]["list"] == true);

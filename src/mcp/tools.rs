@@ -1,4 +1,4 @@
-//! MCP tool handlers — 12 tools matching the Python memory_mcp.py.
+//! MCP tool handlers — 18 tools matching the Python memory_mcp.py.
 //!
 //! Each tool is a standalone async function that takes `&AppState` and
 //! a `serde_json::Value` arguments map, returning a JSON string result.
@@ -1384,10 +1384,10 @@ mod tests {
     }
 
     #[test]
-    fn list_tools_returns_17_tools() {
+    fn list_tools_returns_18_tools() {
         let tools = list_tools();
         let arr = tools.as_array().expect("tools should be an array");
-        assert_eq!(arr.len(), 17, "Expected 17 tools");
+        assert_eq!(arr.len(), 18, "Expected 18 tools");
     }
 
     #[test]
