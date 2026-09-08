@@ -1,16 +1,17 @@
-//! Embedding service — local model (fastembed) or NVIDIA NIM API.
+//! Embedding service — NVIDIA NIM API.
+//!
+//! `fastembed`'s bundled ONNX models top out at 1024 dimensions and cannot
+//! reach this schema's 2048, so it was removed rather than kept as a broken
+//! "local" option — see docs/WINDOWS_PORT_SYNTHESIS.md decision #4.
 //!
 //! Provides async embedding generation with:
-//! - Local ONNX model (validated against the configured production dimension)
-//! - NVIDIA NIM API fallback
+//! - NVIDIA NIM API
 //! - LRU cache (1000 entries)
 
 #[cfg(test)]
 use crate::config::DEFAULT_EMBEDDING_DIM;
 use crate::models::embedding::Embedding;
 use anyhow::{Context, Result};
-#[cfg(feature = "fastembed")]
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use lru::LruCache;
 use reqwest::Client;
 use std::fmt;
@@ -18,8 +19,6 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
-#[cfg(feature = "fastembed")]
-use std::sync::Mutex as BlockingMutex;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -47,106 +46,6 @@ pub struct EmbeddingConfig {
     pub expected_dimension: usize,
     /// LRU cache size (number of entries).
     pub cache_size: usize,
-}
-
-#[cfg(feature = "fastembed")]
-/// Local embedding backend using fastembed.
-pub struct LocalEmbedding {
-    model: Arc<BlockingMutex<TextEmbedding>>,
-    cache: Arc<Mutex<LruCache<String, Embedding>>>,
-    expected_dimension: usize,
-}
-
-#[cfg(feature = "fastembed")]
-impl fmt::Debug for LocalEmbedding {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LocalEmbedding")
-            .field(
-                "cache_size",
-                &self.cache.try_lock().map(|c| c.len()).unwrap_or(0),
-            )
-            .finish()
-    }
-}
-
-#[cfg(feature = "fastembed")]
-impl LocalEmbedding {
-    /// Create a new local embedding backend.
-    pub async fn new(cache_size: usize, expected_dimension: usize) -> Result<Self> {
-        let cache = Arc::new(Mutex::new(LruCache::new(
-            NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(1000).unwrap()),
-        )));
-
-        // Initialize model in a blocking task
-        let model = tokio::task::spawn_blocking(|| -> Result<TextEmbedding> {
-            let mut opts = InitOptions::default();
-            opts.model_name = EmbeddingModel::AllMiniLML6V2;
-            opts.show_download_progress = true;
-            TextEmbedding::try_new(opts).context("Failed to initialize fastembed model")
-        })
-        .await
-        .context("Failed to spawn blocking task for model init")??;
-
-        Ok(Self {
-            model: Arc::new(BlockingMutex::new(model)),
-            cache,
-            expected_dimension,
-        })
-    }
-}
-
-#[cfg(feature = "fastembed")]
-impl EmbeddingService for LocalEmbedding {
-    fn embed(&self, text: &str) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send>> {
-        let text = text.to_string();
-        let model = Arc::clone(&self.model);
-        let cache = Arc::clone(&self.cache);
-        let expected_dimension = self.expected_dimension;
-        Box::pin(async move {
-            if text.trim().is_empty() {
-                anyhow::bail!("cannot embed empty text")
-            }
-
-            // Check cache first
-            {
-                let mut cache = cache.lock().await;
-                if let Some(cached) = cache.get(&text) {
-                    return Ok(cached.clone());
-                }
-            }
-
-            // Run ONNX inference in spawn_blocking
-            let text_clone = text.clone();
-            let model_inner = Arc::clone(&model);
-            let embedding = tokio::task::spawn_blocking(move || {
-                let mut model_lock = model_inner.lock().unwrap();
-                model_lock
-                    .embed(vec![text_clone], None)
-                    .map(|embs| embs.into_iter().next())
-                    .context("Failed to generate embedding")
-            })
-            .await
-            .context("Failed to spawn blocking task for embedding")??;
-
-            let embedding =
-                Embedding::new(embedding.context("Embedding backend returned no vector")?);
-            if embedding.as_vec().len() != expected_dimension {
-                anyhow::bail!(
-                    "local embedding provider returned {} dimensions; expected {}",
-                    embedding.as_vec().len(),
-                    expected_dimension
-                );
-            }
-
-            // Update cache
-            {
-                let mut cache = cache.lock().await;
-                cache.put(text, embedding.clone());
-            }
-
-            Ok(embedding)
-        })
-    }
 }
 
 /// NVIDIA NIM embedding backend (HTTP API).
@@ -366,53 +265,15 @@ impl EmbeddingService for NvidiaNimEmbedding {
     }
 }
 
-/// Fallback embedding service — tries local (fastembed), falls back to NVIDIA NIM.
-#[derive(Debug)]
-pub struct FallbackEmbedding {
-    primary: EmbeddingServiceFactory,
-    fallback: EmbeddingServiceFactory,
-}
-
-impl FallbackEmbedding {
-    pub fn new(primary: EmbeddingServiceFactory, fallback: EmbeddingServiceFactory) -> Self {
-        Self { primary, fallback }
-    }
-}
-
-impl EmbeddingService for FallbackEmbedding {
-    fn embed(&self, text: &str) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>> {
-        let text = text.to_string();
-        let text2 = text.clone();
-        Box::pin(async move {
-            match self.primary.embed(&text).await {
-                Ok(emb) => Ok(emb),
-                Err(e) => {
-                    tracing::warn!(
-                        "Primary embedding failed ({:?}), falling back to NVIDIA NIM",
-                        e
-                    );
-                    self.fallback.embed(&text2).await
-                }
-            }
-        })
-    }
-}
-
 /// Factory for embedding service.
 pub enum EmbeddingServiceFactory {
-    #[cfg(feature = "fastembed")]
-    Local(LocalEmbedding),
     Nvidia(NvidiaNimEmbedding),
-    Fallback(Box<FallbackEmbedding>),
 }
 
 impl fmt::Debug for EmbeddingServiceFactory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            #[cfg(feature = "fastembed")]
-            Self::Local(_) => f.debug_tuple("Local").finish(),
             Self::Nvidia(_) => f.debug_tuple("Nvidia").finish(),
-            Self::Fallback(_) => f.debug_tuple("Fallback").finish(),
         }
     }
 }
@@ -420,45 +281,18 @@ impl fmt::Debug for EmbeddingServiceFactory {
 impl EmbeddingServiceFactory {
     /// Create an embedding service based on configuration.
     ///
-    /// When `model` is `"local"` with fastembed feature, and valid NVIDIA credentials
-    /// are available, returns a `FallbackEmbedding` (local primary, NVIDIA fallback).
-    /// When `model` is `"nvidia"`, uses NVIDIA NIM API directly.
+    /// `model` `"local"` has no working backend yet — see the module doc
+    /// comment — and fails clearly rather than silently reaching NVIDIA.
+    /// `model` `"nvidia"` uses NVIDIA NIM API directly.
     pub async fn new(config: EmbeddingConfig) -> Result<Self> {
         let cache_size = config.cache_size.max(1);
         match config.model.as_str() {
             "local" => {
-                #[cfg(feature = "fastembed")]
-                {
-                    let expected_dimension = config.expected_dimension.max(1);
-                    let local = LocalEmbedding::new(cache_size, expected_dimension).await?;
-                    // If NVIDIA credentials are available, wrap in fallback
-                    if let (Some(url), Some(key)) = (config.nvidia_api_url, config.nvidia_api_key) {
-                        if !url.is_empty() && !key.is_empty() {
-                            let model_name = if config.nvidia_embedding_model.is_empty() {
-                                "nvidia/nv-embedqa-e5-v5".to_string()
-                            } else {
-                                config.nvidia_embedding_model.clone()
-                            };
-                            let nvidia = NvidiaNimEmbedding::new(
-                                url,
-                                key,
-                                model_name,
-                                cache_size,
-                                expected_dimension,
-                            );
-                            return Ok(Self::Fallback(Box::new(FallbackEmbedding::new(
-                                EmbeddingServiceFactory::Local(local),
-                                EmbeddingServiceFactory::Nvidia(nvidia),
-                            ))));
-                        }
-                    }
-                    Ok(Self::Local(local))
-                }
-                #[cfg(not(feature = "fastembed"))]
-                {
-                    let _ = config;
-                    anyhow::bail!("Local embedding requires 'fastembed' feature")
-                }
+                anyhow::bail!(
+                    "EMBEDDING_MODEL=local has no working backend yet (fastembed's models \
+                     cannot reach this schema's 2048 dimensions); see \
+                     docs/WINDOWS_PORT_SYNTHESIS.md decision #1"
+                )
             }
             "nvidia" => {
                 let api_url = config
@@ -484,13 +318,7 @@ impl EmbeddingService for EmbeddingServiceFactory {
     fn embed(&self, text: &str) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>> {
         let text = text.to_string();
         match self {
-            #[cfg(feature = "fastembed")]
-            Self::Local(service) => {
-                let text = text.clone();
-                Box::pin(async move { service.embed(&text).await })
-            }
             Self::Nvidia(service) => Box::pin(async move { service.embed(&text).await }),
-            Self::Fallback(service) => Box::pin(async move { service.embed(&text).await }),
         }
     }
 }
@@ -500,14 +328,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[cfg(feature = "fastembed")]
-    async fn test_local_embedding() {
-        let service = LocalEmbedding::new(1000)
+    async fn test_local_model_has_no_backend() {
+        let config = EmbeddingConfig {
+            model: "local".to_string(),
+            nvidia_api_url: None,
+            nvidia_api_key: None,
+            nvidia_embedding_model: String::new(),
+            expected_dimension: DEFAULT_EMBEDDING_DIM,
+            cache_size: 10,
+        };
+        let err = EmbeddingServiceFactory::new(config)
             .await
-            .expect("Failed to create local embedding");
-        let embedding = service.embed("test").await.expect("Failed to embed");
-        assert_eq!(embedding.as_vec().len(), DEFAULT_EMBEDDING_DIM);
-        assert!(embedding.as_vec().iter().any(|&x| x != 0.0));
+            .expect_err("local model has no working backend yet");
+        assert!(err.to_string().contains("no working backend"));
     }
 
     #[tokio::test]
