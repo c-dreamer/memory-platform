@@ -425,11 +425,11 @@ impl EmbeddingServiceFactory {
     /// When `model` is `"nvidia"`, uses NVIDIA NIM API directly.
     pub async fn new(config: EmbeddingConfig) -> Result<Self> {
         let cache_size = config.cache_size.max(1);
-        let expected_dimension = config.expected_dimension.max(1);
         match config.model.as_str() {
             "local" => {
                 #[cfg(feature = "fastembed")]
                 {
+                    let expected_dimension = config.expected_dimension.max(1);
                     let local = LocalEmbedding::new(cache_size, expected_dimension).await?;
                     // If NVIDIA credentials are available, wrap in fallback
                     if let (Some(url), Some(key)) = (config.nvidia_api_url, config.nvidia_api_key) {

@@ -247,7 +247,6 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use crate::db::postgres::ContextPackage;
-    use chrono::Utc;
     use uuid::Uuid;
 
     fn empty_context() -> ContextPackage {
