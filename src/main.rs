@@ -3,7 +3,9 @@
 //! Starts the Axum HTTP server on the configured port.
 //! Initializes all services, database connections, and migration runner.
 
+use anyhow::Context;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use memory_platform::api;
 use memory_platform::config::Config;
@@ -40,21 +42,18 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(config);
     tracing::info!("Configuration loaded");
 
-    // Connect to PostgreSQL, but keep the daemon alive in degraded mode if
-    // the database is temporarily unavailable.
-    let db = match PostgresDb::connect(&config).await {
-        Ok(db) => {
-            tracing::info!("PostgreSQL connected");
-            let db = Arc::new(db);
-            Migrator::run(&db.pool).await?;
-            tracing::info!("Database migrations applied");
-            db
-        }
-        Err(e) => {
-            tracing::warn!("PostgreSQL unavailable, starting in degraded mode: {e}");
-            Arc::new(PostgresDb::new_empty())
-        }
-    };
+    // Connect to PostgreSQL. It is the local write cache, not an optional
+    // dependency (unlike Redis/Neo4j below): retry for a bounded window to
+    // ride out a startup race (e.g. a scheduled task firing before the DB
+    // service is up), then exit non-zero so a supervisor restarts us rather
+    // than serving traffic against a pool that can never succeed a query.
+    let db = connect_with_retry(&config)
+        .await
+        .context("PostgreSQL is required and never became reachable")?;
+    tracing::info!("PostgreSQL connected");
+    let db = Arc::new(db);
+    Migrator::run(&db.pool).await?;
+    tracing::info!("Database migrations applied");
 
     // Connect to Redis (optional — warn on failure)
     let redis_cache = match RedisCache::connect(&config.redis_url).await {
@@ -172,4 +171,32 @@ async fn main() -> anyhow::Result<()> {
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Retry the PostgreSQL connection with a fixed backoff for up to
+/// `MAX_WAIT`, then give up. Bounded so a real outage still exits the
+/// process (for a supervisor to restart) instead of retrying forever.
+async fn connect_with_retry(config: &Config) -> anyhow::Result<PostgresDb> {
+    const RETRY_INTERVAL: Duration = Duration::from_secs(2);
+    const MAX_WAIT: Duration = Duration::from_secs(120);
+
+    let deadline = Instant::now() + MAX_WAIT;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match PostgresDb::connect(config).await {
+            Ok(db) => return Ok(db),
+            Err(e) if Instant::now() < deadline => {
+                tracing::warn!(
+                    "PostgreSQL connect attempt {attempt} failed, retrying in {RETRY_INTERVAL:?}: {e}"
+                );
+                tokio::time::sleep(RETRY_INTERVAL).await;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "PostgreSQL still unreachable after {attempt} attempts over {MAX_WAIT:?}: {e}"
+                ))
+            }
+        }
+    }
 }
