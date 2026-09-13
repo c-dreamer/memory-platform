@@ -5,7 +5,7 @@ A Rust-based memory and knowledge management platform with hybrid search, embedd
 ## Features
 
 - **Hybrid Search** — Combines vector (pgvector), BM25, and full-text search with Reciprocal Rank Fusion (RRF)
-- **Embedding Service** — Supports local (fastembed) and cloud (NVIDIA NIM) embedding backends with LRU caching
+- **Embedding Service** — NVIDIA NIM embeddings (`nvidia/nemotron-3-embed-1b`, 2048-dim) with LRU caching and a fail-closed dimension guard
 - **Vault Ingestion** — Walks Obsidian vault directories, parses frontmatter, chunks by markdown headers, embeds, and upserts
 - **Contradiction Detection** — Finds semantically similar memories with opposing signals using 30 negation word pairs
 - **Experience Tracking** — Records interactions, updates confidence scores, and applies Ebbinghaus-inspired decay
@@ -109,7 +109,8 @@ All configuration is via environment variables (see `.env.example`):
 | `NEO4J_URI` | `bolt://memory-neo4j:7687` | Neo4j bolt URI |
 | `API_KEY` | (empty = dev mode) | API key for auth |
 | `API_PORT` | `8000` | HTTP server port |
-| `EMBEDDING_MODEL` | `local` | Embedding backend (`local` or `nvidia`) |
+| `EMBEDDING_MODEL` | `local` | Embedding backend. `nvidia` is the working backend (`.env.example` sets it). `local` pairs with `MEMORY_LOCAL_ONLY` and has no working backend yet, so it fails fast rather than silently reaching NVIDIA |
+| `NVIDIA_EMBEDDING_MODEL` | `nvidia/nemotron-3-embed-1b` | NVIDIA embedding model (2048-dim). Supersedes the EOL `llama-nemotron-embed-1b-v2` |
 | `VAULT_PATH` | `/vault` | Path to Obsidian vault |
 
 ### Stats

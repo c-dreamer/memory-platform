@@ -33,6 +33,34 @@ The guard must never terminate a live MCP child to "repair" another session.
 It is safe because memory records are in PostgreSQL; the MCP process is
 stateless and does not own the outbox or archive lifecycle.
 
+## Embedding Model
+
+- Canonical model: `nvidia/nemotron-3-embed-1b`, 2048 dimensions.
+- The previous model `nvidia/llama-nemotron-embed-1b-v2` reached end-of-life on
+  2026-08-25 and now returns `410 Gone`. When it did, the dimension probe failed
+  closed to keyword-only search; it did not corrupt or mix vectors.
+- Because the replacement is also 2048-dimensional, there is no schema change
+  and no re-embedding migration. Vectors produced by the prior model remain
+  valid under the same `nvidia-2048-v1` generation.
+- Verify after a model change: `status` must report
+  `embedding_service: true` and `search_mode: semantic`.
+
+## Connection Pool Resilience
+
+- `PostgresDb::connect` tunes `PgPoolOptions` for a long-lived stdio server that
+  outlives a Docker Postgres restart:
+  - `idle_timeout(60s)` recycles idle connections well before the default 10 min,
+    shrinking the window in which a stale TCP connection can be handed out.
+  - `max_lifetime(None)` avoids a synchronized expiry storm with
+    `min_connections(2)`.
+  - `acquire_timeout(5s)` fails fast so the client sees a retryable error instead
+    of hanging behind a dead socket.
+  - `test_before_acquire(false)` plus a selective `before_acquire` ping only when
+    `idle_for > 60s`, so healthy hot-path acquisitions do not pay a ping.
+- The MCP client `memory` timeout is 10s to sit above the 5s acquire timeout.
+- Expected behavior: after `docker restart memory-postgres`, the next
+  `memory_search` recovers automatically without restarting the MCP process.
+
 ## Storage Audit
 
 The dashboard endpoint `GET /storage/catalog` and the MCP `storage_catalog`

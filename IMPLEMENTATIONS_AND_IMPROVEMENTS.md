@@ -57,6 +57,11 @@ Implement:
 1. Make the active configuration default 2048 everywhere.
 2. Set the canonical model and generation explicitly to
    `nvidia/llama-nemotron-embed-1b-v2` and `2048`.
+   **Update 2026-09-13:** that model reached end-of-life on 2026-08-25 (NVIDIA
+   returns `410 Gone`). The canonical model is now `nvidia/nemotron-3-embed-1b`
+   (2048-dim), wired through `src/config.rs`, `.env.example`, and the memory MCP
+   environment. No schema migration is required because the dimension is
+   unchanged.
 3. Add a startup guard that compares configured dimension, database vector
    columns, source-vector metadata, and retrieval query dimension.
 4. Fail closed for semantic search on mismatch. Continue keyword-only search
@@ -72,6 +77,10 @@ Acceptance tests:
 - A 384/2048 mismatch refuses semantic search without data mutation.
 - A missing embedding service returns keyword-only status.
 - No database vector column or fixture remains unintentionally at 384.
+
+Status 2026-09-13: implemented. `DEFAULT_EMBEDDING_DIM` and `EMBEDDING_DIM` default
+to 2048, a fail-closed dimension guard reports `semantic`/`keyword-only`, vectors
+are never zero-filled, and the canonical model is `nvidia/nemotron-3-embed-1b`.
 
 ### 2. Make the runtime release-safe
 
