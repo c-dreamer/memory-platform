@@ -2,13 +2,16 @@
 
 use anyhow::Result;
 use clap::Parser;
-use memory_platform::Config;
 use memory_platform::db::postgres::PostgresDb;
+use memory_platform::Config;
 use serde_json::json;
 use sqlx::query_scalar;
 
 #[derive(Parser)]
-#[command(name = "stats", about = "Show memory platform database size and counts")]
+#[command(
+    name = "stats",
+    about = "Show memory platform database size and counts"
+)]
 struct Cli {
     /// PostgreSQL connection string
     #[arg(short = 'd', long = "db-url", env = "DATABASE_URL")]
@@ -56,10 +59,7 @@ async fn main() -> Result<()> {
     let summary = summarize(&config.database_url).await?;
 
     if cli.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&summary)?
-        );
+        println!("{}", serde_json::to_string_pretty(&summary)?);
         return Ok(());
     }
 
@@ -86,7 +86,11 @@ async fn summarize(db_url: &str) -> Result<serde_json::Value> {
 }
 
 fn print_summary(label: &str, summary: &serde_json::Value) {
-    println!("{}: {}", label, summary["database_url"].as_str().unwrap_or_default());
+    println!(
+        "{}: {}",
+        label,
+        summary["database_url"].as_str().unwrap_or_default()
+    );
     println!(
         "  size: {:.2} MB ({} bytes)",
         summary["size_mb"].as_f64().unwrap_or_default(),

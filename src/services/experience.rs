@@ -41,7 +41,10 @@ impl std::fmt::Debug for ExperienceService {
             .field("search", &self.search)
             .field(
                 "embedding_service",
-                &self.embedding_service.as_ref().map(|_| "(EmbeddingService)"),
+                &self
+                    .embedding_service
+                    .as_ref()
+                    .map(|_| "(EmbeddingService)"),
             )
             .finish()
     }

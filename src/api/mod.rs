@@ -10,9 +10,9 @@ use axum::Router;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
-use crate::AppState;
 #[cfg(feature = "transport-http")]
 use crate::mcp::transport::http_json_rpc_handler;
+use crate::AppState;
 
 /// Build the API router with all routes.
 #[must_use]

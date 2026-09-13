@@ -1,5 +1,6 @@
-//! OpenCode session ingestion — reads `opencode.db` SQLite via Python extraction script
-//! and stores each session + its message parts as experiences / memories.
+//! Session ingestion — reads a SQLite session DB (OpenCode or Hermes) via a
+//! Python extraction script and stores each session + message parts as
+//! experiences / memories.
 
 use crate::ingest::{IngestEngine, IngestReport};
 use anyhow::{Context, Result};
@@ -17,22 +18,47 @@ pub struct SessionBatch {
     pub new: u64,
 }
 
-/// Find the extraction script relative to the project root.
-fn find_script() -> Result<String> {
+/// A session source: which extraction script to run and how to tag records.
+struct SourceSpec {
+    script: &'static str,
+    /// Metadata key used for dedup (e.g. `opencode_session_id`).
+    dedup_key: &'static str,
+    /// `source` value stamped in metadata.
+    meta_source: &'static str,
+    /// Tag added to every experience/memory for this source.
+    tag: &'static str,
+}
+
+const OPENCODE: SourceSpec = SourceSpec {
+    script: "extract_sessions.py",
+    dedup_key: "opencode_session_id",
+    meta_source: "opencode-session",
+    tag: "opencode-session",
+};
+
+const HERMES: SourceSpec = SourceSpec {
+    script: "extract_hermes_sessions.py",
+    dedup_key: "hermes_session_id",
+    meta_source: "hermes-session",
+    tag: "hermes-session",
+};
+
+/// Find an extraction script relative to the project root.
+fn find_script(script_name: &str) -> Result<String> {
     let candidates = vec![
-        "scripts/extract_sessions.py",
-        "../scripts/extract_sessions.py",
-        "/home/humanoracle26/memory-platform-rust/scripts/extract_sessions.py",
+        format!("scripts/{script_name}"),
+        format!("../scripts/{script_name}"),
+        format!("/home/humanoracle26/memory-platform-rust/scripts/{script_name}"),
     ];
 
     for c in &candidates {
         if Path::new(c).exists() {
-            return Ok(c.to_string());
+            return Ok(c.clone());
         }
     }
 
     anyhow::bail!(
-        "extract_sessions.py not found in expected locations: {:?}",
+        "{script_name} not found in expected locations: {:?}",
         candidates
     );
 }
@@ -43,21 +69,50 @@ pub async fn ingest_sessions(
     opencode_db_path: &Path,
     report: &mut IngestReport,
 ) -> Result<SessionBatch> {
+    ingest_from_source(
+        engine,
+        opencode_db_path,
+        report,
+        &OPENCODE,
+        "opencode-sessions",
+    )
+    .await
+}
+
+/// Ingest all Hermes sessions from `~/.hermes/state.db`.
+pub async fn ingest_hermes_sessions(
+    engine: &IngestEngine,
+    hermes_db_path: &Path,
+    report: &mut IngestReport,
+) -> Result<SessionBatch> {
+    ingest_from_source(engine, hermes_db_path, report, &HERMES, "hermes-sessions").await
+}
+
+/// Shared ingestion pipeline: spawn the Python extractor, stream JSONL,
+/// and process each session.
+async fn ingest_from_source(
+    engine: &IngestEngine,
+    db_path: &Path,
+    report: &mut IngestReport,
+    spec: &SourceSpec,
+    report_key: &str,
+) -> Result<SessionBatch> {
     info!(
-        "Extracting sessions from: {} (via Python script)",
-        opencode_db_path.display()
+        "Extracting sessions from: {} (via Python script {})",
+        db_path.display(),
+        spec.script
     );
 
-    if !opencode_db_path.exists() {
-        anyhow::bail!("Session DB not found: {}", opencode_db_path.display());
+    if !db_path.exists() {
+        anyhow::bail!("Session DB not found: {}", db_path.display());
     }
 
-    let script_path = find_script()?;
+    let script_path = find_script(&spec.script)?;
 
     // Run the Python extraction script
     let mut child = Command::new("python3")
         .arg(&script_path)
-        .arg(opencode_db_path)
+        .arg(db_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -93,7 +148,7 @@ pub async fn ingest_sessions(
         match record_type.as_str() {
             "session" => {
                 if let Some((ses_data, parts, todos)) = current_session.take() {
-                    process_session(engine, &mut batch, ses_data, parts, todos).await;
+                    process_session(engine, &mut batch, ses_data, parts, todos, spec).await;
                 }
                 current_session = Some((data.clone(), Vec::new(), Vec::new()));
                 batch.total += 1;
@@ -122,7 +177,7 @@ pub async fn ingest_sessions(
 
     // Process last session
     if let Some((ses_data, parts, todos)) = current_session.take() {
-        process_session(engine, &mut batch, ses_data, parts, todos).await;
+        process_session(engine, &mut batch, ses_data, parts, todos, spec).await;
     }
 
     // Wait for Python process
@@ -145,7 +200,7 @@ pub async fn ingest_sessions(
 
     report
         .sources_processed
-        .insert("opencode-sessions".to_string(), batch.total);
+        .insert(report_key.to_string(), batch.total);
     report.memories_created += batch.new;
     report.experiences_created += batch.new;
     report.sessions_created += batch.new;
@@ -165,10 +220,15 @@ async fn process_session(
     ses_data: Value,
     parts: Vec<Value>,
     _todos: Vec<Value>,
+    spec: &SourceSpec,
 ) {
     let ses_id = ses_data["id"].as_str().unwrap_or("unknown");
 
-    match engine.session_already_ingested(ses_id).await {
+    // Dedup against the source-specific metadata key.
+    match engine
+        .session_already_ingested_for(spec.dedup_key, ses_id)
+        .await
+    {
         Ok(true) => {
             batch.skipped += 1;
             return;
@@ -226,9 +286,10 @@ async fn process_session(
         Some(mem_session_id)
     };
 
+    let dedup_key = spec.dedup_key;
     let meta = serde_json::json!({
-        "opencode_session_id": ses_id,
-        "source": "opencode-session",
+        dedup_key: ses_id,
+        "source": spec.meta_source,
         "agent": agent_name,
         "model": model_name,
         "tokens_input": tokens_in,
@@ -243,7 +304,7 @@ async fn process_session(
     let tags: Vec<String> = vec![
         agent_name.to_string(),
         model_name.to_string(),
-        "opencode-session".to_string(),
+        spec.tag.to_string(),
     ];
 
     // Insert experience
@@ -264,7 +325,7 @@ async fn process_session(
             None,
             &tags,
             Some(duration_secs),
-            Some("opencode"),
+            Some(spec.meta_source),
         )
         .await
         .unwrap_or_else(|e| {
@@ -290,9 +351,10 @@ async fn process_session(
 
     // Store session summary as a memory
     let session_summary = format!(
-        "OpenCode session: {title}\nAgent: {agent_name}\nModel: {model_name}\n\
+        "{} session: {title}\nAgent: {agent_name}\nModel: {model_name}\n\
          Messages: {msg_count}\nUser prompts: {user_count}\n\
          Tokens: {tokens_in} in / {tokens_out} out\nCost: ${cost:.4}",
+        spec.meta_source,
         msg_count = parts.len(),
         user_count = user_texts.len(),
     );

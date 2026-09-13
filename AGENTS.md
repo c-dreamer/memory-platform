@@ -51,6 +51,23 @@
   task-owned files. Run a staged secret scan before commit. Do not publish until
   local and remote `main` are verified to match.
 
+## Model Router Automation (optional, opt-in)
+
+**Concern (2026-08-21):** Session audit showed the 9router proxy carries ~2% of
+OpenCode traffic (≈14 of 367 sessions), with a 58% proxy success rate and
+22–88s latencies, while native `opencode/*` free models carry the real workload.
+The always-on `model-probe` + `model-router` LaunchAgents (5-min interval)
+rewrote `opencode.json`'s default model during active work (silent failovers),
+and added TCC/binary/pipeline maintenance overhead disproportionate to their use.
+
+**Decision:** These agents are now **opt-in**, not installed by default. The
+9router proxy itself stays available for manual use (Gemini, Cloudflare GLM).
+
+- Install: `scripts/install-neon-sync-launchd.sh --with-model-router`
+- Remove: `scripts/install-neon-sync-launchd.sh --remove-model-router`
+- Default installer run skips both agents and leaves existing installs untouched
+  except when `--remove-model-router` is passed.
+
 ## Cold Archive
 
 - `scripts/archive-documents.sh` defaults to a dry run. It writes a

@@ -93,7 +93,13 @@ impl DecayEngine {
     /// Returns: `relevance_score * score(days_since, access_count, coherence)`
     /// When disabled, returns `relevance_score` unchanged.
     #[must_use]
-    pub fn apply(&self, relevance_score: f64, days_since: f64, access_count: f64, coherence: f64) -> f64 {
+    pub fn apply(
+        &self,
+        relevance_score: f64,
+        days_since: f64,
+        access_count: f64,
+        coherence: f64,
+    ) -> f64 {
         if !self.enabled {
             return relevance_score;
         }

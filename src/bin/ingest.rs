@@ -77,6 +77,12 @@ enum Commands {
         #[arg(short = 'p', long = "path", default_value = "~/.codex/sessions")]
         sessions_path: PathBuf,
     },
+    /// Ingest Hermes sessions from ~/.hermes/state.db
+    Hermes {
+        /// Path to Hermes state.db (SQLite)
+        #[arg(short = 's', long = "source", default_value = "~/.hermes/state.db")]
+        source: PathBuf,
+    },
     /// Run all ingest steps
     All {
         /// Path to opencode.db (SQLite)
@@ -109,6 +115,10 @@ enum Commands {
         /// Path to Codex session archive root
         #[arg(long = "codex-path", default_value = "~/.codex/sessions")]
         codex_path: PathBuf,
+
+        /// Path to Hermes state.db (SQLite)
+        #[arg(long = "hermes-db", default_value = "~/.hermes/state.db")]
+        hermes_db: PathBuf,
     },
 }
 
@@ -170,12 +180,20 @@ async fn main() -> Result<()> {
             let path = expand_path(sessions_path);
             ingest_codex_sessions::ingest_codex_sessions(&engine, &path, &mut report).await?;
         }
+        Commands::Hermes { source } => {
+            let path = expand_path(source);
+            if !path.exists() {
+                anyhow::bail!("Hermes DB not found at: {}", path.display());
+            }
+            ingest_sessions::ingest_hermes_sessions(&engine, &path, &mut report).await?;
+        }
         Commands::All {
             sessions_db,
             vault_path,
             config_dir,
             log_path,
             codex_path,
+            hermes_db,
         } => {
             println!("\n═══════════════════════════════════════");
             println!("  INGESTING ALL SOURCES");
@@ -184,7 +202,7 @@ async fn main() -> Result<()> {
             // 1. Sessions
             let sessions_path = expand_path(sessions_db);
             if sessions_path.exists() {
-                println!("[1/4] Ingesting OpenCode sessions...");
+                println!("[1/6] Ingesting OpenCode sessions...");
                 ingest_sessions::ingest_sessions(&engine, &sessions_path, &mut report).await?;
                 println!("  ✓ Sessions complete");
             } else {
@@ -197,7 +215,7 @@ async fn main() -> Result<()> {
             // 2. Vault
             let vault = expand_path(vault_path);
             if vault.is_dir() {
-                println!("\n[2/4] Ingesting Obsidian vault...");
+                println!("\n[2/6] Ingesting Obsidian vault...");
                 ingest_vault::ingest_vault(&engine, &vault, 0, false, &mut report).await?;
                 println!("  ✓ Vault complete");
             } else {
@@ -207,7 +225,7 @@ async fn main() -> Result<()> {
             // 3. Config
             let cfg_dir = expand_path(config_dir);
             if cfg_dir.is_dir() {
-                println!("\n[3/4] Ingesting OpenCode config, rules, skills...");
+                println!("\n[3/6] Ingesting OpenCode config, rules, skills...");
                 ingest_config::ingest_config(&engine, &cfg_dir, &mut report).await?;
                 println!("  ✓ Config complete");
             } else {
@@ -217,7 +235,7 @@ async fn main() -> Result<()> {
             // 4. Logs
             let log = expand_path(log_path);
             if log.exists() {
-                println!("\n[4/4] Ingesting OpenCode logs...");
+                println!("\n[4/6] Ingesting OpenCode logs...");
                 ingest_logs::ingest_logs(&engine, &log, &mut report).await?;
                 println!("  ✓ Logs complete");
             } else {
@@ -227,7 +245,7 @@ async fn main() -> Result<()> {
             // 5. Codex sessions
             let codex_root = expand_path(codex_path);
             if codex_root.is_dir() {
-                println!("\n[5/5] Ingesting Codex session archives...");
+                println!("\n[5/6] Ingesting Codex session archives...");
                 ingest_codex_sessions::ingest_codex_sessions(&engine, &codex_root, &mut report)
                     .await?;
                 println!("  ✓ Codex sessions complete");
@@ -236,6 +254,16 @@ async fn main() -> Result<()> {
                     "Codex sessions not found at {}, skipping",
                     codex_root.display()
                 );
+            }
+
+            // 6. Hermes sessions
+            let hermes = expand_path(hermes_db);
+            if hermes.exists() {
+                println!("\n[6/6] Ingesting Hermes sessions...");
+                ingest_sessions::ingest_hermes_sessions(&engine, &hermes, &mut report).await?;
+                println!("  ✓ Hermes sessions complete");
+            } else {
+                warn!("Hermes DB not found at {}, skipping", hermes.display());
             }
         }
     }

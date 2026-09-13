@@ -260,7 +260,13 @@ impl ContradictionDetector {
                     memory_id_a: memory.id,
                     memory_id_b: mem.id,
                     content_a: memory.content.chars().take(200).collect(),
-                    content_b: mem.content.as_deref().unwrap_or("").chars().take(200).collect(),
+                    content_b: mem
+                        .content
+                        .as_deref()
+                        .unwrap_or("")
+                        .chars()
+                        .take(200)
+                        .collect(),
                     similarity: (mem.score * 1000.0).round() / 1000.0,
                     contradiction_type: "semantic".into(),
                 });

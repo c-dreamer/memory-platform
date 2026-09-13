@@ -1,8 +1,8 @@
-use axum::{Json, extract::State};
+use axum::{extract::State, Json};
 use std::sync::Arc;
 
-use crate::AppState;
 use crate::api::dto::RootResponse;
+use crate::AppState;
 
 pub async fn root() -> Json<RootResponse> {
     Json(RootResponse {

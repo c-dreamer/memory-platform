@@ -84,9 +84,26 @@ impl IngestEngine {
 
     /// Check whether a memory with the given opencode session ID already exists.
     pub async fn session_already_ingested(&self, opencode_session_id: &str) -> Result<bool> {
+        self.session_already_ingested_for("opencode_session_id", opencode_session_id)
+            .await
+    }
+
+    /// Check whether a session was already ingested, keyed by an arbitrary
+    /// metadata field (e.g. `opencode_session_id` or `hermes_session_id`).
+    pub async fn session_already_ingested_for(
+        &self,
+        dedup_key: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        let mut filter = serde_json::Map::new();
+        filter.insert(
+            dedup_key.to_string(),
+            serde_json::Value::String(session_id.to_string()),
+        );
+        let filter_json = serde_json::Value::Object(filter).to_string();
         let exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM memories WHERE metadata @> $1::jsonb)")
-                .bind(serde_json::json!({"opencode_session_id": opencode_session_id}).to_string())
+                .bind(filter_json)
                 .fetch_one(&self.pool)
                 .await
                 .context("checking if session already ingested")?;

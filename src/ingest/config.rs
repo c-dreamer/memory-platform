@@ -5,6 +5,8 @@
 //! - `rules/` — rule files (coding-style, patterns, testing, git-workflow, security)
 //! - `skills/` — skill markdown files
 //! - `oh-my-openagent.jsonc` — agent configuration
+//! - `~/Documents/AI/opencode.json` — project OpenCode config (9Router models)
+//! - `~/.hermes/config.yaml` — Hermes config (points at 9Router)
 
 use crate::ingest::{IngestEngine, IngestReport};
 use anyhow::{Context, Result};
@@ -85,6 +87,49 @@ pub async fn ingest_config(
         info!("  Ingested opencode.jsonc ({} bytes)", content.len());
     } else {
         warn!("opencode.jsonc not found at {}", opencode_jsonc.display());
+    }
+
+    // 1b. Ingest project opencode.json (~/Documents/AI) — 9Router model registry
+    let project_opencode = config_dir
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."))
+        .join("Documents/AI/opencode.json");
+    if project_opencode.exists() {
+        ingest_aux_config_file(
+            engine,
+            &project_opencode,
+            "ai://opencode.json",
+            "OpenCode Project Configuration (9Router models)",
+            "opencode-config",
+            report,
+        )
+        .await?;
+    } else {
+        warn!(
+            "Project opencode.json not found at {}",
+            project_opencode.display()
+        );
+    }
+
+    // 1c. Ingest hermes config.yaml (~/.hermes) — 9Router base_url
+    let hermes_config = config_dir
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."))
+        .join(".hermes/config.yaml");
+    if hermes_config.exists() {
+        ingest_aux_config_file(
+            engine,
+            &hermes_config,
+            "config://hermes.yaml",
+            "Hermes Agent Configuration",
+            "hermes-config",
+            report,
+        )
+        .await?;
+    } else {
+        warn!("Hermes config not found at {}", hermes_config.display());
     }
 
     // 2. Ingest oh-my-openagent.jsonc
@@ -296,6 +341,72 @@ async fn ingest_skills_recursive(
         info!("  Ingested skill: {file_name}");
     }
 
+    Ok(())
+}
+
+/// Ingest a single auxiliary config file (project opencode.json, hermes config.yaml)
+/// as a document plus a key-detail memory, using a source-appropriate path key.
+async fn ingest_aux_config_file(
+    engine: &IngestEngine,
+    path: &Path,
+    key: &str,
+    title: &str,
+    source: &str,
+    report: &mut IngestReport,
+) -> Result<()> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let modified_at = fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(DateTime::<Utc>::from)
+        .unwrap_or_else(Utc::now);
+    let imported_at = Utc::now();
+
+    let checksum = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let meta = serde_json::json!({
+        "source": source,
+        "path": path.to_string_lossy(),
+        "file_type": path.extension().and_then(|e| e.to_str()).unwrap_or("json"),
+        "source_last_modified_at": modified_at.to_rfc3339(),
+        "source_age_seconds": imported_at.signed_duration_since(modified_at).num_seconds().max(0),
+        "imported_at": imported_at.to_rfc3339(),
+    });
+
+    engine
+        .insert_document(
+            key,
+            Some("config"),
+            Some(title),
+            &content,
+            Some(&checksum),
+            &meta,
+            Some(content.len() as i32),
+            None,
+        )
+        .await
+        .with_context(|| format!("Failed to insert {key} as document"))?;
+    report.documents_created += 1;
+
+    engine
+        .insert_memory(
+            None,
+            &format!("{title} ({source}, {} bytes)", content.len()),
+            "config",
+            0.6,
+            &["opencode-config".to_string(), "configuration".to_string()],
+            &meta,
+        )
+        .await
+        .with_context(|| format!("Failed to insert {key} summary memory"))?;
+    report.memories_created += 1;
+
+    report
+        .sources_processed
+        .entry(key.to_string())
+        .and_modify(|c| *c += 1)
+        .or_insert(1);
+    info!("  Ingested {key} ({} bytes)", content.len());
     Ok(())
 }
 
