@@ -8,7 +8,7 @@ async fn main() -> anyhow::Result<()> {
         model: "local".to_string(),
         nvidia_api_url: None,
         nvidia_api_key: None,
-        nvidia_embedding_model: "nvidia/llama-nemotron-embed-1b-v2".to_string(),
+        nvidia_embedding_model: "nvidia/nemotron-3-embed-1b".to_string(),
         expected_dimension: memory_platform::Config::default().embedding_dim,
         cache_size: 1000,
     };
