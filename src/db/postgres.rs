@@ -10,11 +10,12 @@
 //! equivalent is also a single 584-line file.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::{PgPool, Connection};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -154,13 +155,27 @@ impl PostgresDb {
 
     /// Create a connection pool from the application config.
     ///
-    /// Uses `PgPoolOptions` with min 2, max 10 connections and a 30-second
-    /// command timeout, matching the Python `asyncpg.create_pool` defaults.
+    /// Uses `PgPoolOptions` tuned for local Docker + long-lived stdio MCP:
+    /// - `idle_timeout(60s)` shrinks stale-TCP window from 10min → 1min after container restart
+    /// - `max_lifetime(None)` avoids thundering herd with `min_connections=2` (PostHog pattern)
+    /// - `acquire_timeout(5s)` fail-fast to match opencode's 5s tool timeout
+    /// - `test_before_acquire(false)` + selective `before_acquire` ping (idle>60s) avoids ping on every hot-path acquire
+    /// - `acquire_slow_threshold(1s)` early WARN for slow checkouts
     pub async fn connect(config: &Config) -> Result<Self, sqlx::Error> {
         let pool = PgPoolOptions::new()
             .min_connections(2)
             .max_connections(10)
-            .acquire_timeout(std::time::Duration::from_secs(30))
+            .acquire_timeout(Duration::from_secs(5))
+            .idle_timeout(Duration::from_secs(60))
+            .max_lifetime(None)
+            .test_before_acquire(false)
+            .before_acquire(|conn, meta| Box::pin(async move {
+                if meta.idle_for.as_secs() > 60 {
+                    conn.ping().await?;
+                }
+                Ok(true)
+            }))
+            .acquire_slow_threshold(Duration::from_secs(1))
             .connect(&config.database_url)
             .await?;
         Ok(Self { pool })
