@@ -88,6 +88,30 @@ impl Migrator {
                 "012_fts_input_size_guard",
                 include_str!("../../migrations/012_fts_input_size_guard.sql"),
             ),
+            (
+                "013_neon_event_seq",
+                include_str!("../../migrations/013_neon_event_seq.sql"),
+            ),
+            (
+                "014_sync_scope",
+                include_str!("../../migrations/014_sync_scope.sql"),
+            ),
+            (
+                "015_embeddings_multi_model",
+                include_str!("../../migrations/015_embeddings_multi_model.sql"),
+            ),
+            (
+                "016_contradiction_resolution",
+                include_str!("../../migrations/016_contradiction_resolution.sql"),
+            ),
+            (
+                "017_memory_expiration",
+                include_str!("../../migrations/017_memory_expiration.sql"),
+            ),
+            (
+                "018_bitemporal_validity",
+                include_str!("../../migrations/018_bitemporal_validity.sql"),
+            ),
         ];
 
         // Apply pending migrations in order

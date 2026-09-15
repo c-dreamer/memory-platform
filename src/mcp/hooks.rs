@@ -68,7 +68,7 @@ pub async fn pre_compact(db: &PostgresDb, session_id: Uuid) -> Result<()> {
     let memories = sqlx::query_as::<_, crate::models::Memory>(
         "SELECT id, agent_id, session_id, content, content_type, embedding::TEXT AS embedding, \
          importance, tags, metadata, last_accessed_at, access_count, \
-         decay_score, created_at, updated_at \
+         decay_score, created_at, updated_at, expiration_date \
          FROM memories WHERE session_id = $1 ORDER BY created_at DESC",
     )
     .bind(session_id)

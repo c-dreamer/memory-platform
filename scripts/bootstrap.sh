@@ -22,4 +22,6 @@ echo "[bootstrap] rehydrating local store from Neon and live sources"
 "$SCRIPT_DIR/rehydrate_local.sh"
 
 echo "[bootstrap] verifying backup coverage"
-python3 "$SCRIPT_DIR/verify_backups.py"
+PY=python3
+python3 --version >/dev/null 2>&1 || PY="py -3"
+$PY "$SCRIPT_DIR/verify_backups.py"

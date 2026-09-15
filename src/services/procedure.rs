@@ -32,7 +32,7 @@ impl ProcedureService {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self {
-            db: Arc::new(PostgresDb { pool }),
+            db: Arc::new(PostgresDb::with_pool(pool)),
         }
     }
 

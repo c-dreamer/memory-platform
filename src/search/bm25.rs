@@ -3,7 +3,7 @@
 //! Thin orchestration layer that converts the engine's `SearchResult`
 //! type from the DB layer's `db::SearchResult`.
 
-use crate::db::postgres::PostgresDb;
+use crate::db::postgres::{PostgresDb, SearchFilters};
 
 use super::SearchResult;
 
@@ -34,8 +34,9 @@ impl Bm25Search {
         table: &str,
         query: &str,
         limit: i64,
+        filters: Option<&SearchFilters>,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
-        let rows = db.bm25_search(table, query, limit).await?;
+        let rows = db.bm25_search(table, query, limit, filters).await?;
         Ok(rows
             .into_iter()
             .map(|r| SearchResult {

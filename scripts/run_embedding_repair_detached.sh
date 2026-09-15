@@ -49,11 +49,22 @@ if [[ "${1:-start}" != "start" && "${1:-start}" != "retry" ]]; then
   exit 2
 fi
 
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  write_status running 0 "another repair worker already owns the lock"
-  exit 0
+LOCK_DIR="$LOCK_FILE.d"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  # A crash (SIGKILL, OOM, power loss) never runs the EXIT trap below, so a
+  # stale lock dir can outlive its owner. Reclaim it if that PID is dead,
+  # the same liveness check status() already does against $STATUS_FILE above.
+  stale_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if [[ -n "$stale_pid" ]] && ! kill -0 "$stale_pid" 2>/dev/null; then
+    rm -rf "$LOCK_DIR"
+  fi
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    write_status running 0 "another repair worker already owns the lock"
+    exit 0
+  fi
 fi
+echo "$$" >"$LOCK_DIR/pid"
+trap 'rm -rf "$LOCK_DIR" 2>/dev/null' EXIT
 
 cd "$ROOT_DIR"
 write_status running 0 "started"

@@ -28,7 +28,7 @@ impl ContextService {
     #[must_use]
     pub fn new(pool: PgPool, search: Arc<SearchEngine>) -> Self {
         Self {
-            db: Arc::new(PostgresDb { pool }),
+            db: Arc::new(PostgresDb::with_pool(pool)),
             search,
         }
     }
@@ -38,7 +38,7 @@ impl ContextService {
         let agent_id = Uuid::parse_str(agent_id).unwrap_or_default();
         let memories = sqlx::query_as::<_, Memory>(
             "SELECT id, agent_id, session_id, content, content_type, embedding::TEXT AS embedding, importance, \
-                    tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at \
+                    tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at, expiration_date \
              FROM memories WHERE agent_id = $1 ORDER BY created_at DESC LIMIT $2",
         )
         .bind(agent_id)

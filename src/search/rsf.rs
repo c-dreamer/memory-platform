@@ -63,14 +63,14 @@ impl RsfFusion {
         let mut seen: HashMap<Uuid, FuseEntry> = HashMap::new();
 
         // Vector side — store normalised score as the base factor.
-        for (rank, r) in vec_results.iter().enumerate() {
+        for (rank, r) in vec_results.into_iter().enumerate() {
             let norm_score = (r.score / max_vec).clamp(0.0, 1.0);
             seen.insert(
                 r.id,
                 FuseEntry {
                     id: r.id,
-                    content: r.content.clone(),
-                    source_info: r.source_info.clone(),
+                    content: r.content,
+                    source_info: r.source_info,
                     vec_factor: norm_score,
                     kw_factor: None,
                     fused_score: 0.0,
@@ -80,7 +80,7 @@ impl RsfFusion {
         }
 
         // Keyword side — multiply or insert with default.
-        for (rank, r) in kw_results.iter().enumerate() {
+        for (rank, r) in kw_results.into_iter().enumerate() {
             let norm_score = (r.score / max_kw).clamp(0.0, 1.0);
             seen.entry(r.id)
                 .and_modify(|e| {
@@ -88,8 +88,8 @@ impl RsfFusion {
                 })
                 .or_insert(FuseEntry {
                     id: r.id,
-                    content: r.content.clone(),
-                    source_info: r.source_info.clone(),
+                    content: r.content,
+                    source_info: r.source_info,
                     vec_factor: missing_default,
                     kw_factor: Some(norm_score),
                     fused_score: 0.0,

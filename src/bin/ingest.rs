@@ -122,9 +122,9 @@ enum Commands {
 
 fn expand_path(path: &PathBuf) -> PathBuf {
     let s = path.to_string_lossy().to_string();
-    if s.starts_with("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(s.replacen("~/", &format!("{home}/"), 1));
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
         }
     }
     path.clone()
@@ -149,7 +149,9 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to connect to PostgreSQL")?;
 
-    Migrator::run(&pool).await.context("Failed to run database migrations")?;
+    Migrator::run(&pool)
+        .await
+        .context("Failed to run database migrations")?;
 
     let engine = IngestEngine::new(pool);
     let mut report = IngestReport::default();

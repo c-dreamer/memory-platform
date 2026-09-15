@@ -220,7 +220,7 @@ fn default_ingest_path() -> String {
 
 // ─── Events ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct EventCreate {
     #[serde(default)]
     pub agent_id: Option<String>,

@@ -67,6 +67,16 @@ impl IngestReport {
     }
 }
 
+/// Parse a source-declared timestamp, rejecting it instead of silently
+/// defaulting to the import time. A wrong "now()" for a backfilled record can
+/// make contradiction resolution or decay-based ranking permanently prefer
+/// the wrong side, so a missing/malformed source timestamp must fail the
+/// record rather than fabricate one.
+pub fn require_source_timestamp(raw: &str, context: &str) -> Result<chrono::DateTime<Utc>> {
+    raw.parse::<chrono::DateTime<Utc>>()
+        .with_context(|| format!("missing or malformed source timestamp for {context}: {raw:?}"))
+}
+
 /// Shared ingestion engine wrapping a PgPool.
 pub struct IngestEngine {
     pool: PgPool,
@@ -123,8 +133,13 @@ impl IngestEngine {
 
     /// Upsert a source-backed session without creating a duplicate row.
     pub async fn upsert_source_session(
-        &self, source_key: &str, goal: &str, status: &str, summary: Option<&str>,
-        started_at: chrono::DateTime<Utc>, ended_at: Option<chrono::DateTime<Utc>>,
+        &self,
+        source_key: &str,
+        goal: &str,
+        status: &str,
+        summary: Option<&str>,
+        started_at: chrono::DateTime<Utc>,
+        ended_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<Uuid> {
         sqlx::query_scalar(
             r#"INSERT INTO sessions (goal,status,summary,started_at,ended_at,source_key)

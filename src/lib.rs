@@ -11,6 +11,7 @@ pub mod ingest;
 pub mod mcp;
 pub mod migrations;
 pub mod models;
+pub mod queue;
 pub mod search;
 pub mod services;
 
@@ -21,6 +22,7 @@ pub use config::Config;
 use db::neo4j::GraphClient;
 use db::postgres::PostgresDb;
 use db::redis::RedisCache;
+use queue::PendingWriteQueue;
 use search::SearchEngine;
 use services::context::ContextService;
 use services::contradiction::ContradictionDetector;
@@ -45,6 +47,7 @@ pub struct AppState {
     pub experience_service: Option<Arc<ExperienceService>>,
     pub ingestion_service: Option<Arc<IngestionService>>,
     pub procedure_service: Option<Arc<ProcedureService>>,
+    pub pending_writes: Arc<PendingWriteQueue>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -53,15 +56,34 @@ impl std::fmt::Debug for AppState {
             .field("config", &self.config)
             .field("db", &self.db)
             .field("search", &self.search)
-            .field("neo4j_client", &self.neo4j_client.as_ref().map(|_| "(GraphClient)"))
-            .field("redis_cache", &self.redis_cache.as_ref().map(|_| "(RedisCache)"))
+            .field(
+                "neo4j_client",
+                &self.neo4j_client.as_ref().map(|_| "(GraphClient)"),
+            )
+            .field(
+                "redis_cache",
+                &self.redis_cache.as_ref().map(|_| "(RedisCache)"),
+            )
             .field("context_service", &self.context_service)
             .field("contradiction_detector", &self.contradiction_detector)
             .field("decay_engine", &self.decay_engine)
-            .field("embedding_service", &self.embedding_service.as_ref().map(|_| "(EmbeddingService)"))
+            .field(
+                "embedding_service",
+                &self
+                    .embedding_service
+                    .as_ref()
+                    .map(|_| "(EmbeddingService)"),
+            )
             .field("experience_service", &self.experience_service)
-            .field("ingestion_service", &self.ingestion_service.as_ref().map(|_| "(IngestionService)"))
+            .field(
+                "ingestion_service",
+                &self
+                    .ingestion_service
+                    .as_ref()
+                    .map(|_| "(IngestionService)"),
+            )
             .field("procedure_service", &self.procedure_service)
+            .field("pending_writes", &"(PendingWriteQueue)")
             .finish()
     }
 }

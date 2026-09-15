@@ -1,6 +1,6 @@
 //! Memory model — matches the `memories` table.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -28,6 +28,9 @@ pub struct Memory {
     pub decay_score: f64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Soft, date-bounded hide: once past, excluded from search/list (but
+    /// still directly fetchable) without touching decay or deleting the row.
+    pub expiration_date: Option<NaiveDate>,
 }
 
 #[cfg(test)]
@@ -54,6 +57,7 @@ mod tests {
             decay_score: 1.0,
             created_at: now,
             updated_at: now,
+            expiration_date: None,
         };
         assert_eq!(memory.content_type, "insight");
         assert_eq!(memory.importance, 0.8);
@@ -80,6 +84,7 @@ mod tests {
             decay_score: 0.9,
             created_at: now,
             updated_at: now,
+            expiration_date: None,
         };
         let json = serde_json::to_string(&memory).unwrap();
         let decoded: Memory = serde_json::from_str(&json).unwrap();

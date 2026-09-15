@@ -5,11 +5,8 @@
 use std::sync::Arc;
 
 use memory_platform::{
-    config::Config,
-    db::postgres::PostgresDb,
-    mcp::McpServer,
-    search::SearchEngine,
-    AppState,
+    config::Config, db::postgres::PostgresDb, mcp::McpServer, queue::PendingWriteQueue,
+    search::SearchEngine, AppState,
 };
 use serde_json::{json, Value};
 
@@ -28,6 +25,7 @@ fn minimal_state() -> Arc<AppState> {
         experience_service: None,
         ingestion_service: None,
         procedure_service: None,
+        pending_writes: Arc::new(PendingWriteQueue::new_empty()),
     })
 }
 
@@ -70,14 +68,29 @@ async fn test_mcp_tools_list() {
     let resp = response.unwrap();
 
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 18, "Should return 18 tools");
+    assert_eq!(tools.len(), 22, "Should return 22 tools");
 
-    let names: Vec<&str> = tools.iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
-    for name in &["memory_search", "memory_store", "memory_context",
-                  "memory_initialize", "experience_find", "procedure_run",
-                  "session_start", "session_end", "recall", "forget", "list", "status", "session_context", "archive_status", "storage_catalog", "memory_health", "dashboard_status", "dashboard_control"] {
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    for name in &[
+        "memory_search",
+        "memory_store",
+        "memory_context",
+        "memory_initialize",
+        "experience_find",
+        "procedure_run",
+        "session_start",
+        "session_end",
+        "recall",
+        "forget",
+        "list",
+        "status",
+        "session_context",
+        "archive_status",
+        "storage_catalog",
+        "memory_health",
+        "dashboard_status",
+        "dashboard_control",
+    ] {
         assert!(names.contains(name), "Missing tool: {name}");
     }
 }
@@ -96,7 +109,10 @@ async fn test_mcp_unknown_tool() {
     });
 
     let response = server.handle_request(request).await;
-    assert!(response.is_ok(), "Unknown tool should still return 200 JSON-RPC");
+    assert!(
+        response.is_ok(),
+        "Unknown tool should still return 200 JSON-RPC"
+    );
     let resp = response.unwrap();
     let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("Unknown tool"), "Should mention unknown tool");

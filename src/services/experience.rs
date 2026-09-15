@@ -40,7 +40,10 @@ impl std::fmt::Debug for ExperienceService {
             .field("search", &self.search)
             .field(
                 "embedding_service",
-                &self.embedding_service.as_ref().map(|_| "(EmbeddingService)"),
+                &self
+                    .embedding_service
+                    .as_ref()
+                    .map(|_| "(EmbeddingService)"),
             )
             .finish()
     }
@@ -100,9 +103,7 @@ impl ExperienceService {
         &self,
         data: CreateExperience,
     ) -> Result<Experience, anyhow::Error> {
-        let db = PostgresDb {
-            pool: self.pool.clone(),
-        };
+        let db = PostgresDb::with_pool(self.pool.clone());
 
         let embedding = if let Some(service) = &self.embedding_service {
             let text = compose_experience_text(&data);

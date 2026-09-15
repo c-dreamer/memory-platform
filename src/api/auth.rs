@@ -6,7 +6,7 @@
 
 use axum::{
     extract::FromRequestParts,
-    http::{StatusCode, request::Parts},
+    http::{request::Parts, StatusCode},
     response::{IntoResponse, Response},
 };
 use std::sync::Arc;

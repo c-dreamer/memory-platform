@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  Windows Task Scheduler analog of launchd/com.memory-platform.neon-retry.plist.template
+  (decision #22, docs/WINDOWS_PORT_SYNTHESIS.md). Skipped when MEMORY_LOCAL_ONLY=1
+  (decision #23).
+
+  launchd's StartInterval=3600 (run every hour, forever, no wall-clock anchor) has
+  no direct Task Scheduler equivalent. This maps it to a daily CalendarTrigger whose
+  Repetition fires every hour for a 1-day Duration, so the *next* day's CalendarTrigger
+  re-arms the cycle. UNVERIFIED against a live Windows 11 box as of 2026-09-09
+  (docs/WINDOWS_PORT_SYNTHESIS.md §7 row 9's own caveat). Confirm with
+  `Get-ScheduledTaskInfo -TaskName MemoryPlatformNeonRetry` that LastRunTime keeps
+  advancing hourly past the first 24h before relying on this for real retry coverage.
+-->
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Memory Platform: hourly check for a previously failed sync, retried only if one is pending (mirrors com.memory-platform.neon-retry on macOS).</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-01-01T00:05:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+      <Repetition>
+        <Interval>PT1H</Interval>
+        <Duration>P1D</Duration>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>__USER__</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT30M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>__POWERSHELL__</Command>
+      <Arguments>__PS1_ARGS__</Arguments>
+    </Exec>
+  </Actions>
+</Task>

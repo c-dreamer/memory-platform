@@ -8,13 +8,17 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use memory_platform::db::postgres::PostgresDb;
+use memory_platform::queue::PendingWriteQueue;
 use memory_platform::search::SearchEngine;
 use memory_platform::{api, config::Config, AppState};
 use tower::ServiceExt;
 
-/// Test that the health endpoint returns 200 OK.
+/// `minimal_state()`'s db is `PostgresDb::new_empty()` — lazily connected to
+/// a nonexistent database, so `db.health()` is false here by construction.
+/// Since 1c56c04, `/health` reports that honestly as 503 rather than a
+/// silent 200; this asserts the current, correct contract.
 #[tokio::test]
-async fn health_endpoint_returns_200() {
+async fn health_endpoint_returns_503_when_db_unavailable() {
     let state = minimal_state();
     let app = api::router().with_state(state);
 
@@ -28,7 +32,7 @@ async fn health_endpoint_returns_200() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 /// Test that the root endpoint returns 200 OK.
@@ -83,6 +87,7 @@ async fn auth_rejects_missing_api_key() {
         experience_service: None,
         ingestion_service: None,
         procedure_service: None,
+        pending_writes: Arc::new(PendingWriteQueue::new_empty()),
     });
 
     let app = api::router().with_state(state);
@@ -170,5 +175,6 @@ fn minimal_state() -> Arc<AppState> {
         experience_service: None,
         ingestion_service: None,
         procedure_service: None,
+        pending_writes: Arc::new(PendingWriteQueue::new_empty()),
     })
 }

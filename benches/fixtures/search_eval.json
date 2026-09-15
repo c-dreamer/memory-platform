@@ -1,0 +1,66 @@
+{
+  "memories": [
+    {
+      "key": "pg-pool",
+      "content": "Postgres connection pooling reuses open connections and avoids a new TCP handshake per request.",
+      "tags": ["database", "performance"]
+    },
+    {
+      "key": "rust-ownership",
+      "content": "Rust's ownership model prevents use-after-free bugs at compile time without a garbage collector.",
+      "tags": ["rust", "memory-safety"]
+    },
+    {
+      "key": "rrf-fusion",
+      "content": "Reciprocal rank fusion combines vector and keyword search rankings into one relevance score.",
+      "tags": ["search", "ranking"]
+    },
+    {
+      "key": "decay-half-life",
+      "content": "Memory decay scoring uses an exponential half-life so recently accessed items rank higher over time.",
+      "tags": ["decay", "ranking"]
+    },
+    {
+      "key": "windows-linker",
+      "content": "On Windows, Git Bash coreutils link.exe shadows the MSVC linker rustc needs, causing a confusing extra operand error.",
+      "tags": ["windows", "build"]
+    },
+    {
+      "key": "bm25-tsvector",
+      "content": "BM25 inspired full text search in Postgres uses tsvector and ts_rank with a trigram similarity fallback.",
+      "tags": ["search", "postgres"]
+    },
+    {
+      "key": "contradiction-resolution",
+      "content": "Contradiction resolution marks the losing memory as superseded instead of deleting it, preserving history.",
+      "tags": ["memory", "contradiction"]
+    },
+    {
+      "key": "expiration-soft-hide",
+      "content": "An expiration date soft hides a memory from search results without touching its decay score or deleting the row.",
+      "tags": ["memory", "lifecycle"]
+    },
+    {
+      "key": "neon-sync-outbox",
+      "content": "The Neon sync outbox drains committed transactions in small batches and halves batch size after a transport failure.",
+      "tags": ["sync", "neon"]
+    },
+    {
+      "key": "vault-ingest-chunking",
+      "content": "Obsidian vault ingestion splits markdown files into chunks at heading boundaries before embedding.",
+      "tags": ["ingest", "markdown"]
+    }
+  ],
+  "queries": [
+    { "query": "connection pooling handshake overhead", "expect": ["pg-pool"] },
+    { "query": "ownership prevents use-after-free", "expect": ["rust-ownership"] },
+    { "query": "reciprocal rank fusion vector keyword", "expect": ["rrf-fusion"] },
+    { "query": "exponential half-life decay scoring", "expect": ["decay-half-life"] },
+    { "query": "link.exe shadows MSVC linker", "expect": ["windows-linker"] },
+    { "query": "tsvector ts_rank trigram fallback", "expect": ["bm25-tsvector"] },
+    { "query": "superseded memory contradiction", "expect": ["contradiction-resolution"] },
+    { "query": "expiration date hides memory search", "expect": ["expiration-soft-hide"] },
+    { "query": "outbox batch transport failure", "expect": ["neon-sync-outbox"] },
+    { "query": "markdown chunk heading boundaries", "expect": ["vault-ingest-chunking"] }
+  ]
+}
