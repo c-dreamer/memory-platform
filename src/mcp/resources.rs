@@ -20,7 +20,8 @@ use serde_json::{json, Value};
 use crate::models::Memory;
 use crate::AppState;
 
-const MEMORY_COLUMNS: &str = "id, agent_id, session_id, content, content_type, embedding::TEXT AS embedding, \
+const MEMORY_COLUMNS: &str =
+    "id, agent_id, session_id, content, content_type, embedding::TEXT AS embedding, \
      importance, tags, metadata, last_accessed_at, access_count, \
      decay_score, created_at, updated_at, expiration_date";
 
@@ -153,7 +154,10 @@ mod tests {
     fn list_resource_templates_cover_recent_and_tag() {
         let templates = list_resource_templates();
         let arr = templates.as_array().unwrap();
-        let uris: Vec<&str> = arr.iter().map(|t| t["uriTemplate"].as_str().unwrap()).collect();
+        let uris: Vec<&str> = arr
+            .iter()
+            .map(|t| t["uriTemplate"].as_str().unwrap())
+            .collect();
         assert!(uris.contains(&"memory://recent/{n}"));
         assert!(uris.contains(&"memory://tag/{tag}"));
     }
@@ -175,7 +179,9 @@ mod tests {
             procedure_service: None,
             pending_writes: std::sync::Arc::new(crate::queue::PendingWriteQueue::new_empty()),
         };
-        let err = read_resource(&state, "memory://nonsense").await.unwrap_err();
+        let err = read_resource(&state, "memory://nonsense")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("Unknown resource URI"));
     }
 

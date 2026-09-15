@@ -1517,7 +1517,9 @@ mod tests {
     #[test]
     fn urls_rejects_common_pooler_ports() {
         for port in ["6543", "6432"] {
-            let cli = cli_with_target(&format!("postgres://user:pw@db.example.com:{port}/postgres"));
+            let cli = cli_with_target(&format!(
+                "postgres://user:pw@db.example.com:{port}/postgres"
+            ));
             assert!(urls(&cli).is_err(), "port {port} should be rejected");
         }
     }

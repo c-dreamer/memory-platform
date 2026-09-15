@@ -112,8 +112,7 @@ async fn main() -> Result<()> {
 
     latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let recall = hits as f64 / fixtures.queries.len() as f64;
-    let avg_context_tokens =
-        (context_chars as f64 / fixtures.queries.len() as f64) / 4.0; // ~4 chars/token heuristic
+    let avg_context_tokens = (context_chars as f64 / fixtures.queries.len() as f64) / 4.0; // ~4 chars/token heuristic
 
     println!(
         "search_eval: {} queries against {} seeded memories",

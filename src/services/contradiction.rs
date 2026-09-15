@@ -425,14 +425,14 @@ impl ContradictionDetector {
     /// Fetch one memory's bi-temporal validity fields, for `auto_resolve`
     /// only — not part of the general `Memory` model.
     async fn fetch_validity(&self, memory_id: Uuid) -> Result<MemoryValidity> {
-        let (valid_at, invalid_at, created_at) = sqlx::query_as::<
-            _,
-            (Option<DateTime<Utc>>, Option<DateTime<Utc>>, DateTime<Utc>),
-        >("SELECT valid_at, invalid_at, created_at FROM memories WHERE id = $1")
-        .bind(memory_id)
-        .fetch_one(&self.db.pool)
-        .await
-        .with_context(|| format!("Failed to fetch validity for memory {memory_id}"))?;
+        let (valid_at, invalid_at, created_at) =
+            sqlx::query_as::<_, (Option<DateTime<Utc>>, Option<DateTime<Utc>>, DateTime<Utc>)>(
+                "SELECT valid_at, invalid_at, created_at FROM memories WHERE id = $1",
+            )
+            .bind(memory_id)
+            .fetch_one(&self.db.pool)
+            .await
+            .with_context(|| format!("Failed to fetch validity for memory {memory_id}"))?;
         Ok(MemoryValidity {
             valid_at,
             invalid_at,

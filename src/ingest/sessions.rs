@@ -189,22 +189,24 @@ async fn process_session(
 
     let created_iso = ses_data["time_created_iso"].as_str().unwrap_or("");
     let updated_iso = ses_data["time_updated_iso"].as_str().unwrap_or("");
-    let created_dt = match require_source_timestamp(created_iso, &format!("session {ses_id} created_at")) {
-        Ok(dt) => dt,
-        Err(e) => {
-            warn!("  Skipping session '{ses_id}': {e}");
-            batch.errors += 1;
-            return;
-        }
-    };
-    let updated_dt = match require_source_timestamp(updated_iso, &format!("session {ses_id} updated_at")) {
-        Ok(dt) => dt,
-        Err(e) => {
-            warn!("  Skipping session '{ses_id}': {e}");
-            batch.errors += 1;
-            return;
-        }
-    };
+    let created_dt =
+        match require_source_timestamp(created_iso, &format!("session {ses_id} created_at")) {
+            Ok(dt) => dt,
+            Err(e) => {
+                warn!("  Skipping session '{ses_id}': {e}");
+                batch.errors += 1;
+                return;
+            }
+        };
+    let updated_dt =
+        match require_source_timestamp(updated_iso, &format!("session {ses_id} updated_at")) {
+            Ok(dt) => dt,
+            Err(e) => {
+                warn!("  Skipping session '{ses_id}': {e}");
+                batch.errors += 1;
+                return;
+            }
+        };
     let duration_secs = (updated_dt - created_dt).num_seconds() as i32;
     let imported_at = Utc::now();
     let source_age_seconds = imported_at

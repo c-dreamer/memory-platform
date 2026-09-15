@@ -535,7 +535,8 @@ async fn tool_memory_context(state: &AppState, args: Value) -> Result<String> {
     // Record cross-references if session_id was provided
     if let Some(sid) = session_id {
         let mem_refs: Vec<(Uuid, f64)> = context.memories.iter().map(|m| (m.id, m.score)).collect();
-        let doc_refs: Vec<(Uuid, f64)> = context.documents.iter().map(|d| (d.id, d.score)).collect();
+        let doc_refs: Vec<(Uuid, f64)> =
+            context.documents.iter().map(|d| (d.id, d.score)).collect();
         record_batch_access(&state.db.pool, sid, "loaded", &mem_refs, &doc_refs).await;
     }
 
@@ -566,7 +567,8 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
     // Record cross-references if session_id was provided
     if let Some(sid) = session_id {
         let mem_refs: Vec<(Uuid, f64)> = context.memories.iter().map(|m| (m.id, m.score)).collect();
-        let doc_refs: Vec<(Uuid, f64)> = context.documents.iter().map(|d| (d.id, d.score)).collect();
+        let doc_refs: Vec<(Uuid, f64)> =
+            context.documents.iter().map(|d| (d.id, d.score)).collect();
         record_batch_access(&state.db.pool, sid, "loaded", &mem_refs, &doc_refs).await;
     }
 
@@ -1798,7 +1800,10 @@ mod tests {
             }),
         )
         .await;
-        assert!(result.is_err(), "Missing source_type should error before touching the DB");
+        assert!(
+            result.is_err(),
+            "Missing source_type should error before touching the DB"
+        );
     }
 
     #[tokio::test]
@@ -1815,14 +1820,20 @@ mod tests {
             }),
         )
         .await;
-        assert!(result.is_err(), "Malformed source_id should error before touching the DB");
+        assert!(
+            result.is_err(),
+            "Malformed source_id should error before touching the DB"
+        );
     }
 
     #[tokio::test]
     async fn memory_graph_rejects_missing_entity_id() {
         let state = test_state();
         let result = tool_memory_graph(&state, json!({"entity_type": "memory"})).await;
-        assert!(result.is_err(), "Missing entity_id should error before touching the DB");
+        assert!(
+            result.is_err(),
+            "Missing entity_id should error before touching the DB"
+        );
     }
 
     #[tokio::test]

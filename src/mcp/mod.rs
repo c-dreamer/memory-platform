@@ -321,8 +321,14 @@ impl McpServer {
                 // bail!() in resources.rs) from a server-caused one (a wrapped
                 // sqlx failure) so the client doesn't see a DB outage reported
                 // as "you sent an invalid request".
-                let is_db_error = e.chain().any(|cause| cause.downcast_ref::<sqlx::Error>().is_some());
-                let code = if is_db_error { ERROR_INTERNAL_ERROR } else { ERROR_INVALID_PARAMS };
+                let is_db_error = e
+                    .chain()
+                    .any(|cause| cause.downcast_ref::<sqlx::Error>().is_some());
+                let code = if is_db_error {
+                    ERROR_INTERNAL_ERROR
+                } else {
+                    ERROR_INVALID_PARAMS
+                };
                 Ok(json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -410,7 +416,11 @@ mod tests {
         let response = server.handle_request(request).await.unwrap();
         assert_eq!(response["id"], 1);
         let resources = response["result"]["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 3, "Should return exactly 3 static resources");
+        assert_eq!(
+            resources.len(),
+            3,
+            "Should return exactly 3 static resources"
+        );
     }
 
     #[tokio::test]
@@ -428,7 +438,11 @@ mod tests {
         let response = server.handle_request(request).await.unwrap();
         assert_eq!(response["id"], 1);
         let templates = response["result"]["resourceTemplates"].as_array().unwrap();
-        assert_eq!(templates.len(), 2, "Should return exactly 2 resource templates");
+        assert_eq!(
+            templates.len(),
+            2,
+            "Should return exactly 2 resource templates"
+        );
     }
 
     #[tokio::test]
@@ -577,6 +591,8 @@ mod tests {
         assert_eq!(response["result"]["serverInfo"]["name"], "memory-mcp");
         assert_eq!(response["result"]["serverInfo"]["version"], "2.0.0");
         assert!(response["result"]["capabilities"].get("tools").is_some());
-        assert!(response["result"]["capabilities"].get("resources").is_some());
+        assert!(response["result"]["capabilities"]
+            .get("resources")
+            .is_some());
     }
 }
