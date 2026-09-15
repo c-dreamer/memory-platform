@@ -1,5 +1,18 @@
 # Memory Platform Implementations and Improvements
 
+**Status (2026-09-15):** dated handoff from the 2026-08-10 review — most-checked
+blockers have since shipped (e.g. Release Blocker 1's embedding-dimension drift:
+`DEFAULT_EMBEDDING_DIM`, `config.rs`'s default, and `.env.example` are all `2048`
+today, not the `384` this doc describes finding). The "Final Architecture"
+diagram below treats loopback HTTP as the primary MCP transport and stdio as a
+compatibility adapter — that direction was later reversed:
+`docs/WINDOWS_PORT_SYNTHESIS.md` decision #20 keeps stdio as the transport and
+explicitly does not build out `transport-http` (still an empty scaffold in
+`src/mcp/transport.rs`), matching the README's current architecture diagram.
+Treat the rest of this document as a historical implementation record, not a
+current-state checklist — verify against the code before treating any item
+below as still open.
+
 ## Purpose
 
 This document is the implementation handoff for OpenCode. It follows the

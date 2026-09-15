@@ -4,7 +4,19 @@ Scope: bring the memory platform to Windows as the **work** deployment, kept str
 from the personal macOS and Linux deployments. Microtech client data is in scope, so security
 decisions are made at the stricter bar throughout.
 
-Status: planning and audit complete. No code changed yet.
+Status (2026-09-15): **superseded.** This was the initial planning/audit pass
+(2026-09-05, "no code changed yet"). `docs/WINDOWS_PORT_SYNTHESIS.md`
+(2026-09-08) turned its blockers and work order into 24 concrete decisions,
+and most of those have since shipped: CI's matrix now includes
+`windows-latest` with no `services:` block and is green
+(`.github/workflows/ci.yml`), `/health` returns 503 on a down database
+(`tests/integration.rs::health_endpoint_returns_503_when_db_unavailable`),
+the local SQLite pending-writes queue exists (`src/queue/`), a local
+`llama-cpp` embedding backend exists (`src/services/embedding.rs`), and
+`taskscheduler/*.xml.template` + `scripts/install-taskscheduler.ps1` cover
+scheduling. Treat the manual-tasks and blockers below as a historical record
+of what was true on 2026-09-05, not the current state — check the synthesis
+doc and the code itself before assuming anything here is still open.
 
 ---
 
