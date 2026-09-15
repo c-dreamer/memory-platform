@@ -212,11 +212,11 @@ impl SearchEngine {
 
     /// Apply Ebbinghaus-inspired memory decay to fused results.
     ///
-    /// Queries `last_accessed_at`/`created_at` and `access_count` for each
-    /// memory ID and scores via `DecayEngine::score_recency_frequency`
-    /// (recency + frequency; coherence isn't available post-RRF-fusion, so
-    /// it renormalizes over just those two weights rather than dropping
-    /// `semantic_weight`'s share silently).
+    /// Queries `last_accessed_at`/`created_at`, `access_count`, and
+    /// `importance` for each memory ID and scores via
+    /// `DecayEngine::score_recency_frequency` (recency + frequency +
+    /// importance; coherence isn't available post-RRF-fusion, so stored
+    /// `importance` fills that weight's slot instead of it being dropped).
     async fn apply_decay(&self, results: &mut Vec<SearchResult>) -> Result<(), sqlx::Error> {
         use sqlx::Row;
 
@@ -226,7 +226,7 @@ impl SearchEngine {
             let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("${i}")).collect();
             let sql = format!(
                 "SELECT id, (EXTRACT(EPOCH FROM (now() - COALESCE(last_accessed_at, created_at))) / 86400.0)::FLOAT8 AS days_since, \
-                        access_count \
+                        access_count, importance \
                  FROM memories WHERE id IN ({})",
                 placeholders.join(",")
             );
@@ -241,9 +241,12 @@ impl SearchEngine {
                 let id: Uuid = row.get("id");
                 let days_since: f64 = row.get("days_since");
                 let access_count: i32 = row.get("access_count");
-                let decay = self
-                    .decay_engine
-                    .score_recency_frequency(days_since, access_count as f64);
+                let importance: f64 = row.get("importance");
+                let decay = self.decay_engine.score_recency_frequency(
+                    days_since,
+                    access_count as f64,
+                    importance,
+                );
 
                 if let Some(r) = results.iter_mut().find(|r| r.id == id) {
                     r.score *= decay;

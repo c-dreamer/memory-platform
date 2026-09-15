@@ -111,21 +111,6 @@ impl SearchFilters {
     }
 }
 
-/// An RRF-fused search result with optional decay and rank metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchResultRrf {
-    pub id: Uuid,
-    pub content: String,
-    pub score: f64,
-    pub source_info: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub decay_factor: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vec_rank: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kw_rank: Option<i32>,
-}
-
 /// A pair of similar experiences found by cross-join vector comparison.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SimilarExperience {
@@ -1035,7 +1020,6 @@ impl PostgresDb {
     }
 
     /// Legacy hybrid search — simple union of vector + fulltext results.
-    /// Prefer `hybrid_search_rrf`.
     pub async fn hybrid_search(
         &self,
         table: &str,
@@ -1067,134 +1051,6 @@ impl PostgresDb {
 
         merged.truncate(limit as usize);
         Ok(merged)
-    }
-
-    /// Hybrid search with Reciprocal Rank Fusion (RRF) + optional memory decay.
-    ///
-    /// RRF formula: `score += 1.0 / (rrf_k + rank + 1) * weight`
-    ///
-    /// Memory decay: `final_score *= max(min_score, 2^(-days_since / half_life))`
-    pub async fn hybrid_search_rrf(
-        &self,
-        table: &str,
-        embedding: &[f32],
-        query: &str,
-        limit: i64,
-        threshold: f64,
-        rrf_k: i32,
-        vector_weight: f64,
-        keyword_weight: f64,
-        apply_decay: bool,
-        half_life_days: f64,
-    ) -> Result<Vec<SearchResultRrf>, sqlx::Error> {
-        let fetch_limit = limit * 2;
-        let vec_results = self
-            .vector_search(
-                table,
-                embedding,
-                &self.active_embedding_model,
-                fetch_limit,
-                threshold,
-                None,
-            )
-            .await?;
-        let ft_results = self.bm25_search(table, query, fetch_limit, None).await?;
-
-        // Rank fusion
-        let mut seen: HashMap<Uuid, RrfEntry> = HashMap::new();
-
-        for (rank, r) in vec_results.iter().enumerate() {
-            let rrf_score = 1.0 / (rrf_k as f64 + rank as f64 + 1.0) * vector_weight;
-            seen.insert(
-                r.id,
-                RrfEntry {
-                    id: r.id,
-                    content: r.content.clone().unwrap_or_default(),
-                    source_info: r.source_info.clone(),
-                    rrf_score,
-                    vec_rank: Some(rank as i32 + 1),
-                    kw_rank: None,
-                },
-            );
-        }
-
-        for (rank, r) in ft_results.iter().enumerate() {
-            let kw_score = 1.0 / (rrf_k as f64 + rank as f64 + 1.0) * keyword_weight;
-            seen.entry(r.id)
-                .and_modify(|e| {
-                    e.rrf_score += kw_score;
-                    e.kw_rank = Some(rank as i32 + 1);
-                })
-                .or_insert(RrfEntry {
-                    id: r.id,
-                    content: r.content.clone().unwrap_or_default(),
-                    source_info: r.source_info.clone(),
-                    rrf_score: kw_score,
-                    vec_rank: None,
-                    kw_rank: Some(rank as i32 + 1),
-                });
-        }
-
-        // Apply decay if enabled and table is "memories"
-        let mut decay_factors: HashMap<Uuid, f64> = HashMap::new();
-        if apply_decay && table == "memories" {
-            #[derive(sqlx::FromRow)]
-            struct DecayRow {
-                id: Uuid,
-                days_since: f64,
-            }
-
-            let ids: Vec<Uuid> = seen.keys().copied().collect();
-            // Query decay info for each memory ID
-            for chunk in ids.chunks(50) {
-                // Build a query with multiple IDs
-                let placeholders: Vec<String> =
-                    (1..=chunk.len()).map(|i| format!("${i}")).collect();
-                let sql = format!(
-                    "SELECT id, EXTRACT(EPOCH FROM (now() - COALESCE(last_accessed_at, created_at))) / 86400.0 AS days_since \
-                     FROM memories WHERE id IN ({})",
-                    placeholders.join(",")
-                );
-
-                let mut query_builder = sqlx::query_as::<_, DecayRow>(&sql);
-                for id in chunk {
-                    query_builder = query_builder.bind(*id);
-                }
-                let rows: Vec<DecayRow> = query_builder.fetch_all(&self.pool).await?;
-                for row in rows {
-                    let decay = f64::max(0.1, 2_f64.powf(-row.days_since / half_life_days));
-                    decay_factors.insert(row.id, decay);
-                }
-            }
-
-            for (id, entry) in &mut seen {
-                if let Some(decay) = decay_factors.get(id) {
-                    entry.rrf_score *= decay;
-                }
-            }
-        }
-
-        // Sort by final RRF score, take top `limit`
-        let mut entries: Vec<RrfEntry> = seen.into_values().collect();
-        entries.sort_by(|a, b| {
-            b.rrf_score
-                .partial_cmp(&a.rrf_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        entries.truncate(limit as usize);
-
-        Ok(entries
-            .into_iter()
-            .map(|e| SearchResultRrf {
-                id: e.id,
-                content: e.content,
-                score: (e.rrf_score * 10000.0).round() / 10000.0,
-                source_info: e.source_info,
-                decay_factor: decay_factors.get(&e.id).copied(),
-                vec_rank: e.vec_rank,
-                kw_rank: e.kw_rank,
-            })
-            .collect())
     }
 
     // ------------------------------------------------------------------
@@ -1295,7 +1151,30 @@ impl PostgresDb {
         Ok(candidates)
     }
 
-    /// Store a detected contradiction in the contradictions table.
+    /// Byte-cap a string without landing mid-character. `content_a`/`content_b`
+    /// are already char-capped by the caller, but a char cap doesn't bound
+    /// byte length (multi-byte UTF-8 can still exceed `max_bytes`), and a raw
+    /// byte slice at a non-boundary index panics.
+    fn truncate_at_byte_boundary(s: &str, max_bytes: usize) -> &str {
+        if s.len() <= max_bytes {
+            return s;
+        }
+        let mut end = max_bytes;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+
+    /// Store a detected contradiction, or return the existing row for the
+    /// same pair. `(memory_id_a, memory_id_b)` is normalized into canonical
+    /// (smaller, larger) order before insert so the same pair discovered
+    /// from either detection direction dedupes onto one row instead of
+    /// inserting a duplicate every time — matching `fetch_contradiction`'s
+    /// own normalize-then-query assumption. `ON CONFLICT ... DO UPDATE`
+    /// (rather than `DO NOTHING`) is what makes `RETURNING` fire for the
+    /// already-exists case too, so callers get the full row in one round
+    /// trip instead of a separate fetch after insert.
     pub async fn store_contradiction(
         &self,
         memory_id_a: Uuid,
@@ -1304,22 +1183,30 @@ impl PostgresDb {
         content_b: &str,
         similarity: f64,
         contradiction_type: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<Contradiction, sqlx::Error> {
+        let (id_a, id_b) = if memory_id_a < memory_id_b {
+            (memory_id_a, memory_id_b)
+        } else {
+            (memory_id_b, memory_id_a)
+        };
+        sqlx::query_as::<_, Contradiction>(
             "INSERT INTO contradictions (memory_id_a, memory_id_b, content_a, content_b, \
                                          similarity, contradiction_type) \
              VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT DO NOTHING",
+             ON CONFLICT (memory_id_a, memory_id_b) \
+             DO UPDATE SET memory_id_a = EXCLUDED.memory_id_a \
+             RETURNING id, memory_id_a, memory_id_b, content_a, content_b, \
+                       similarity, contradiction_type, detected_by, resolved, \
+                       resolution_note, created_at, updated_at",
         )
-        .bind(memory_id_a)
-        .bind(memory_id_b)
-        .bind(&content_a[..content_a.len().min(500)])
-        .bind(&content_b[..content_b.len().min(500)])
+        .bind(id_a)
+        .bind(id_b)
+        .bind(Self::truncate_at_byte_boundary(content_a, 500))
+        .bind(Self::truncate_at_byte_boundary(content_b, 500))
         .bind(similarity)
         .bind(contradiction_type)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        .fetch_one(&self.pool)
+        .await
     }
 
     // ------------------------------------------------------------------
@@ -1525,16 +1412,6 @@ impl PostgresDb {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// RRF fusion entry used during rank merging.
-struct RrfEntry {
-    id: Uuid,
-    content: String,
-    source_info: String,
-    rrf_score: f64,
-    vec_rank: Option<i32>,
-    kw_rank: Option<i32>,
-}
-
 /// Convert a `&[f32]` embedding to pgvector text format `'[x,y,z]'`.
 ///
 /// This is the format PostgreSQL's pgvector extension expects for INSERT
@@ -1717,42 +1594,6 @@ mod tests {
         let decoded: SearchResult = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.content, Some("Rust is memory-safe".into()));
         assert_eq!(decoded.score, 0.95);
-    }
-
-    #[test]
-    fn search_result_rrf_serde_roundtrip() {
-        let sr = SearchResultRrf {
-            id: Uuid::new_v4(),
-            content: "Test".into(),
-            score: 0.85,
-            source_info: "tags".into(),
-            decay_factor: Some(0.5),
-            vec_rank: Some(1),
-            kw_rank: Some(3),
-        };
-        let json = serde_json::to_string(&sr).unwrap();
-        let decoded: SearchResultRrf = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.score, 0.85);
-        assert_eq!(decoded.decay_factor, Some(0.5));
-        assert_eq!(decoded.vec_rank, Some(1));
-    }
-
-    #[test]
-    fn search_result_rrf_optional_fields_none() {
-        let sr = SearchResultRrf {
-            id: Uuid::new_v4(),
-            content: "Minimal".into(),
-            score: 0.5,
-            source_info: "".into(),
-            decay_factor: None,
-            vec_rank: None,
-            kw_rank: None,
-        };
-        let json = serde_json::to_string(&sr).unwrap();
-        // None fields should be absent from JSON
-        assert!(!json.contains("decay_factor"));
-        assert!(!json.contains("vec_rank"));
-        assert!(!json.contains("kw_rank"));
     }
 
     #[test]

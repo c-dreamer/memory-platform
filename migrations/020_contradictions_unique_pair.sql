@@ -1,0 +1,12 @@
+-- store_contradiction's `ON CONFLICT DO NOTHING` had no unique constraint to
+-- arbitrate against, so it was dead code: the same pair discovered from
+-- either detect() direction inserted a fresh duplicate row every time
+-- instead of deduplicating. store_contradiction now normalizes
+-- (memory_id_a, memory_id_b) into canonical (smaller, larger) order before
+-- insert — matching fetch_contradiction's own normalize-then-query
+-- assumption — so a plain unique constraint on the raw column pair is
+-- sufficient; no expression index needed.
+-- A unique index (not a named CONSTRAINT — ALTER TABLE ... ADD CONSTRAINT
+-- has no IF NOT EXISTS in Postgres) serves ON CONFLICT (memory_id_a,
+-- memory_id_b) just as well as a table constraint would.
+CREATE UNIQUE INDEX IF NOT EXISTS contradictions_pair_unique ON contradictions (memory_id_a, memory_id_b);

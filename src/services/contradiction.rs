@@ -91,7 +91,8 @@ impl ContradictionDetector {
 
         let mut contradictions = Vec::new();
         for c in candidates {
-            self.db
+            let stored = self
+                .db
                 .store_contradiction(
                     c.memory_id_a,
                     c.memory_id_b,
@@ -107,14 +108,7 @@ impl ContradictionDetector {
                         c.memory_id_a, c.memory_id_b
                     )
                 })?;
-
-            // Fetch the stored contradiction to return full row data.
-            let stored = self
-                .fetch_contradiction(c.memory_id_a, c.memory_id_b)
-                .await?;
-            if let Some(contra) = stored {
-                contradictions.push(contra);
-            }
+            contradictions.push(stored);
         }
 
         Ok(contradictions)
@@ -147,7 +141,8 @@ impl ContradictionDetector {
                     continue;
                 }
 
-                self.db
+                let stored = self
+                    .db
                     .store_contradiction(
                         c.memory_id_a,
                         c.memory_id_b,
@@ -163,13 +158,7 @@ impl ContradictionDetector {
                             c.memory_id_a, c.memory_id_b
                         )
                     })?;
-
-                if let Some(contra) = self
-                    .fetch_contradiction(c.memory_id_a, c.memory_id_b)
-                    .await?
-                {
-                    all_contradictions.push(contra);
-                }
+                all_contradictions.push(stored);
             }
         }
 
@@ -385,24 +374,6 @@ impl ContradictionDetector {
         .fetch_all(&self.db.pool)
         .await
         .context("Failed to fetch memories with embeddings")
-        .map_err(Into::into)
-    }
-
-    /// Fetch a stored contradiction by its two memory IDs.
-    async fn fetch_contradiction(&self, id_a: Uuid, id_b: Uuid) -> Result<Option<Contradiction>> {
-        let (a, b) = normalize_pair(id_a, id_b);
-        sqlx::query_as::<_, Contradiction>(
-            "SELECT id, memory_id_a, memory_id_b, content_a, content_b, \
-                    similarity, contradiction_type, detected_by, resolved, \
-                    resolution_note, created_at, updated_at \
-             FROM contradictions \
-             WHERE memory_id_a = $1 AND memory_id_b = $2",
-        )
-        .bind(a)
-        .bind(b)
-        .fetch_optional(&self.db.pool)
-        .await
-        .context("Failed to fetch contradiction")
         .map_err(Into::into)
     }
 

@@ -181,6 +181,11 @@ impl McpServer {
                     "jsonrpc": "2.0",
                 }))
             }
+            "ping" => Ok(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {},
+            })),
             "tools/list" => Ok(self.handle_tools_list(id)),
             "tools/call" => self.handle_tools_call(id, params).await,
             "resources/list" => Ok(self.handle_resources_list(id)),

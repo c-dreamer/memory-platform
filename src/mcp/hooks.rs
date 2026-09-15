@@ -82,30 +82,39 @@ pub async fn pre_compact(db: &PostgresDb, session_id: Uuid) -> Result<()> {
     }
 
     // Simple dedup: if two memories have >90% content similarity,
-    // keep the newer one and soft-delete the older one
-    let mut compacted = 0usize;
+    // keep the newer one and soft-delete the older one.
+    // Each memory's word set is computed once up front rather than
+    // rebuilt on every (i, j) comparison.
+    let word_sets: Vec<std::collections::HashSet<&str>> = memories
+        .iter()
+        .map(|m| m.content.split_whitespace().collect())
+        .collect();
+
+    let mut to_compact = Vec::new();
     for i in 0..memories.len() {
         for j in (i + 1)..memories.len() {
-            let similarity = jaccard_similarity(&memories[i].content, &memories[j].content);
-            if similarity > 0.9 {
-                // Soft-delete the older memory (j is older since we ordered DESC)
-                sqlx::query(
-                    "UPDATE memories SET importance = 0.0, \
-                     tags = array_append(tags, 'compacted'), \
-                     updated_at = now() \
-                     WHERE id = $1",
-                )
-                .bind(memories[j].id)
-                .execute(&db.pool)
-                .await
-                .context("Failed to compact memory")?;
-                compacted += 1;
+            if jaccard_from_sets(&word_sets[i], &word_sets[j]) > 0.9 {
+                // The older memory (j is older since we ordered DESC) gets compacted.
+                to_compact.push(memories[j].id);
             }
         }
     }
 
-    if compacted > 0 {
-        info!("Compacted {compacted} duplicate memories in session {session_id}");
+    if !to_compact.is_empty() {
+        sqlx::query(
+            "UPDATE memories SET importance = 0.0, \
+             tags = array_append(tags, 'compacted'), \
+             updated_at = now() \
+             WHERE id = ANY($1)",
+        )
+        .bind(&to_compact)
+        .execute(&db.pool)
+        .await
+        .context("Failed to compact memories")?;
+        info!(
+            "Compacted {} duplicate memories in session {session_id}",
+            to_compact.len()
+        );
     }
 
     Ok(())
@@ -212,16 +221,28 @@ pub fn format_context_banner(context: &ContextPackage) -> String {
 /// Compute Jaccard similarity between two strings based on word overlap.
 ///
 /// Returns a value in [0.0, 1.0] where 1.0 means identical word sets.
+/// Test-only: `pre_compact` calls `jaccard_from_sets` directly with
+/// pre-split word sets instead, to avoid re-splitting on every pair.
+#[cfg(test)]
 fn jaccard_similarity(a: &str, b: &str) -> f64 {
-    let words_a: std::collections::HashSet<&str> = a.split_whitespace().collect();
-    let words_b: std::collections::HashSet<&str> = b.split_whitespace().collect();
+    jaccard_from_sets(
+        &a.split_whitespace().collect(),
+        &b.split_whitespace().collect(),
+    )
+}
 
+/// Jaccard similarity over pre-split word sets, for callers comparing the
+/// same content against many others (avoids re-splitting on every pair).
+fn jaccard_from_sets(
+    words_a: &std::collections::HashSet<&str>,
+    words_b: &std::collections::HashSet<&str>,
+) -> f64 {
     if words_a.is_empty() && words_b.is_empty() {
         return 1.0;
     }
 
-    let intersection = words_a.intersection(&words_b).count();
-    let union = words_a.union(&words_b).count();
+    let intersection = words_a.intersection(words_b).count();
+    let union = words_a.union(words_b).count();
 
     if union == 0 {
         return 0.0;

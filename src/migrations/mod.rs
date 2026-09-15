@@ -112,6 +112,14 @@ impl Migrator {
                 "018_bitemporal_validity",
                 include_str!("../../migrations/018_bitemporal_validity.sql"),
             ),
+            (
+                "019_fix_partial_index_direction",
+                include_str!("../../migrations/019_fix_partial_index_direction.sql"),
+            ),
+            (
+                "020_contradictions_unique_pair",
+                include_str!("../../migrations/020_contradictions_unique_pair.sql"),
+            ),
         ];
 
         // Apply pending migrations in order

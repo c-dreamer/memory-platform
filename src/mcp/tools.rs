@@ -311,7 +311,7 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result
 /// 1. memory_search — hybrid search across all tables.
 async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
     let query = get_string(&args, "query")?;
-    let limit = get_i64(&args, "limit").unwrap_or(10);
+    let limit = get_i64(&args, "limit").unwrap_or(10).clamp(1, 500);
     let session_id = args
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -466,6 +466,76 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
         None => None,
     };
     let embedding_slice = embedding.as_deref();
+
+    // Near-duplicate consolidation: an incoming memory whose embedding is
+    // >=0.95 cosine-similar to an existing one is treated as the same fact
+    // restated, not a new memory. 0.95, not the 0.85 ContradictionDetector
+    // uses for "worth comparing" (src/services/contradiction.rs) — merging
+    // is destructive/identity-preserving, so a false-positive match at a
+    // looser threshold would silently discard a genuinely distinct memory.
+    // On a hit: reinforce the existing row (bump access_count via
+    // record_memory_access), union tags, raise importance to the max of
+    // old vs new, and return its id — no new row is inserted. Skipped
+    // without an embedding service: there's no signal to compare on, and
+    // this trades recall (a real near-duplicate slips through as separate
+    // rows) for never mis-merging two unrelated memories.
+    if let Some(emb) = embedding_slice {
+        let similar = state
+            .db
+            .vector_search(
+                "memories",
+                emb,
+                &state.db.active_embedding_model,
+                1,
+                0.95,
+                None,
+            )
+            .await
+            .context("Failed near-duplicate search")?;
+        if let Some(dup) = similar.into_iter().next() {
+            if let Some(existing) = state.db.get_memory(dup.id).await? {
+                state.db.record_memory_access(existing.id).await?;
+                let mut merged_tags = existing.tags.clone();
+                for t in &tags {
+                    if !merged_tags.contains(t) {
+                        merged_tags.push(t.clone());
+                    }
+                }
+                let merged_importance = existing.importance.max(importance);
+                sqlx::query("UPDATE memories SET importance = $1, tags = $2 WHERE id = $3")
+                    .bind(merged_importance)
+                    .bind(&merged_tags)
+                    .bind(existing.id)
+                    .execute(&state.db.pool)
+                    .await
+                    .context("Failed to merge near-duplicate memory")?;
+
+                if let Some(sid) = session_id {
+                    let _ = sqlx::query("SELECT record_memory_access($1, $2, 'accessed', $3)")
+                        .bind(sid)
+                        .bind(existing.id)
+                        .bind(merged_importance)
+                        .execute(&state.db.pool)
+                        .await;
+                }
+
+                info!(
+                    "memory_store: deduplicated into existing memory {} (similarity {:.3})",
+                    existing.id, dup.score
+                );
+
+                let result = json!({
+                    "id": existing.id,
+                    "content_type": existing.content_type,
+                    "importance": merged_importance,
+                    "tags": merged_tags,
+                    "created_at": existing.created_at,
+                    "deduplicated": true,
+                });
+                return Ok(serde_json::to_string(&result)?);
+            }
+        }
+    }
 
     let memory = match state
         .db
@@ -939,8 +1009,8 @@ async fn tool_forget(state: &AppState, args: Value) -> Result<String> {
 /// 11. list — paginated listing from a table.
 async fn tool_list(state: &AppState, args: Value) -> Result<String> {
     let table = get_string(&args, "table").unwrap_or_else(|_| "memories".to_string());
-    let limit = get_i64(&args, "limit").unwrap_or(50);
-    let offset = get_i64(&args, "offset").unwrap_or(0);
+    let limit = get_i64(&args, "limit").unwrap_or(50).clamp(1, 500);
+    let offset = get_i64(&args, "offset").unwrap_or(0).max(0);
 
     info!("list: table={table}, limit={limit}, offset={offset}");
 

@@ -80,6 +80,9 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<Value> {
         let limit: i64 = n
             .parse()
             .with_context(|| format!("invalid recent count in resource URI {uri:?}"))?;
+        if limit < 0 {
+            anyhow::bail!("negative recent count in resource URI {uri:?}");
+        }
         return recent(state, limit).await;
     }
     if let Some(tag) = uri.strip_prefix("memory://tag/") {
