@@ -1166,6 +1166,24 @@ impl PostgresDb {
         &s[..end]
     }
 
+    /// Order a contradiction pair by id, carrying each memory's content with
+    /// its own id. Binding the original content order against swapped ids
+    /// would file memory B's text as `content_a` under memory A's id,
+    /// misattributing which text belongs to which memory on roughly half of
+    /// all pairs (uuid ordering is effectively random).
+    fn canonical_pair<'t>(
+        memory_id_a: Uuid,
+        memory_id_b: Uuid,
+        content_a: &'t str,
+        content_b: &'t str,
+    ) -> (Uuid, Uuid, &'t str, &'t str) {
+        if memory_id_a < memory_id_b {
+            (memory_id_a, memory_id_b, content_a, content_b)
+        } else {
+            (memory_id_b, memory_id_a, content_b, content_a)
+        }
+    }
+
     /// Store a detected contradiction, or return the existing row for the
     /// same pair. `(memory_id_a, memory_id_b)` is normalized into canonical
     /// (smaller, larger) order before insert so the same pair discovered
@@ -1184,11 +1202,8 @@ impl PostgresDb {
         similarity: f64,
         contradiction_type: &str,
     ) -> Result<Contradiction, sqlx::Error> {
-        let (id_a, id_b) = if memory_id_a < memory_id_b {
-            (memory_id_a, memory_id_b)
-        } else {
-            (memory_id_b, memory_id_a)
-        };
+        let (id_a, id_b, text_a, text_b) =
+            Self::canonical_pair(memory_id_a, memory_id_b, content_a, content_b);
         sqlx::query_as::<_, Contradiction>(
             "INSERT INTO contradictions (memory_id_a, memory_id_b, content_a, content_b, \
                                          similarity, contradiction_type) \
@@ -1201,8 +1216,8 @@ impl PostgresDb {
         )
         .bind(id_a)
         .bind(id_b)
-        .bind(Self::truncate_at_byte_boundary(content_a, 500))
-        .bind(Self::truncate_at_byte_boundary(content_b, 500))
+        .bind(Self::truncate_at_byte_boundary(text_a, 500))
+        .bind(Self::truncate_at_byte_boundary(text_b, 500))
         .bind(similarity)
         .bind(contradiction_type)
         .fetch_one(&self.pool)
@@ -1594,6 +1609,20 @@ mod tests {
         let decoded: SearchResult = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.content, Some("Rust is memory-safe".into()));
         assert_eq!(decoded.score, 0.95);
+    }
+
+    #[test]
+    fn canonical_pair_keeps_content_with_its_own_id() {
+        let low = Uuid::from_u128(1);
+        let high = Uuid::from_u128(2);
+
+        // Already canonical — nothing moves.
+        let (a, b, ta, tb) = PostgresDb::canonical_pair(low, high, "low text", "high text");
+        assert_eq!((a, b, ta, tb), (low, high, "low text", "high text"));
+
+        // Reversed — ids swap, and each text must follow its own id.
+        let (a, b, ta, tb) = PostgresDb::canonical_pair(high, low, "high text", "low text");
+        assert_eq!((a, b, ta, tb), (low, high, "low text", "high text"));
     }
 
     #[test]
