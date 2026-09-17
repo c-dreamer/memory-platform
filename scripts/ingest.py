@@ -24,6 +24,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 
 def expand_path(p: str) -> str:
@@ -31,11 +32,30 @@ def expand_path(p: str) -> str:
     return str(Path(p).expanduser())
 
 
+def _conn_env(db_url: str) -> tuple[str, dict]:
+    """Strip the password out of a postgres URL and carry it via PGPASSWORD
+    instead, so it never appears in this process's argv (visible to any other
+    local user via `ps`/`/proc/<pid>/cmdline` for the life of the subprocess).
+    """
+    parts = urlsplit(db_url)
+    if not parts.password:
+        return db_url, os.environ.copy()
+    env = os.environ.copy()
+    env["PGPASSWORD"] = parts.password
+    netloc = parts.hostname or ""
+    if parts.port:
+        netloc += f":{parts.port}"
+    if parts.username:
+        netloc = f"{parts.username}@{netloc}"
+    return urlunsplit(parts._replace(netloc=netloc)), env
+
+
 def run_psql(db_url: str, sql: str) -> list[dict]:
     """Execute SQL via psql and return results as list of dicts."""
+    url, env = _conn_env(db_url)
     result = subprocess.run(
-        ["psql", db_url, "-t", "-A", "-F", "|", "-c", sql],
-        capture_output=True, text=True, timeout=30,
+        ["psql", url, "-t", "-A", "-F", "|", "-c", sql],
+        capture_output=True, text=True, timeout=30, env=env,
     )
     if result.returncode != 0:
         print(f"  ⚠ psql error: {result.stderr.strip()}", file=sys.stderr)
@@ -69,9 +89,10 @@ def insert_session(db_url: str, goal: str, status: str, started_at: str, ended_a
     VALUES ({_esc(goal)}, '{status}', '{started_at_esc}', {ended_at_sql})
     RETURNING id;
     """
+    url, env = _conn_env(db_url)
     result = subprocess.run(
-        ["psql", db_url, "-t", "-A", "-c", sql],
-        capture_output=True, text=True, timeout=10,
+        ["psql", url, "-t", "-A", "-c", sql],
+        capture_output=True, text=True, timeout=10, env=env,
     )
     if result.returncode != 0:
         print(f"  ⚠ insert_session error: {result.stderr.strip()}", file=sys.stderr)
@@ -95,9 +116,10 @@ def insert_experience(db_url: str, session_id: str | None, goal: str, result: st
     VALUES ({sid}, {goal_esc}, {result_esc}, {tags_sql}, {dur}, {related_esc})
     RETURNING id;
     """
+    url, env = _conn_env(db_url)
     result = subprocess.run(
-        ["psql", db_url, "-t", "-A", "-c", sql],
-        capture_output=True, text=True, timeout=10,
+        ["psql", url, "-t", "-A", "-c", sql],
+        capture_output=True, text=True, timeout=10, env=env,
     )
     if result.returncode != 0:
         print(f"  ⚠ insert_experience error: {result.stderr.strip()[:200]}", file=sys.stderr)
@@ -118,9 +140,10 @@ def insert_memory(db_url: str, session_id: str | None, content: str, content_typ
     VALUES ({sid}, {content_esc}, '{content_type}', {importance}, {tags_sql}, '{meta_json}')
     RETURNING id;
     """
+    url, env = _conn_env(db_url)
     result = subprocess.run(
-        ["psql", db_url, "-t", "-A", "-c", sql],
-        capture_output=True, text=True, timeout=10,
+        ["psql", url, "-t", "-A", "-c", sql],
+        capture_output=True, text=True, timeout=10, env=env,
     )
     if result.returncode != 0:
         print(f"  ⚠ insert_memory error: {result.stderr.strip()[:200]}", file=sys.stderr)
@@ -145,7 +168,8 @@ def insert_document(db_url: str, path: str, section: str | None, title: str | No
             checksum = COALESCE({checksum_val}, checksum), updated_at = now()
         WHERE id = '{doc_id}';
         """
-        subprocess.run(["psql", db_url, "-c", sql], capture_output=True, timeout=30)
+        url, env = _conn_env(db_url)
+        subprocess.run(["psql", url, "-c", sql], capture_output=True, timeout=30, env=env)
         return doc_id
     
     section_val = _esc(section) if section else "NULL"
@@ -163,24 +187,25 @@ def insert_document(db_url: str, path: str, section: str | None, title: str | No
     RETURNING id;
     """
 
+    url, env = _conn_env(db_url)
     if len(sql) > 100000:
         import tempfile
         with tempfile.NamedTemporaryFile(mode='w', suffix='.sql', delete=False, dir='/tmp') as f:
             f.write(sql)
             tmp_path = f.name
         result = subprocess.run(
-            ["psql", db_url, "-t", "-A", "-f", tmp_path],
-            capture_output=True, text=True, timeout=60,
+            ["psql", url, "-t", "-A", "-f", tmp_path],
+            capture_output=True, text=True, timeout=60, env=env,
         )
         os.unlink(tmp_path)
         if result.returncode != 0:
             print(f"  ⚠ insert_document error: {result.stderr.strip()[:200]}", file=sys.stderr)
             return None
         return result.stdout.strip()
-    
+
     result = subprocess.run(
-        ["psql", db_url, "-t", "-A", "-c", sql],
-        capture_output=True, text=True, timeout=30,
+        ["psql", url, "-t", "-A", "-c", sql],
+        capture_output=True, text=True, timeout=30, env=env,
     )
     if result.returncode != 0:
         print(f"  ⚠ insert_document error: {result.stderr.strip()[:200]}", file=sys.stderr)
@@ -200,9 +225,10 @@ def ensure_agent(db_url: str, name: str) -> str:
     VALUES ('{name}', '["ingested"]', '{meta}')
     RETURNING id;
     """
+    url, env = _conn_env(db_url)
     result = subprocess.run(
-        ["psql", db_url, "-t", "-A", "-c", sql],
-        capture_output=True, text=True, timeout=10,
+        ["psql", url, "-t", "-A", "-c", sql],
+        capture_output=True, text=True, timeout=10, env=env,
     )
     if result.returncode != 0:
         return None
@@ -253,7 +279,7 @@ def ingest_sessions(db_url: str, source: str, report: dict):
     
     start = time.time()
     proc = subprocess.Popen(
-        ["python3", str(extract_script), source_path],
+        [sys.executable, str(extract_script), source_path],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     

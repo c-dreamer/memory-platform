@@ -74,19 +74,42 @@ pub struct SearchResult {
     pub score: f64,
 }
 
-/// An RRF-fused search result with optional decay and rank metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchResultRrf {
-    pub id: Uuid,
-    pub content: String,
-    pub score: f64,
-    pub source_info: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub decay_factor: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vec_rank: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kw_rank: Option<i32>,
+/// Optional filters for `vector_search`/`bm25_search`: tag membership and a
+/// `created_at` range. Tag filtering only takes effect on tables that
+/// actually have a `tags` column (`memories`, `experiences`) — it's silently
+/// ignored on the others, since `memory_search` fans the same filters out
+/// across all 4 searchable tables at once.
+#[derive(Debug, Clone, Default)]
+pub struct SearchFilters {
+    pub tags: Option<Vec<String>>,
+    /// `true` = match ANY of `tags` (`&&`), `false` = match ALL of `tags` (`@>`).
+    pub tags_match_any: bool,
+    pub start_date: Option<DateTime<Utc>>,
+    pub end_date: Option<DateTime<Utc>>,
+}
+
+impl SearchFilters {
+    /// Build the " AND ..." WHERE-clause fragment for whichever filters are
+    /// set, numbering placeholders starting at `start_param`. Returns the SQL
+    /// fragment and the next unused placeholder number.
+    fn clause(&self, extra_col: &str, column_prefix: &str, start_param: usize) -> (String, usize) {
+        let mut sql = String::new();
+        let mut next = start_param;
+        if self.tags.is_some() && extra_col == "tags" {
+            let op = if self.tags_match_any { "&&" } else { "@>" };
+            sql.push_str(&format!(" AND {column_prefix}tags {op} ${next}::text[]"));
+            next += 1;
+        }
+        if self.start_date.is_some() {
+            sql.push_str(&format!(" AND {column_prefix}created_at >= ${next}"));
+            next += 1;
+        }
+        if self.end_date.is_some() {
+            sql.push_str(&format!(" AND {column_prefix}created_at <= ${next}"));
+            next += 1;
+        }
+        (sql, next)
+    }
 }
 
 /// A pair of similar experiences found by cross-join vector comparison.
@@ -133,12 +156,32 @@ pub struct ContextPackage {
 #[derive(Debug)]
 pub struct PostgresDb {
     pub pool: PgPool,
+    /// The `public.embeddings.model` identifier this process stores new
+    /// derived-cache rows under — one embedding backend is active per
+    /// running process, so this is fixed for the life of the `PostgresDb`.
+    pub active_embedding_model: String,
+    /// The backend selector (`EMBEDDING_MODEL`'s raw value: "nvidia",
+    /// "llama-cpp", ...) rather than the specific model identifier above —
+    /// used to decide whether embeddings also belong in a fixed source-table
+    /// column, independent of which exact NVIDIA model name is configured.
+    active_embedding_backend: String,
 }
 
 impl PostgresDb {
     // ------------------------------------------------------------------
     // Connection & health
     // ------------------------------------------------------------------
+
+    /// Wrap an existing pool, tagging it with the environment's configured
+    /// embedding model (see `config::active_embedding_model_identifier`) for
+    /// callers that only have a bare pool, not a full `Config`.
+    pub fn with_pool(pool: PgPool) -> Self {
+        Self {
+            pool,
+            active_embedding_model: crate::config::active_embedding_model_identifier(),
+            active_embedding_backend: crate::config::active_embedding_backend(),
+        }
+    }
 
     /// Create an empty PostgresDb for testing (no real connection).
     ///
@@ -150,6 +193,8 @@ impl PostgresDb {
             pool: PgPoolOptions::new()
                 .connect_lazy("postgresql://localhost:5432/nonexistent")
                 .expect("connect_lazy should succeed without network"),
+            active_embedding_model: "unknown".to_string(),
+            active_embedding_backend: "unknown".to_string(),
         }
     }
 
@@ -178,7 +223,25 @@ impl PostgresDb {
             .acquire_slow_threshold(Duration::from_secs(1))
             .connect(&config.database_url)
             .await?;
-        Ok(Self { pool })
+        let active_embedding_model = match config.embedding_model.as_str() {
+            "nvidia" => config.nvidia_embedding_model.clone(),
+            "llama-cpp" => config.llama_cpp_model_name.clone(),
+            _ => "unknown".to_string(),
+        };
+        Ok(Self {
+            pool,
+            active_embedding_model,
+            active_embedding_backend: config.embedding_model.clone(),
+        })
+    }
+
+    /// Whether the currently active embedding backend's vectors belong in a
+    /// fixed `VECTOR(2048)` source-table column. Only the cloud (NVIDIA)
+    /// backend does; any other model is recorded in the `embeddings` cache
+    /// only, since source columns carry no model discriminator (decision #5,
+    /// docs/WINDOWS_PORT_SYNTHESIS.md).
+    pub(crate) fn embedding_belongs_in_source_column(&self) -> bool {
+        self.active_embedding_backend == "nvidia"
     }
 
     /// Check database connectivity with `SELECT 1`.
@@ -321,12 +384,21 @@ impl PostgresDb {
         id: Uuid,
         embedding: &[f32],
     ) -> Result<(), sqlx::Error> {
-        let emb_text = vec_to_pgvector(embedding);
-        sqlx::query("UPDATE sessions SET embedding = $1::vector, updated_at = now() WHERE id = $2")
+        // Same gate as store_memory/upsert_document/store_experience: the fixed
+        // sessions.embedding column carries no model discriminator, so only the
+        // NVIDIA cloud-default backend's vectors belong there. Every other model
+        // is recorded in the multi-model `embeddings` cache below instead.
+        if self.embedding_belongs_in_source_column() {
+            let emb_text = vec_to_pgvector(embedding);
+            sqlx::query(
+                "UPDATE sessions SET embedding = $1::vector, updated_at = now() WHERE id = $2",
+            )
             .bind(emb_text)
             .bind(id)
             .execute(&self.pool)
             .await?;
+        }
+        self.store_embedding("sessions", id, embedding).await?;
         Ok(())
     }
 
@@ -347,6 +419,7 @@ impl PostgresDb {
     // ------------------------------------------------------------------
 
     /// Store a new memory with optional embedding.
+    #[allow(clippy::too_many_arguments)]
     pub async fn store_memory(
         &self,
         content: &str,
@@ -357,13 +430,24 @@ impl PostgresDb {
         agent_id: Option<Uuid>,
         session_id: Option<Uuid>,
         embedding: Option<&[f32]>,
+        expiration_date: Option<chrono::NaiveDate>,
+        // When the fact became true in the world — may predate `created_at`
+        // for backfilled data. `None` defers to `created_at` (see
+        // `ContradictionDetector::auto_resolve`). Not part of the `Memory`
+        // model: only contradiction auto-resolution reads it, so it isn't
+        // threaded through every SELECT that builds a `Memory`.
+        valid_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<Memory, sqlx::Error> {
-        let emb_text = embedding.map(vec_to_pgvector);
+        let emb_text = if self.embedding_belongs_in_source_column() {
+            embedding.map(vec_to_pgvector)
+        } else {
+            None
+        };
 
         let row = sqlx::query_as::<_, Memory>(
-            "INSERT INTO memories (agent_id, session_id, content, content_type, embedding, importance, tags, metadata) \
-             VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8) \
-             RETURNING id, agent_id, session_id, content, content_type, embedding::TEXT as embedding, importance, tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at",
+            "INSERT INTO memories (agent_id, session_id, content, content_type, embedding, importance, tags, metadata, expiration_date, valid_at) \
+             VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9, $10) \
+             RETURNING id, agent_id, session_id, content, content_type, embedding::TEXT as embedding, importance, tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at, expiration_date",
         )
         .bind(agent_id)
         .bind(session_id)
@@ -373,6 +457,8 @@ impl PostgresDb {
         .bind(importance)
         .bind(tags)
         .bind(metadata)
+        .bind(expiration_date)
+        .bind(valid_at)
         .fetch_one(&self.pool)
         .await?;
 
@@ -386,7 +472,7 @@ impl PostgresDb {
     /// Get a memory by UUID (excludes fts column since it's #[sqlx(skip)]).
     pub async fn get_memory(&self, id: Uuid) -> Result<Option<Memory>, sqlx::Error> {
         sqlx::query_as::<_, Memory>(
-            "SELECT id, agent_id, session_id, content, content_type, embedding::TEXT as embedding, importance, tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at FROM memories WHERE id = $1",
+            "SELECT id, agent_id, session_id, content, content_type, embedding::TEXT as embedding, importance, tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at, expiration_date FROM memories WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -424,7 +510,11 @@ impl PostgresDb {
         file_modified_at: Option<DateTime<Utc>>,
         embedding: Option<&[f32]>,
     ) -> Result<Uuid, sqlx::Error> {
-        let emb_text = embedding.map(vec_to_pgvector);
+        let emb_text = if self.embedding_belongs_in_source_column() {
+            embedding.map(vec_to_pgvector)
+        } else {
+            None
+        };
 
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
@@ -541,7 +631,11 @@ impl PostgresDb {
         data: &CreateTradingResult,
         embedding: Option<&[f32]>,
     ) -> Result<TradingResult, sqlx::Error> {
-        let emb_text = embedding.map(vec_to_pgvector);
+        let emb_text = if self.embedding_belongs_in_source_column() {
+            embedding.map(vec_to_pgvector)
+        } else {
+            None
+        };
 
         let row = sqlx::query_as::<_, TradingResult>(
             "INSERT INTO trading_results (agent_id, ea_version, strategy, symbol, timeframe, \
@@ -592,7 +686,11 @@ impl PostgresDb {
         data: &CreateExperience,
         embedding: Option<&[f32]>,
     ) -> Result<Experience, sqlx::Error> {
-        let emb_text = embedding.map(vec_to_pgvector);
+        let emb_text = if self.embedding_belongs_in_source_column() {
+            embedding.map(vec_to_pgvector)
+        } else {
+            None
+        };
 
         let row = sqlx::query_as::<_, Experience>(
             "INSERT INTO experiences (agent_id, session_id, goal, reasoning_summary, actions, \
@@ -628,6 +726,12 @@ impl PostgresDb {
     }
 
     /// Find pairs of similar successful experiences via cross-join vector comparison.
+    ///
+    /// Known gap: self-joins `experiences.embedding` directly (the fixed
+    /// source column), not the `embeddings` cache — so an experience stored
+    /// under a non-cloud-default model (`embedding_belongs_in_source_column`
+    /// is false for it) has a NULL source column and never participates
+    /// here, until/unless this query is migrated to read the cache instead.
     pub async fn find_similar_experiences(
         &self,
         threshold: f64,
@@ -736,12 +840,19 @@ impl PostgresDb {
     }
 
     /// Vector similarity search using pgvector `<=>` (cosine distance).
+    ///
+    /// `model` restricts the comparison to embeddings produced by one model —
+    /// required now that `embeddings.embedding` holds mixed dimensions
+    /// (migration 015): comparing vectors of different widths via `<=>`
+    /// errors, so cross-model rows must never reach the same query.
     pub async fn vector_search(
         &self,
         table: &str,
         embedding: &[f32],
+        model: &str,
         limit: i64,
         threshold: f64,
+        filters: Option<&SearchFilters>,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
         let (text_col, extra_col) = Self::table_schema(table);
         let emb_text = vec_to_pgvector(embedding);
@@ -751,25 +862,60 @@ impl PostgresDb {
         } else {
             format!("s.{extra_col}")
         };
+        // Only `memories` carries superseded_by (migration 016) — a contradiction
+        // resolution that picked a winner. Excluding the loser here is what
+        // makes that resolution actually change recall, not just sit as inert
+        // metadata; it stays fetchable directly (recall/list) for point-in-time review.
+        let superseded_filter = if table == "memories" {
+            " AND s.superseded_by IS NULL"
+        } else {
+            ""
+        };
+        // Only `memories` carries expiration_date (migration 017) — a soft,
+        // date-bounded hide that excludes a memory from search once past
+        // without touching decay or deleting the row; direct fetch (get_memory)
+        // stays unaffected so it's still reviewable in place.
+        let expiration_filter = if table == "memories" {
+            " AND (s.expiration_date IS NULL OR s.expiration_date >= CURRENT_DATE)"
+        } else {
+            ""
+        };
+        let (filter_clause, limit_param) = filters
+            .map(|f| f.clause(extra_col, "s.", 5))
+            .unwrap_or((String::new(), 5));
         let sql = format!(
             "SELECT s.id, COALESCE(s.{text_col}, '') AS content, COALESCE({extra_col_sql}, '') AS source_info, \
                     (1 - (e.embedding <=> $1::vector))::float8 AS score \
              FROM embeddings e \
              INNER JOIN {table} s ON s.id = e.source_id \
              WHERE e.source_table = $2 \
+               AND e.model = $3 \
                AND e.embedding IS NOT NULL \
-               AND (1 - (e.embedding <=> $1::vector))::float8 > $3 \
+               AND (1 - (e.embedding <=> $1::vector))::float8 > $4 \
+               {superseded_filter}{expiration_filter}{filter_clause} \
              ORDER BY score DESC \
-             LIMIT $4"
+             LIMIT ${limit_param}"
         );
 
-        sqlx::query_as::<_, SearchResult>(&sql)
+        let mut q = sqlx::query_as::<_, SearchResult>(&sql)
             .bind(&emb_text)
             .bind(table)
-            .bind(threshold)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
+            .bind(model)
+            .bind(threshold);
+        if let Some(f) = filters {
+            if let Some(tags) = &f.tags {
+                if extra_col == "tags" {
+                    q = q.bind(tags);
+                }
+            }
+            if let Some(d) = f.start_date {
+                q = q.bind(d);
+            }
+            if let Some(d) = f.end_date {
+                q = q.bind(d);
+            }
+        }
+        q.bind(limit).fetch_all(&self.pool).await
     }
 
     /// BM25-inspired full-text search using tsvector/tsquery with ts_rank.
@@ -780,6 +926,7 @@ impl PostgresDb {
         table: &str,
         query: &str,
         limit: i64,
+        filters: Option<&SearchFilters>,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
         let (text_col, extra_col) = Self::table_schema(table);
         // Cast TEXT[] arrays to TEXT for source_info
@@ -789,17 +936,30 @@ impl PostgresDb {
             extra_col.to_string()
         };
 
-        // Check if table has fts column first
-        let has_fts = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = $1 AND column_name = 'fts'
-            )",
-        )
-        .bind(table)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
+        // Which tables carry an `fts` column is fixed at migration time (see
+        // migrations/001_initial.sql, 002_hybrid_decay_contradiction.sql) —
+        // every TABLE_SCHEMAS table except trading_results. No need to ask
+        // Postgres at query time what's already known statically.
+        let has_fts = table != "trading_results";
+
+        // Same reasoning as vector_search's superseded_filter: only `memories`
+        // has the column, and excluding a superseded loser here keeps keyword
+        // search consistent with vector search after a contradiction is resolved.
+        let superseded_filter = if table == "memories" {
+            " AND superseded_by IS NULL"
+        } else {
+            ""
+        };
+        // Same reasoning as vector_search's expiration_filter: only `memories`
+        // has the column.
+        let expiration_filter = if table == "memories" {
+            " AND (expiration_date IS NULL OR expiration_date >= CURRENT_DATE)"
+        } else {
+            ""
+        };
+        let (filter_clause, limit_param) = filters
+            .map(|f| f.clause(extra_col, "", 2))
+            .unwrap_or((String::new(), 2));
 
         if has_fts {
             // Try tsvector first
@@ -808,15 +968,14 @@ impl PostgresDb {
                         ts_rank(fts, plainto_tsquery('english', $1), 32)::float8 AS score \
                  FROM {table} \
                  WHERE fts @@ plainto_tsquery('english', $1) \
+                 {superseded_filter}{expiration_filter}{filter_clause} \
                  ORDER BY score DESC \
-                 LIMIT $2"
+                 LIMIT ${limit_param}"
             );
 
-            let result = sqlx::query_as::<_, SearchResult>(&ts_sql)
-                .bind(query)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await;
+            let mut q = sqlx::query_as::<_, SearchResult>(&ts_sql).bind(query);
+            q = Self::bind_search_filters(q, filters, extra_col);
+            let result = q.bind(limit).fetch_all(&self.pool).await;
 
             match result {
                 Ok(rows) if !rows.is_empty() => return Ok(rows),
@@ -831,14 +990,37 @@ impl PostgresDb {
                     similarity({text_col}, $1)::float8 AS score \
              FROM {table} \
              WHERE {text_col} % $1 \
+             {superseded_filter}{expiration_filter}{filter_clause} \
              ORDER BY score DESC \
-             LIMIT $2"
+             LIMIT ${limit_param}"
         );
-        sqlx::query_as::<_, SearchResult>(&pg_sql)
-            .bind(query)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
+        let mut q = sqlx::query_as::<_, SearchResult>(&pg_sql).bind(query);
+        q = Self::bind_search_filters(q, filters, extra_col);
+        q.bind(limit).fetch_all(&self.pool).await
+    }
+
+    /// Bind the optional tag/date filter values, in the same order
+    /// `SearchFilters::clause` numbered their placeholders.
+    fn bind_search_filters<'q>(
+        mut q: sqlx::query::QueryAs<'q, sqlx::Postgres, SearchResult, sqlx::postgres::PgArguments>,
+        filters: Option<&'q SearchFilters>,
+        extra_col: &str,
+    ) -> sqlx::query::QueryAs<'q, sqlx::Postgres, SearchResult, sqlx::postgres::PgArguments> {
+        let Some(f) = filters else {
+            return q;
+        };
+        if let Some(tags) = &f.tags {
+            if extra_col == "tags" {
+                q = q.bind(tags);
+            }
+        }
+        if let Some(d) = f.start_date {
+            q = q.bind(d);
+        }
+        if let Some(d) = f.end_date {
+            q = q.bind(d);
+        }
+        q
     }
 
     /// Legacy trigram-based full-text search. Prefer `bm25_search`.
@@ -849,11 +1031,10 @@ impl PostgresDb {
         limit: i64,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
         // Delegate to bm25_search which already has the fallback logic
-        self.bm25_search(table, query, limit).await
+        self.bm25_search(table, query, limit, None).await
     }
 
     /// Legacy hybrid search — simple union of vector + fulltext results.
-    /// Prefer `hybrid_search_rrf`.
     pub async fn hybrid_search(
         &self,
         table: &str,
@@ -863,7 +1044,14 @@ impl PostgresDb {
         threshold: f64,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
         let vec_results = self
-            .vector_search(table, embedding, limit, threshold)
+            .vector_search(
+                table,
+                embedding,
+                &self.active_embedding_model,
+                limit,
+                threshold,
+                None,
+            )
             .await?;
         let ft_results = self.fulltext_search(table, query, limit).await?;
 
@@ -880,127 +1068,6 @@ impl PostgresDb {
         Ok(merged)
     }
 
-    /// Hybrid search with Reciprocal Rank Fusion (RRF) + optional memory decay.
-    ///
-    /// RRF formula: `score += 1.0 / (rrf_k + rank + 1) * weight`
-    ///
-    /// Memory decay: `final_score *= max(min_score, 2^(-days_since / half_life))`
-    pub async fn hybrid_search_rrf(
-        &self,
-        table: &str,
-        embedding: &[f32],
-        query: &str,
-        limit: i64,
-        threshold: f64,
-        rrf_k: i32,
-        vector_weight: f64,
-        keyword_weight: f64,
-        apply_decay: bool,
-        half_life_days: f64,
-    ) -> Result<Vec<SearchResultRrf>, sqlx::Error> {
-        let fetch_limit = limit * 2;
-        let vec_results = self
-            .vector_search(table, embedding, fetch_limit, threshold)
-            .await?;
-        let ft_results = self.bm25_search(table, query, fetch_limit).await?;
-
-        // Rank fusion
-        let mut seen: HashMap<Uuid, RrfEntry> = HashMap::new();
-
-        for (rank, r) in vec_results.iter().enumerate() {
-            let rrf_score = 1.0 / (rrf_k as f64 + rank as f64 + 1.0) * vector_weight;
-            seen.insert(
-                r.id,
-                RrfEntry {
-                    id: r.id,
-                    content: r.content.clone().unwrap_or_default(),
-                    source_info: r.source_info.clone(),
-                    rrf_score,
-                    vec_rank: Some(rank as i32 + 1),
-                    kw_rank: None,
-                },
-            );
-        }
-
-        for (rank, r) in ft_results.iter().enumerate() {
-            let kw_score = 1.0 / (rrf_k as f64 + rank as f64 + 1.0) * keyword_weight;
-            seen.entry(r.id)
-                .and_modify(|e| {
-                    e.rrf_score += kw_score;
-                    e.kw_rank = Some(rank as i32 + 1);
-                })
-                .or_insert(RrfEntry {
-                    id: r.id,
-                    content: r.content.clone().unwrap_or_default(),
-                    source_info: r.source_info.clone(),
-                    rrf_score: kw_score,
-                    vec_rank: None,
-                    kw_rank: Some(rank as i32 + 1),
-                });
-        }
-
-        // Apply decay if enabled and table is "memories"
-        let mut decay_factors: HashMap<Uuid, f64> = HashMap::new();
-        if apply_decay && table == "memories" {
-            #[derive(sqlx::FromRow)]
-            struct DecayRow {
-                id: Uuid,
-                days_since: f64,
-            }
-
-            let ids: Vec<Uuid> = seen.keys().copied().collect();
-            // Query decay info for each memory ID
-            for chunk in ids.chunks(50) {
-                // Build a query with multiple IDs
-                let placeholders: Vec<String> =
-                    (1..=chunk.len()).map(|i| format!("${i}")).collect();
-                let sql = format!(
-                    "SELECT id, EXTRACT(EPOCH FROM (now() - COALESCE(last_accessed_at, created_at))) / 86400.0 AS days_since \
-                     FROM memories WHERE id IN ({})",
-                    placeholders.join(",")
-                );
-
-                let mut query_builder = sqlx::query_as::<_, DecayRow>(&sql);
-                for id in chunk {
-                    query_builder = query_builder.bind(*id);
-                }
-                let rows: Vec<DecayRow> = query_builder.fetch_all(&self.pool).await?;
-                for row in rows {
-                    let decay = f64::max(0.1, 2_f64.powf(-row.days_since / half_life_days));
-                    decay_factors.insert(row.id, decay);
-                }
-            }
-
-            for (id, entry) in &mut seen {
-                if let Some(decay) = decay_factors.get(id) {
-                    entry.rrf_score *= decay;
-                }
-            }
-        }
-
-        // Sort by final RRF score, take top `limit`
-        let mut entries: Vec<RrfEntry> = seen.into_values().collect();
-        entries.sort_by(|a, b| {
-            b.rrf_score
-                .partial_cmp(&a.rrf_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        entries.truncate(limit as usize);
-
-        Ok(entries
-            .into_iter()
-            .map(|e| SearchResultRrf {
-                id: e.id,
-                content: e.content,
-                score: (e.rrf_score * 10000.0).round() / 10000.0,
-                source_info: e.source_info,
-                decay_factor: decay_factors.get(&e.id).copied(),
-                vec_rank: e.vec_rank,
-                kw_rank: e.kw_rank,
-            })
-            .collect())
-    }
-
     // ------------------------------------------------------------------
     // Contradictions
     // ------------------------------------------------------------------
@@ -1012,7 +1079,16 @@ impl PostgresDb {
         content: &str,
         embedding: &[f32],
     ) -> Result<Vec<ContradictionCandidate>, sqlx::Error> {
-        let similar = self.vector_search("memories", embedding, 10, 0.6).await?;
+        let similar = self
+            .vector_search(
+                "memories",
+                embedding,
+                &self.active_embedding_model,
+                10,
+                0.6,
+                None,
+            )
+            .await?;
 
         let mut candidates = Vec::new();
         let new_lower = content.to_lowercase();
@@ -1090,7 +1166,48 @@ impl PostgresDb {
         Ok(candidates)
     }
 
-    /// Store a detected contradiction in the contradictions table.
+    /// Byte-cap a string without landing mid-character. `content_a`/`content_b`
+    /// are already char-capped by the caller, but a char cap doesn't bound
+    /// byte length (multi-byte UTF-8 can still exceed `max_bytes`), and a raw
+    /// byte slice at a non-boundary index panics.
+    fn truncate_at_byte_boundary(s: &str, max_bytes: usize) -> &str {
+        if s.len() <= max_bytes {
+            return s;
+        }
+        let mut end = max_bytes;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+
+    /// Order a contradiction pair by id, carrying each memory's content with
+    /// its own id. Binding the original content order against swapped ids
+    /// would file memory B's text as `content_a` under memory A's id,
+    /// misattributing which text belongs to which memory on roughly half of
+    /// all pairs (uuid ordering is effectively random).
+    fn canonical_pair<'t>(
+        memory_id_a: Uuid,
+        memory_id_b: Uuid,
+        content_a: &'t str,
+        content_b: &'t str,
+    ) -> (Uuid, Uuid, &'t str, &'t str) {
+        if memory_id_a < memory_id_b {
+            (memory_id_a, memory_id_b, content_a, content_b)
+        } else {
+            (memory_id_b, memory_id_a, content_b, content_a)
+        }
+    }
+
+    /// Store a detected contradiction, or return the existing row for the
+    /// same pair. `(memory_id_a, memory_id_b)` is normalized into canonical
+    /// (smaller, larger) order before insert so the same pair discovered
+    /// from either detection direction dedupes onto one row instead of
+    /// inserting a duplicate every time — matching `fetch_contradiction`'s
+    /// own normalize-then-query assumption. `ON CONFLICT ... DO UPDATE`
+    /// (rather than `DO NOTHING`) is what makes `RETURNING` fire for the
+    /// already-exists case too, so callers get the full row in one round
+    /// trip instead of a separate fetch after insert.
     pub async fn store_contradiction(
         &self,
         memory_id_a: Uuid,
@@ -1099,22 +1216,27 @@ impl PostgresDb {
         content_b: &str,
         similarity: f64,
         contradiction_type: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<Contradiction, sqlx::Error> {
+        let (id_a, id_b, text_a, text_b) =
+            Self::canonical_pair(memory_id_a, memory_id_b, content_a, content_b);
+        sqlx::query_as::<_, Contradiction>(
             "INSERT INTO contradictions (memory_id_a, memory_id_b, content_a, content_b, \
                                          similarity, contradiction_type) \
              VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT DO NOTHING",
+             ON CONFLICT (memory_id_a, memory_id_b) \
+             DO UPDATE SET memory_id_a = EXCLUDED.memory_id_a \
+             RETURNING id, memory_id_a, memory_id_b, content_a, content_b, \
+                       similarity, contradiction_type, detected_by, resolved, \
+                       resolution_note, created_at, updated_at",
         )
-        .bind(memory_id_a)
-        .bind(memory_id_b)
-        .bind(&content_a[..content_a.len().min(500)])
-        .bind(&content_b[..content_b.len().min(500)])
+        .bind(id_a)
+        .bind(id_b)
+        .bind(Self::truncate_at_byte_boundary(text_a, 500))
+        .bind(Self::truncate_at_byte_boundary(text_b, 500))
         .bind(similarity)
         .bind(contradiction_type)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        .fetch_one(&self.pool)
+        .await
     }
 
     // ------------------------------------------------------------------
@@ -1142,7 +1264,9 @@ impl PostgresDb {
     // Embedding Store
     // ------------------------------------------------------------------
 
-    /// Store a raw embedding in the embeddings table.
+    /// Store a raw embedding in the embeddings table, tagged with the model
+    /// that produced it (`self.active_embedding_model`) rather than relying
+    /// on the column's default, which only ever matched the NVIDIA backend.
     pub async fn store_embedding(
         &self,
         source_table: &str,
@@ -1153,15 +1277,16 @@ impl PostgresDb {
         let dimension = embedding.len() as i32;
 
         sqlx::query(
-            "INSERT INTO embeddings (source_table, source_id, embedding, dimension) \
-             VALUES ($1, $2, $3::vector, $4) \
-             ON CONFLICT (source_table, source_id) DO UPDATE SET \
+            "INSERT INTO embeddings (source_table, source_id, embedding, model, dimension) \
+             VALUES ($1, $2, $3::vector, $4, $5) \
+             ON CONFLICT (source_table, source_id, model) DO UPDATE SET \
                  embedding = EXCLUDED.embedding, \
                  dimension = EXCLUDED.dimension",
         )
         .bind(source_table)
         .bind(source_id)
         .bind(&emb_text)
+        .bind(&self.active_embedding_model)
         .bind(dimension)
         .execute(&self.pool)
         .await?;
@@ -1193,18 +1318,14 @@ impl PostgresDb {
         embedding: &[f32],
         limit: i64,
     ) -> Result<ContextPackage, sqlx::Error> {
-        let memories = self
-            .hybrid_search("memories", embedding, query, limit, 0.5)
-            .await?;
-        let documents = self
-            .hybrid_search("documents", embedding, query, limit, 0.5)
-            .await?;
-        let experiences = self
-            .hybrid_search("experiences", embedding, query, limit, 0.5)
-            .await?;
-        let recent_sessions = self.get_recent_sessions(3).await?;
-        let procedures = self.get_related_procedures(3).await?;
-        let trading_results = self.get_trading_results_summary(3).await?;
+        let (memories, documents, experiences, recent_sessions, procedures, trading_results) = tokio::try_join!(
+            self.hybrid_search("memories", embedding, query, limit, 0.5),
+            self.hybrid_search("documents", embedding, query, limit, 0.5),
+            self.hybrid_search("experiences", embedding, query, limit, 0.5),
+            self.get_recent_sessions(3),
+            self.get_related_procedures(3),
+            self.get_trading_results_summary(3),
+        )?;
 
         Ok(ContextPackage {
             memories,
@@ -1223,16 +1344,21 @@ impl PostgresDb {
         query: &str,
         limit: i64,
     ) -> Result<ContextPackage, sqlx::Error> {
-        let memories = self.bm25_search("memories", query, limit).await?;
-        let documents = self.bm25_search("documents", query, limit).await?;
-        let experiences = self.bm25_search("experiences", query, limit).await?;
+        let (memories, documents, experiences, recent_sessions, procedures, trading_results) = tokio::try_join!(
+            self.bm25_search("memories", query, limit, None),
+            self.bm25_search("documents", query, limit, None),
+            self.bm25_search("experiences", query, limit, None),
+            self.get_recent_sessions(3),
+            self.get_related_procedures(3),
+            self.get_trading_results_summary(3),
+        )?;
         Ok(ContextPackage {
             memories,
             documents,
             experiences,
-            recent_sessions: self.get_recent_sessions(3).await?,
-            procedures: self.get_related_procedures(3).await?,
-            trading_results: self.get_trading_results_summary(3).await?,
+            recent_sessions,
+            procedures,
+            trading_results,
         })
     }
 
@@ -1316,16 +1442,6 @@ impl PostgresDb {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// RRF fusion entry used during rank merging.
-struct RrfEntry {
-    id: Uuid,
-    content: String,
-    source_info: String,
-    rrf_score: f64,
-    vec_rank: Option<i32>,
-    kw_rank: Option<i32>,
-}
-
 /// Convert a `&[f32]` embedding to pgvector text format `'[x,y,z]'`.
 ///
 /// This is the format PostgreSQL's pgvector extension expects for INSERT
@@ -1367,6 +1483,62 @@ mod tests {
     fn vec_to_pgvector_single() {
         let result = vec_to_pgvector(&[1.0]);
         assert_eq!(result, "[1]");
+    }
+
+    // ------------------------------------------------------------------
+    // SearchFilters::clause
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn search_filters_clause_empty_when_unset() {
+        let f = SearchFilters::default();
+        let (sql, next) = f.clause("tags", "s.", 5);
+        assert_eq!(sql, "");
+        assert_eq!(next, 5);
+    }
+
+    #[test]
+    fn search_filters_clause_tags_any_only_on_tags_column() {
+        let f = SearchFilters {
+            tags: Some(vec!["a".into()]),
+            tags_match_any: true,
+            ..Default::default()
+        };
+        let (sql, next) = f.clause("tags", "s.", 5);
+        assert_eq!(sql, " AND s.tags && $5::text[]");
+        assert_eq!(next, 6);
+
+        // Ignored on a table without a tags column (e.g. documents/trading_results).
+        let (sql, next) = f.clause("path", "s.", 5);
+        assert_eq!(sql, "");
+        assert_eq!(next, 5);
+    }
+
+    #[test]
+    fn search_filters_clause_tags_all_mode() {
+        let f = SearchFilters {
+            tags: Some(vec!["a".into()]),
+            tags_match_any: false,
+            ..Default::default()
+        };
+        let (sql, _) = f.clause("tags", "s.", 5);
+        assert_eq!(sql, " AND s.tags @> $5::text[]");
+    }
+
+    #[test]
+    fn search_filters_clause_date_range_numbers_after_tags() {
+        let f = SearchFilters {
+            tags: Some(vec!["a".into()]),
+            tags_match_any: true,
+            start_date: Some(Utc::now()),
+            end_date: Some(Utc::now()),
+        };
+        let (sql, next) = f.clause("tags", "", 2);
+        assert_eq!(
+            sql,
+            " AND tags && $2::text[] AND created_at >= $3 AND created_at <= $4"
+        );
+        assert_eq!(next, 5);
     }
 
     // ------------------------------------------------------------------
@@ -1455,39 +1627,17 @@ mod tests {
     }
 
     #[test]
-    fn search_result_rrf_serde_roundtrip() {
-        let sr = SearchResultRrf {
-            id: Uuid::new_v4(),
-            content: "Test".into(),
-            score: 0.85,
-            source_info: "tags".into(),
-            decay_factor: Some(0.5),
-            vec_rank: Some(1),
-            kw_rank: Some(3),
-        };
-        let json = serde_json::to_string(&sr).unwrap();
-        let decoded: SearchResultRrf = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.score, 0.85);
-        assert_eq!(decoded.decay_factor, Some(0.5));
-        assert_eq!(decoded.vec_rank, Some(1));
-    }
+    fn canonical_pair_keeps_content_with_its_own_id() {
+        let low = Uuid::from_u128(1);
+        let high = Uuid::from_u128(2);
 
-    #[test]
-    fn search_result_rrf_optional_fields_none() {
-        let sr = SearchResultRrf {
-            id: Uuid::new_v4(),
-            content: "Minimal".into(),
-            score: 0.5,
-            source_info: "".into(),
-            decay_factor: None,
-            vec_rank: None,
-            kw_rank: None,
-        };
-        let json = serde_json::to_string(&sr).unwrap();
-        // None fields should be absent from JSON
-        assert!(!json.contains("decay_factor"));
-        assert!(!json.contains("vec_rank"));
-        assert!(!json.contains("kw_rank"));
+        // Already canonical — nothing moves.
+        let (a, b, ta, tb) = PostgresDb::canonical_pair(low, high, "low text", "high text");
+        assert_eq!((a, b, ta, tb), (low, high, "low text", "high text"));
+
+        // Reversed — ids swap, and each text must follow its own id.
+        let (a, b, ta, tb) = PostgresDb::canonical_pair(high, low, "high text", "low text");
+        assert_eq!((a, b, ta, tb), (low, high, "low text", "high text"));
     }
 
     #[test]

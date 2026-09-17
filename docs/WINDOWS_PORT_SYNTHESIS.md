@@ -2,6 +2,20 @@
 
 Synthesized from 10 researched-and-verified dimensions plus direct re-verification against the repo and live CI (2026-09-08). Builds on and supersedes `docs/WINDOWS_PORT.md` (committed 2026-09-05, "planning and audit complete, no code changed yet") — that doc's 4 blockers, manual-task list, and work order are the skeleton this fleshes out. Two findings below were confirmed by reading the repo and CI directly during this synthesis, not sourced from any of the 10 dimensions: **CI is red today for two independent, already-existing reasons** (not a future Windows problem), and **`memory-dashboard.rs` is a third, ungated egress path to Neon**. Both are load-bearing for Sections 2 and 3.
 
+**Status (2026-09-15):** this reads forward-looking ("Fix:", "New migration",
+diff sketches) but most of it has since shipped — verified directly against
+the current repo, not re-derived decision-by-decision here: CI's
+`windows-latest` leg (decision #8) is green today, `/health` returns 503 on
+a down database (#14), the local SQLite pending-writes queue exists in
+`src/queue/` (#13), the `llama-cpp` local embedding backend exists in
+`src/services/embedding.rs` (#1), `MEMORY_LOCAL_ONLY` is documented and
+enforced (#15/#16), the MCP `protocolVersion`/tool-count bugs are fixed
+(#21), and Task Scheduler installs from `taskscheduler/*.xml.template` +
+`scripts/install-taskscheduler.ps1` (#22). Treat each decision below as a
+historical design record, not a live checklist — check the code before
+assuming a specific decision (e.g. #10's native-Postgres-via-WinSW, or the
+Neon/scope work in #2/#17) is still open.
+
 ---
 
 ## 1. Decisions

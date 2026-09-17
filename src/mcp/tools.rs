@@ -1,4 +1,5 @@
-//! MCP tool handlers — 18 tools matching the Python memory_mcp.py.
+//! MCP tool handlers — 22 tools: 18 matching the Python memory_mcp.py, plus
+//! contradiction_scan/contradiction_resolve/memory_relate/memory_graph (Rust-only).
 //!
 //! Each tool is a standalone async function that takes `&AppState` and
 //! a `serde_json::Value` arguments map, returning a JSON string result.
@@ -30,7 +31,11 @@ pub fn list_tools() -> Value {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search query text" },
-                    "limit": { "type": "integer", "description": "Maximum results (default: 10)", "default": 10 }
+                    "limit": { "type": "integer", "description": "Maximum results (default: 10)", "default": 10 },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter by tags (memories/experiences only; ignored for documents/trading_results)", "default": null },
+                    "tag_match_mode": { "type": "string", "description": "'any' (default) or 'all' — how `tags` must match", "default": "any" },
+                    "start_date": { "type": "string", "description": "ISO-8601 lower bound on created_at (inclusive)", "default": null },
+                    "end_date": { "type": "string", "description": "ISO-8601 upper bound on created_at (inclusive)", "default": null }
                 },
                 "required": ["query"]
             }
@@ -46,7 +51,9 @@ pub fn list_tools() -> Value {
                     "content_type": { "type": "string", "description": "Type: note, insight, decision, observation, error", "default": "note" },
                     "importance": { "type": "number", "description": "Importance 0.0-1.0 (default: 0.5)", "default": 0.5 },
                     "critical": { "type": "boolean", "description": "Mark as critical. Sets importance to at least 0.9 and adds the critical tag.", "default": false },
-                    "session_id": { "type": "string", "description": "Optional session UUID to create cross-reference", "default": null }
+                    "session_id": { "type": "string", "description": "Optional session UUID to create cross-reference", "default": null },
+                    "expiration_date": { "type": "string", "description": "Optional ISO-8601 date (YYYY-MM-DD) after which this memory is hidden from search/list, without deleting it or affecting decay. Malformed values are ignored.", "default": null },
+                    "valid_at": { "type": "string", "description": "Optional ISO-8601 timestamp for when this fact became true in the world (may predate now, e.g. backfilled data). Defaults to the storage time. Used to auto-resolve contradictions in favor of the more currently-valid side. Malformed values are ignored.", "default": null }
                 },
                 "required": ["content"]
             }
@@ -199,6 +206,61 @@ pub fn list_tools() -> Value {
                 },
                 "required": ["session_id"]
             }
+        },
+        {
+            "name": "contradiction_scan",
+            "description": "Check one memory against existing similar memories for contradictions (opposing signals in near-duplicate content). Stores any found and returns them for review.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": { "type": "string", "description": "UUID of the memory to check" }
+                },
+                "required": ["memory_id"]
+            }
+        },
+        {
+            "name": "contradiction_resolve",
+            "description": "Resolve a detected contradiction. If keep_memory_id names one side of the pair, the other memory is marked superseded by it — recall stops surfacing it by default, but it stays recoverable for point-in-time review.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "contradiction_id": { "type": "string", "description": "UUID of the contradiction to resolve" },
+                    "resolution_note": { "type": "string", "description": "Why this was resolved this way" },
+                    "keep_memory_id": { "type": "string", "description": "Optional UUID of whichever memory in the pair is correct; the other is marked superseded. Pass the literal string \"auto\" to decide automatically by comparing each memory's valid_at/invalid_at (falls back to created_at) instead of naming one.", "default": null }
+                },
+                "required": ["contradiction_id", "resolution_note"]
+            }
+        },
+        {
+            "name": "memory_relate",
+            "description": "Create a typed relationship edge between two entities (e.g. two memories, or a memory and a session). Powers memory_graph traversal.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source_type": { "type": "string", "description": "Entity kind on the source side, e.g. \"memory\", \"session\", \"agent\"" },
+                    "source_id": { "type": "string", "description": "UUID of the source entity" },
+                    "target_type": { "type": "string", "description": "Entity kind on the target side" },
+                    "target_id": { "type": "string", "description": "UUID of the target entity" },
+                    "relation_type": { "type": "string", "description": "Relationship label, e.g. \"derived_from\", \"references\", \"supersedes\"" },
+                    "weight": { "type": "number", "description": "Optional edge weight, default 1.0" },
+                    "metadata": { "type": "object", "description": "Optional free-form metadata" }
+                },
+                "required": ["source_type", "source_id", "target_type", "target_id", "relation_type"]
+            }
+        },
+        {
+            "name": "memory_graph",
+            "description": "Multi-hop traversal of the relationship graph from one entity, returning every entity reachable within max_hops as shortest-hop distance (breadth-first). Memory entities include a content preview.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entity_type": { "type": "string", "description": "Entity kind to start from, e.g. \"memory\"" },
+                    "entity_id": { "type": "string", "description": "UUID of the starting entity" },
+                    "max_hops": { "type": "integer", "description": "Maximum hops to traverse, 1-5 (default 2)" },
+                    "relation_type": { "type": "string", "description": "Optional: only follow edges with this relation_type" }
+                },
+                "required": ["entity_type", "entity_id"]
+            }
         }
     ])
 }
@@ -234,6 +296,10 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result
         "dashboard_status" => tool_dashboard_status(state).await,
         "dashboard_control" => tool_dashboard_control(arguments).await,
         "session_context" => tool_session_context(state, arguments).await,
+        "contradiction_scan" => tool_contradiction_scan(state, arguments).await,
+        "contradiction_resolve" => tool_contradiction_resolve(state, arguments).await,
+        "memory_relate" => tool_memory_relate(state, arguments).await,
+        "memory_graph" => tool_memory_graph(state, arguments).await,
         _ => Err(anyhow::anyhow!("Unknown tool: {name}")),
     }
 }
@@ -245,11 +311,40 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result
 /// 1. memory_search — hybrid search across all tables.
 async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
     let query = get_string(&args, "query")?;
-    let limit = get_i64(&args, "limit").unwrap_or(10);
+    let limit = get_i64(&args, "limit").unwrap_or(10).clamp(1, 500);
     let session_id = args
         .get("session_id")
         .and_then(|v| v.as_str())
         .and_then(|s| Uuid::parse_str(s).ok());
+
+    let filters = {
+        let tags = get_string_array(&args, "tags");
+        let tags_match_any = args.get("tag_match_mode").and_then(|v| v.as_str()) != Some("all");
+        let start_date = args
+            .get("start_date")
+            .and_then(|v| v.as_str())
+            .map(|s| chrono::DateTime::parse_from_rfc3339(s))
+            .transpose()
+            .context("invalid start_date (expected ISO-8601)")?
+            .map(|d| d.with_timezone(&chrono::Utc));
+        let end_date = args
+            .get("end_date")
+            .and_then(|v| v.as_str())
+            .map(|s| chrono::DateTime::parse_from_rfc3339(s))
+            .transpose()
+            .context("invalid end_date (expected ISO-8601)")?
+            .map(|d| d.with_timezone(&chrono::Utc));
+        if tags.is_none() && start_date.is_none() && end_date.is_none() {
+            None
+        } else {
+            Some(crate::db::postgres::SearchFilters {
+                tags,
+                tags_match_any,
+                start_date,
+                end_date,
+            })
+        }
+    };
 
     info!("memory_search: query='{query}', limit={limit}");
 
@@ -268,18 +363,38 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
 
     // Search across all four tables in parallel
     let (memories, documents, experiences, trading) = match tokio::try_join!(
-        state
-            .search
-            .hybrid_search("memories", &query, &embedding, search_mode, limit),
-        state
-            .search
-            .hybrid_search("documents", &query, &embedding, search_mode, limit),
-        state
-            .search
-            .hybrid_search("experiences", &query, &embedding, search_mode, limit),
-        state
-            .search
-            .hybrid_search("trading_results", &query, &embedding, search_mode, limit),
+        state.search.hybrid_search_filtered(
+            "memories",
+            &query,
+            &embedding,
+            search_mode,
+            limit,
+            filters.as_ref()
+        ),
+        state.search.hybrid_search_filtered(
+            "documents",
+            &query,
+            &embedding,
+            search_mode,
+            limit,
+            filters.as_ref()
+        ),
+        state.search.hybrid_search_filtered(
+            "experiences",
+            &query,
+            &embedding,
+            search_mode,
+            limit,
+            filters.as_ref()
+        ),
+        state.search.hybrid_search_filtered(
+            "trading_results",
+            &query,
+            &embedding,
+            search_mode,
+            limit,
+            filters.as_ref()
+        ),
     ) {
         Ok(results) => results,
         Err(e) => {
@@ -290,23 +405,9 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
 
     // Record cross-references if session_id was provided
     if let Some(sid) = session_id {
-        let pool = &state.db.pool;
-        for m in &memories {
-            let _ = sqlx::query("SELECT record_memory_access($1, $2, 'searched', $3)")
-                .bind(sid)
-                .bind(m.id)
-                .bind(m.score)
-                .execute(pool)
-                .await;
-        }
-        for d in &documents {
-            let _ = sqlx::query("SELECT record_document_access($1, $2, 'searched', $3)")
-                .bind(sid)
-                .bind(d.id)
-                .bind(d.score)
-                .execute(pool)
-                .await;
-        }
+        let mem_refs: Vec<(Uuid, f64)> = memories.iter().map(|m| (m.id, m.score)).collect();
+        let doc_refs: Vec<(Uuid, f64)> = documents.iter().map(|d| (d.id, d.score)).collect();
+        record_batch_access(&state.db.pool, sid, "searched", &mem_refs, &doc_refs).await;
     }
 
     let result = json!({
@@ -339,6 +440,20 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
         .get("session_id")
         .and_then(|v| v.as_str())
         .and_then(|s| Uuid::parse_str(s).ok());
+    // Fail-open: a malformed expiration_date is ignored (memory never expires)
+    // rather than rejecting the whole store — it's advisory metadata, not a
+    // required field.
+    let expiration_date = args
+        .get("expiration_date")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+    // Fail-open, same as expiration_date: a malformed valid_at just leaves
+    // the fact's validity start deferred to created_at.
+    let valid_at = args
+        .get("valid_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
 
     info!("memory_store: type={content_type}, importance={importance}, tags={tags:?}");
 
@@ -352,6 +467,76 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
     };
     let embedding_slice = embedding.as_deref();
 
+    // Near-duplicate consolidation: an incoming memory whose embedding is
+    // >=0.95 cosine-similar to an existing one is treated as the same fact
+    // restated, not a new memory. 0.95, not the 0.85 ContradictionDetector
+    // uses for "worth comparing" (src/services/contradiction.rs) — merging
+    // is destructive/identity-preserving, so a false-positive match at a
+    // looser threshold would silently discard a genuinely distinct memory.
+    // On a hit: reinforce the existing row (bump access_count via
+    // record_memory_access), union tags, raise importance to the max of
+    // old vs new, and return its id — no new row is inserted. Skipped
+    // without an embedding service: there's no signal to compare on, and
+    // this trades recall (a real near-duplicate slips through as separate
+    // rows) for never mis-merging two unrelated memories.
+    if let Some(emb) = embedding_slice {
+        let similar = state
+            .db
+            .vector_search(
+                "memories",
+                emb,
+                &state.db.active_embedding_model,
+                1,
+                0.95,
+                None,
+            )
+            .await
+            .context("Failed near-duplicate search")?;
+        if let Some(dup) = similar.into_iter().next() {
+            if let Some(existing) = state.db.get_memory(dup.id).await? {
+                state.db.record_memory_access(existing.id).await?;
+                let mut merged_tags = existing.tags.clone();
+                for t in &tags {
+                    if !merged_tags.contains(t) {
+                        merged_tags.push(t.clone());
+                    }
+                }
+                let merged_importance = existing.importance.max(importance);
+                sqlx::query("UPDATE memories SET importance = $1, tags = $2 WHERE id = $3")
+                    .bind(merged_importance)
+                    .bind(&merged_tags)
+                    .bind(existing.id)
+                    .execute(&state.db.pool)
+                    .await
+                    .context("Failed to merge near-duplicate memory")?;
+
+                if let Some(sid) = session_id {
+                    let _ = sqlx::query("SELECT record_memory_access($1, $2, 'accessed', $3)")
+                        .bind(sid)
+                        .bind(existing.id)
+                        .bind(merged_importance)
+                        .execute(&state.db.pool)
+                        .await;
+                }
+
+                info!(
+                    "memory_store: deduplicated into existing memory {} (similarity {:.3})",
+                    existing.id, dup.score
+                );
+
+                let result = json!({
+                    "id": existing.id,
+                    "content_type": existing.content_type,
+                    "importance": merged_importance,
+                    "tags": merged_tags,
+                    "created_at": existing.created_at,
+                    "deduplicated": true,
+                });
+                return Ok(serde_json::to_string(&result)?);
+            }
+        }
+    }
+
     let memory = match state
         .db
         .store_memory(
@@ -363,6 +548,8 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
             None,
             None,
             embedding_slice,
+            expiration_date,
+            valid_at,
         )
         .await
     {
@@ -417,23 +604,10 @@ async fn tool_memory_context(state: &AppState, args: Value) -> Result<String> {
 
     // Record cross-references if session_id was provided
     if let Some(sid) = session_id {
-        let pool = &state.db.pool;
-        for m in &context.memories {
-            let _ = sqlx::query("SELECT record_memory_access($1, $2, 'loaded', $3)")
-                .bind(sid)
-                .bind(m.id)
-                .bind(m.score)
-                .execute(pool)
-                .await;
-        }
-        for d in &context.documents {
-            let _ = sqlx::query("SELECT record_document_access($1, $2, 'loaded', $3)")
-                .bind(sid)
-                .bind(d.id)
-                .bind(d.score)
-                .execute(pool)
-                .await;
-        }
+        let mem_refs: Vec<(Uuid, f64)> = context.memories.iter().map(|m| (m.id, m.score)).collect();
+        let doc_refs: Vec<(Uuid, f64)> =
+            context.documents.iter().map(|d| (d.id, d.score)).collect();
+        record_batch_access(&state.db.pool, sid, "loaded", &mem_refs, &doc_refs).await;
     }
 
     Ok(serde_json::to_string(&context)?)
@@ -462,23 +636,10 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
 
     // Record cross-references if session_id was provided
     if let Some(sid) = session_id {
-        let pool = &state.db.pool;
-        for m in &context.memories {
-            let _ = sqlx::query("SELECT record_memory_access($1, $2, 'loaded', $3)")
-                .bind(sid)
-                .bind(m.id)
-                .bind(m.score)
-                .execute(pool)
-                .await;
-        }
-        for d in &context.documents {
-            let _ = sqlx::query("SELECT record_document_access($1, $2, 'loaded', $3)")
-                .bind(sid)
-                .bind(d.id)
-                .bind(d.score)
-                .execute(pool)
-                .await;
-        }
+        let mem_refs: Vec<(Uuid, f64)> = context.memories.iter().map(|m| (m.id, m.score)).collect();
+        let doc_refs: Vec<(Uuid, f64)> =
+            context.documents.iter().map(|d| (d.id, d.score)).collect();
+        record_batch_access(&state.db.pool, sid, "loaded", &mem_refs, &doc_refs).await;
     }
 
     // Format as a banner matching the Python output
@@ -848,8 +1009,8 @@ async fn tool_forget(state: &AppState, args: Value) -> Result<String> {
 /// 11. list — paginated listing from a table.
 async fn tool_list(state: &AppState, args: Value) -> Result<String> {
     let table = get_string(&args, "table").unwrap_or_else(|_| "memories".to_string());
-    let limit = get_i64(&args, "limit").unwrap_or(50);
-    let offset = get_i64(&args, "offset").unwrap_or(0);
+    let limit = get_i64(&args, "limit").unwrap_or(50).clamp(1, 500);
+    let offset = get_i64(&args, "offset").unwrap_or(0).max(0);
 
     info!("list: table={table}, limit={limit}, offset={offset}");
 
@@ -858,8 +1019,10 @@ async fn tool_list(state: &AppState, args: Value) -> Result<String> {
             let rows = sqlx::query_as::<_, Memory>(
                 "SELECT id, agent_id, session_id, content, content_type, embedding::TEXT AS embedding, \
                  importance, tags, metadata, last_accessed_at, access_count, \
-                 decay_score, created_at, updated_at \
-                 FROM memories ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                 decay_score, created_at, updated_at, expiration_date \
+                 FROM memories \
+                 WHERE expiration_date IS NULL OR expiration_date >= CURRENT_DATE \
+                 ORDER BY created_at DESC LIMIT $1 OFFSET $2",
             )
             .bind(limit)
             .bind(offset)
@@ -1149,11 +1312,10 @@ async fn tool_archive_status(state: &AppState, _args: Value) -> Result<String> {
 /// in the MCP makes archive decisions inspectable without exposing transcript
 /// bodies or credentials to an agent.
 async fn tool_storage_catalog(state: &AppState) -> Result<String> {
-    let database_mb: f64 = sqlx::query_scalar(
-        "SELECT pg_database_size(current_database())::float8 / 1024 / 1024",
-    )
-    .fetch_one(&state.db.pool)
-    .await?;
+    let database_mb: f64 =
+        sqlx::query_scalar("SELECT pg_database_size(current_database())::float8 / 1024 / 1024")
+            .fetch_one(&state.db.pool)
+            .await?;
     let pending_upload_bytes: i64 = sqlx::query_scalar(
         "SELECT coalesce(sum(pg_column_size(payload)),0)::bigint FROM sync_meta.events WHERE pushed_at IS NULL",
     )
@@ -1263,6 +1425,252 @@ async fn tool_session_context(state: &AppState, args: Value) -> Result<String> {
     });
 
     Ok(serde_json::to_string(&result)?)
+}
+
+/// 19. contradiction_scan — check one memory against similar ones for contradictions.
+async fn tool_contradiction_scan(state: &AppState, args: Value) -> Result<String> {
+    let memory_id = get_string(&args, "memory_id")?;
+
+    info!("contradiction_scan: memory_id={memory_id}");
+
+    let detector = state
+        .contradiction_detector
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Contradiction detection is not available"))?;
+
+    let contradictions = detector.detect(&memory_id).await?;
+
+    let result = json!({
+        "memory_id": memory_id,
+        "contradictions": contradictions,
+        "count": contradictions.len(),
+    });
+
+    Ok(serde_json::to_string(&result)?)
+}
+
+/// 20. contradiction_resolve — resolve a stored contradiction.
+async fn tool_contradiction_resolve(state: &AppState, args: Value) -> Result<String> {
+    let contradiction_id = get_string(&args, "contradiction_id")?;
+    let resolution_note = get_string(&args, "resolution_note")?;
+    let keep_memory_id = args.get("keep_memory_id").and_then(|v| v.as_str());
+
+    info!("contradiction_resolve: id={contradiction_id}");
+
+    let detector = state
+        .contradiction_detector
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Contradiction detection is not available"))?;
+
+    let resolved = if keep_memory_id == Some("auto") {
+        detector
+            .auto_resolve(&contradiction_id, &resolution_note)
+            .await?
+    } else {
+        detector
+            .resolve(&contradiction_id, &resolution_note, keep_memory_id)
+            .await?
+    };
+
+    Ok(serde_json::to_string(&resolved)?)
+}
+
+/// 21. memory_relate — create a relationship edge between two entities.
+async fn tool_memory_relate(state: &AppState, args: Value) -> Result<String> {
+    let source_type = get_string(&args, "source_type")?;
+    let source_id =
+        Uuid::parse_str(&get_string(&args, "source_id")?).context("Invalid source_id")?;
+    let target_type = get_string(&args, "target_type")?;
+    let target_id =
+        Uuid::parse_str(&get_string(&args, "target_id")?).context("Invalid target_id")?;
+    let relation_type = get_string(&args, "relation_type")?;
+    let weight = get_f64(&args, "weight").unwrap_or(1.0);
+    let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
+
+    info!("memory_relate: {source_type}:{source_id} -{relation_type}-> {target_type}:{target_id}");
+
+    let row = sqlx::query(
+        "INSERT INTO relationships (source_type, source_id, target_type, target_id, relation_type, weight, metadata) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, created_at",
+    )
+    .bind(&source_type)
+    .bind(source_id)
+    .bind(&target_type)
+    .bind(target_id)
+    .bind(&relation_type)
+    .bind(weight)
+    .bind(&metadata)
+    .fetch_one(&state.db.pool)
+    .await
+    .context("Failed to create relationship")?;
+
+    let result = json!({
+        "id": row.try_get::<Uuid, _>("id")?,
+        "source_type": source_type,
+        "source_id": source_id,
+        "target_type": target_type,
+        "target_id": target_id,
+        "relation_type": relation_type,
+        "weight": weight,
+        "created_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?,
+    });
+
+    Ok(serde_json::to_string(&result)?)
+}
+
+/// 22. memory_graph — breadth-first multi-hop traversal of the relationship graph.
+async fn tool_memory_graph(state: &AppState, args: Value) -> Result<String> {
+    let entity_type = get_string(&args, "entity_type")?;
+    let entity_id =
+        Uuid::parse_str(&get_string(&args, "entity_id")?).context("Invalid entity_id")?;
+    let max_hops = get_i64(&args, "max_hops").unwrap_or(2).clamp(1, 5);
+    let relation_filter = args.get("relation_type").and_then(|v| v.as_str());
+
+    info!("memory_graph: {entity_type}:{entity_id}, max_hops={max_hops}");
+
+    // ponytail: no visited-path tracking — recursion is still bounded by
+    // max_hops regardless of cycles in the edge set (each step requires
+    // depth < max_hops, so it always terminates); a cyclic neighborhood just
+    // produces extra intermediate rows that GROUP BY collapses below.
+    let rows: Vec<(String, Uuid, i64)> = sqlx::query_as(
+        "WITH RECURSIVE traversal(entity_type, entity_id, depth) AS ( \
+             SELECT $1::text, $2::uuid, 0::bigint \
+             UNION ALL \
+             SELECT \
+                 CASE WHEN r.source_type = t.entity_type AND r.source_id = t.entity_id \
+                      THEN r.target_type ELSE r.source_type END, \
+                 CASE WHEN r.source_type = t.entity_type AND r.source_id = t.entity_id \
+                      THEN r.target_id ELSE r.source_id END, \
+                 t.depth + 1 \
+             FROM relationships r \
+             JOIN traversal t \
+               ON (r.source_type = t.entity_type AND r.source_id = t.entity_id) \
+               OR (r.target_type = t.entity_type AND r.target_id = t.entity_id) \
+             WHERE t.depth < $3 \
+               AND ($4::text IS NULL OR r.relation_type = $4) \
+         ) \
+         SELECT entity_type, entity_id, MIN(depth) AS depth \
+         FROM traversal \
+         WHERE depth > 0 \
+         GROUP BY entity_type, entity_id \
+         ORDER BY depth, entity_type, entity_id",
+    )
+    .bind(&entity_type)
+    .bind(entity_id)
+    .bind(max_hops)
+    .bind(relation_filter)
+    .fetch_all(&state.db.pool)
+    .await
+    .context("Failed to traverse relationship graph")?;
+
+    let memory_ids: Vec<Uuid> = rows
+        .iter()
+        .filter(|(t, _, _)| t == "memory")
+        .map(|(_, id, _)| *id)
+        .collect();
+    let previews = fetch_memory_previews(&state.db, &memory_ids).await?;
+
+    let nodes: Vec<Value> = rows
+        .into_iter()
+        .map(|(node_type, node_id, depth)| {
+            let mut node = json!({
+                "entity_type": node_type,
+                "entity_id": node_id,
+                "depth": depth,
+            });
+            if let Some(preview) = previews.get(&node_id) {
+                node["content_preview"] = json!(preview);
+            }
+            node
+        })
+        .collect();
+
+    let result = json!({
+        "start": { "entity_type": entity_type, "entity_id": entity_id },
+        "max_hops": max_hops,
+        "nodes": nodes,
+        "count": nodes.len(),
+    });
+
+    Ok(serde_json::to_string(&result)?)
+}
+
+/// Fetch short content previews for a set of memory IDs (for memory_graph).
+async fn fetch_memory_previews(
+    db: &PostgresDb,
+    ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, String>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("${i}")).collect();
+    let sql = format!(
+        "SELECT id, content FROM memories WHERE id IN ({})",
+        placeholders.join(",")
+    );
+
+    let mut query_builder = sqlx::query(&sql);
+    for id in ids {
+        query_builder = query_builder.bind(*id);
+    }
+
+    let rows = query_builder
+        .fetch_all(&db.pool)
+        .await
+        .context("Failed to fetch memory previews")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let id: Uuid = row.get("id");
+            let content: String = row.get("content");
+            (id, truncate(&content, 200))
+        })
+        .collect())
+}
+
+/// Batch-record access-tracking rows for a set of memories/documents in 2
+/// round trips total (one per table) instead of one row at a time — used by
+/// `memory_search`, `memory_context`, and `memory_initialize`, which all record a
+/// cross-reference for every result once a `session_id` is known. See
+/// `record_memory_access`/`record_document_access` in
+/// `migrations/003_session_vault_xref.sql` — both are plain single-row INSERT
+/// wrappers, so it's safe to insert the batch directly rather than call the
+/// function once per row.
+async fn record_batch_access(
+    pool: &sqlx::PgPool,
+    session_id: Uuid,
+    interaction_type: &str,
+    memories: &[(Uuid, f64)],
+    documents: &[(Uuid, f64)],
+) {
+    if !memories.is_empty() {
+        let (ids, scores): (Vec<Uuid>, Vec<f64>) = memories.iter().copied().unzip();
+        let _ = sqlx::query(
+            "INSERT INTO session_memories (session_id, memory_id, interaction_type, relevance_score) \
+             SELECT $1, x.id, $2, x.score FROM UNNEST($3::uuid[], $4::float8[]) AS x(id, score)",
+        )
+        .bind(session_id)
+        .bind(interaction_type)
+        .bind(&ids)
+        .bind(&scores)
+        .execute(pool)
+        .await;
+    }
+    if !documents.is_empty() {
+        let (ids, scores): (Vec<Uuid>, Vec<f64>) = documents.iter().copied().unzip();
+        let _ = sqlx::query(
+            "INSERT INTO session_documents (session_id, document_id, interaction_type, relevance_score) \
+             SELECT $1, x.id, $2, x.score FROM UNNEST($3::uuid[], $4::float8[]) AS x(id, score)",
+        )
+        .bind(session_id)
+        .bind(interaction_type)
+        .bind(&ids)
+        .bind(&scores)
+        .execute(pool)
+        .await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1380,14 +1788,15 @@ mod tests {
             experience_service: None,
             ingestion_service: None,
             procedure_service: None,
+            pending_writes: Arc::new(crate::queue::PendingWriteQueue::new_empty()),
         }
     }
 
     #[test]
-    fn list_tools_returns_18_tools() {
+    fn list_tools_returns_20_tools() {
         let tools = list_tools();
         let arr = tools.as_array().expect("tools should be an array");
-        assert_eq!(arr.len(), 18, "Expected 18 tools");
+        assert_eq!(arr.len(), 22, "Expected 22 tools");
     }
 
     #[test]
@@ -1446,6 +1855,62 @@ mod tests {
         let result = call_tool(&state, "nonexistent", json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn memory_relate_rejects_missing_source_type() {
+        let state = test_state();
+        let result = tool_memory_relate(
+            &state,
+            json!({
+                "source_id": Uuid::new_v4().to_string(),
+                "target_type": "memory",
+                "target_id": Uuid::new_v4().to_string(),
+                "relation_type": "references",
+            }),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "Missing source_type should error before touching the DB"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_relate_rejects_malformed_uuid() {
+        let state = test_state();
+        let result = tool_memory_relate(
+            &state,
+            json!({
+                "source_type": "memory",
+                "source_id": "not-a-uuid",
+                "target_type": "memory",
+                "target_id": Uuid::new_v4().to_string(),
+                "relation_type": "references",
+            }),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "Malformed source_id should error before touching the DB"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_graph_rejects_missing_entity_id() {
+        let state = test_state();
+        let result = tool_memory_graph(&state, json!({"entity_type": "memory"})).await;
+        assert!(
+            result.is_err(),
+            "Missing entity_id should error before touching the DB"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_memory_previews_empty_ids_returns_empty_map_without_querying() {
+        let db = PostgresDb::new_empty();
+        let previews = fetch_memory_previews(&db, &[]).await.unwrap();
+        assert!(previews.is_empty());
     }
 
     #[test]

@@ -53,7 +53,7 @@ impl IngestionService {
     #[must_use]
     pub fn new(pool: PgPool, embedder: Arc<dyn EmbeddingService>) -> Self {
         Self {
-            db: PostgresDb { pool },
+            db: PostgresDb::with_pool(pool),
             embedder,
         }
     }
@@ -262,7 +262,7 @@ impl IngestionService {
 
         let memories: Vec<Memory> = sqlx::query_as::<_, Memory>(
             "SELECT id, agent_id, session_id, content, content_type, embedding::TEXT AS embedding, importance, \
-         tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at \
+         tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at, expiration_date \
          FROM memories WHERE embedding IS NULL ORDER BY created_at ASC",
         )
         .fetch_all(&self.db.pool)
@@ -294,16 +294,24 @@ impl IngestionService {
                             continue;
                         }
                     };
-                    let result = sqlx::query(
-                    "UPDATE memories SET embedding = $1::vector, updated_at = now() WHERE id = $2",
-                )
-                .bind(embedding.as_vec())
-                .bind(memory.id)
-                .execute(&self.db.pool)
-                .await;
+                    // Same gate store_memory/upsert_document/etc. use: only the
+                    // NVIDIA cloud-default backend's vectors belong in the fixed
+                    // source column, since it carries no model discriminator.
+                    let result = if self.db.embedding_belongs_in_source_column() {
+                        sqlx::query(
+                            "UPDATE memories SET embedding = $1::vector, updated_at = now() WHERE id = $2",
+                        )
+                        .bind(embedding.as_vec())
+                        .bind(memory.id)
+                        .execute(&self.db.pool)
+                        .await
+                        .map(|_| ())
+                    } else {
+                        Ok(())
+                    };
 
                     match result {
-                        Ok(_) => {
+                        Ok(()) => {
                             match self
                                 .db
                                 .store_embedding("memories", memory.id, embedding.as_vec())
@@ -363,15 +371,19 @@ impl IngestionService {
                             continue;
                         }
                     };
-                    let result =
+                    let result = if self.db.embedding_belongs_in_source_column() {
                         sqlx::query("UPDATE experiences SET embedding = $1::vector WHERE id = $2")
                             .bind(embedding.as_vec())
                             .bind(experience.id)
                             .execute(&self.db.pool)
-                            .await;
+                            .await
+                            .map(|_| ())
+                    } else {
+                        Ok(())
+                    };
 
                     match result {
-                        Ok(_) => {
+                        Ok(()) => {
                             match self
                                 .db
                                 .store_embedding("experiences", experience.id, embedding.as_vec())
@@ -407,8 +419,13 @@ impl IngestionService {
 
         for session in &sessions {
             let text = compose_session_text(session);
-            match self.embedder.embed(&text).await {
-                Ok(embedding) => {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(REPAIR_EMBED_TIMEOUT_SECS),
+                self.embedder.embed(&text),
+            )
+            .await
+            {
+                Ok(Ok(embedding)) => {
                     let embedding = match validate_repair_embedding(embedding) {
                         Ok(value) => value,
                         Err(error) => {
@@ -416,16 +433,21 @@ impl IngestionService {
                             continue;
                         }
                     };
-                    let result = sqlx::query(
-                        "UPDATE sessions SET embedding = $1::vector, updated_at = now() WHERE id = $2",
-                    )
-                    .bind(embedding.as_vec())
-                    .bind(session.id)
-                    .execute(&self.db.pool)
-                    .await;
+                    let result = if self.db.embedding_belongs_in_source_column() {
+                        sqlx::query(
+                            "UPDATE sessions SET embedding = $1::vector, updated_at = now() WHERE id = $2",
+                        )
+                        .bind(embedding.as_vec())
+                        .bind(session.id)
+                        .execute(&self.db.pool)
+                        .await
+                        .map(|_| ())
+                    } else {
+                        Ok(())
+                    };
 
                     match result {
-                        Ok(_) => match self
+                        Ok(()) => match self
                             .db
                             .store_embedding("sessions", session.id, embedding.as_vec())
                             .await
@@ -438,7 +460,11 @@ impl IngestionService {
                         Err(e) => errors.push(format!("sessions/{}: {e}", session.id)),
                     }
                 }
-                Err(e) => errors.push(format!("sessions/{} (embed): {e:#}", session.id)),
+                Ok(Err(e)) => errors.push(format!("sessions/{} (embed): {e:#}", session.id)),
+                Err(_) => errors.push(format!(
+                    "sessions/{} (embed): timeout after {REPAIR_EMBED_TIMEOUT_SECS}s",
+                    session.id
+                )),
             }
         }
 
@@ -467,8 +493,13 @@ impl IngestionService {
                 } else {
                     &source_text
                 };
-                match self.embedder.embed(embed_text).await {
-                    Ok(embedding) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(REPAIR_EMBED_TIMEOUT_SECS),
+                    self.embedder.embed(embed_text),
+                )
+                .await
+                {
+                    Ok(Ok(embedding)) => {
                         let embedding = match validate_repair_embedding(embedding) {
                             Ok(value) => value,
                             Err(error) => {
@@ -476,15 +507,22 @@ impl IngestionService {
                                 continue;
                             }
                         };
-                        let update =
-                            format!("UPDATE {table} SET embedding = $1::vector WHERE id = $2");
-                        match sqlx::query(&update)
-                            .bind(embedding.as_vec())
-                            .bind(id)
-                            .execute(&self.db.pool)
-                            .await
-                        {
-                            Ok(_) => {
+                        let source_column_write: Result<(), sqlx::Error> =
+                            if self.db.embedding_belongs_in_source_column() {
+                                let update = format!(
+                                    "UPDATE {table} SET embedding = $1::vector WHERE id = $2"
+                                );
+                                sqlx::query(&update)
+                                    .bind(embedding.as_vec())
+                                    .bind(id)
+                                    .execute(&self.db.pool)
+                                    .await
+                                    .map(|_| ())
+                            } else {
+                                Ok(())
+                            };
+                        match source_column_write {
+                            Ok(()) => {
                                 self.db
                                     .store_embedding(table, id, embedding.as_vec())
                                     .await
@@ -496,7 +534,10 @@ impl IngestionService {
                             Err(e) => errors.push(format!("{table}/{id}: {e}")),
                         }
                     }
-                    Err(e) => errors.push(format!("{table}/{id} (embed): {e:#}")),
+                    Ok(Err(e)) => errors.push(format!("{table}/{id} (embed): {e:#}")),
+                    Err(_) => errors.push(format!(
+                        "{table}/{id} (embed): timeout after {REPAIR_EMBED_TIMEOUT_SECS}s"
+                    )),
                 }
             }
         }

@@ -23,11 +23,17 @@ set -a
 source "$ENV_FILE"
 set +a
 
+# neon-sync (below) reads DATABASE_URL from its own inherited environment and
+# needs the password embedded in it (sqlx has no PGPASSWORD fallback), so
+# DATABASE_URL itself is left intact -- only the one direct `psql` call below
+# gets a password-free URL argv plus PGPASSWORD.
+. "$ROOT/scripts/lib/pg-env.sh"
+
 printf '%s manual full recovery started\n' "$(date -u +%FT%TZ)" >> "$LOG_FILE"
 for attempt in {1..30}; do
   printf '%s attempt=%s\n' "$(date -u +%FT%TZ)" "$attempt" >> "$LOG_FILE"
   "$ROOT/target/release/neon-sync" full --confirm-full-push >> "$LOG_FILE" 2>&1 || true
-  queue="$(psql "$DATABASE_URL" -Atqc 'SELECT count(*) FROM sync_meta.outbox')"
+  queue="$(PGPASSWORD="$(pg_password "$DATABASE_URL")" psql "$(pg_url_strip_password "$DATABASE_URL")" -Atqc 'SELECT count(*) FROM sync_meta.outbox')"
   printf '%s remaining_queue=%s\n' "$(date -u +%FT%TZ)" "$queue" >> "$LOG_FILE"
   if [[ "$queue" == "0" ]]; then
     "$ROOT/target/release/neon-sync" pull >> "$LOG_FILE" 2>&1 || true

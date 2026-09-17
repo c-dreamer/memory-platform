@@ -1,8 +1,8 @@
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{extract::State, http::StatusCode, Json};
 use std::sync::Arc;
 
-use crate::AppState;
 use crate::api::dto::RootResponse;
+use crate::AppState;
 
 pub async fn root() -> Json<RootResponse> {
     Json(RootResponse {
@@ -15,7 +15,9 @@ pub async fn root() -> Json<RootResponse> {
 
 /// Returns 503 when Postgres is unreachable so a status-code-only supervisor
 /// (Task Scheduler, `curl -f`) can see degraded mode instead of a plain 200.
-pub async fn health_check(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn health_check(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
     let postgres = state.db.health().await;
     let status = if postgres {
         StatusCode::OK

@@ -38,6 +38,8 @@ async fn main() -> Result<()> {
             Some(config.nvidia_api_key.clone())
         },
         nvidia_embedding_model: config.nvidia_embedding_model.clone(),
+        llama_cpp_url: config.llama_cpp_url.clone(),
+        llama_cpp_model_name: config.llama_cpp_model_name.clone(),
         expected_dimension: config.embedding_dim,
         cache_size: config.embedding_cache_size,
     };

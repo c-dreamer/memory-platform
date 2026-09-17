@@ -25,12 +25,21 @@ if [[ -z "$NEON_URL" ]]; then
   exit 1
 fi
 
-echo "[rehydrate] restoring local store from Neon into: $LOCAL_URL"
-docker run --rm \
-  postgres:18 \
-  pg_dump "$NEON_URL" --clean --if-exists --no-owner --no-acl \
+# cargo run (below) needs the full URLs with password embedded (sqlx has no
+# PGPASSWORD fallback), so LOCAL_URL/NEON_URL stay intact for that; only the
+# pg_dump/psql argv below gets password-free URLs plus PGPASSWORD.
+. "$SCRIPT_DIR/lib/pg-env.sh"
+NEON_PW="$(pg_password "$NEON_URL")"
+LOCAL_PW="$(pg_password "$LOCAL_URL")"
+NEON_URL_NOPASS="$(pg_url_strip_password "$NEON_URL")"
+LOCAL_URL_NOPASS="$(pg_url_strip_password "$LOCAL_URL")"
+
+echo "[rehydrate] restoring local store from Neon into: $LOCAL_URL_NOPASS"
+PGPASSWORD="$NEON_PW" docker run --rm -e PGPASSWORD \
+  pgvector/pgvector:pg17 \
+  pg_dump "$NEON_URL_NOPASS" --clean --if-exists --no-owner --no-acl \
   | sed '/pg_session_jwt/d' \
-  | psql "$LOCAL_URL" -v ON_ERROR_STOP=1 >/dev/null
+  | PGPASSWORD="$LOCAL_PW" psql "$LOCAL_URL_NOPASS" -v ON_ERROR_STOP=1 >/dev/null
 
 echo "[rehydrate] ingesting current local source files"
 DATABASE_URL="$LOCAL_URL" cargo run --quiet --bin ingest -- all

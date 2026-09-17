@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::db::postgres::PostgresDb;
+use crate::services::decay::DecayEngine;
 
 use self::bm25::Bm25Search;
 use self::rrf::RrfFusion;
@@ -73,6 +74,7 @@ pub struct SearchResult {
 pub struct SearchEngine {
     db: Arc<PostgresDb>,
     config: Arc<Config>,
+    decay_engine: DecayEngine,
 }
 
 impl SearchEngine {
@@ -82,15 +84,23 @@ impl SearchEngine {
     /// be shared across threads (e.g. in an Axum application state).
     #[must_use]
     pub fn new(db: Arc<PostgresDb>, config: Arc<Config>) -> Self {
-        Self { db, config }
+        let decay_engine = DecayEngine::new(config.clone());
+        Self {
+            db,
+            config,
+            decay_engine,
+        }
     }
 
     /// Create an empty search engine for testing (no real backend).
     #[must_use]
     pub fn new_empty() -> Self {
+        let config = Arc::new(Config::default());
+        let decay_engine = DecayEngine::new(config.clone());
         Self {
             db: Arc::new(PostgresDb::new_empty()),
-            config: Arc::new(Config::default()),
+            config,
+            decay_engine,
         }
     }
 
@@ -124,15 +134,30 @@ impl SearchEngine {
         mode: &str,
         limit: i64,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
+        self.hybrid_search_filtered(table, query, embedding, mode, limit, None)
+            .await
+    }
+
+    /// Same as `hybrid_search`, with optional tag/date filters (see
+    /// `db::postgres::SearchFilters`).
+    pub async fn hybrid_search_filtered(
+        &self,
+        table: &str,
+        query: &str,
+        embedding: &[f32],
+        mode: &str,
+        limit: i64,
+        filters: Option<&crate::db::postgres::SearchFilters>,
+    ) -> Result<Vec<SearchResult>, sqlx::Error> {
         match mode {
-            "vector" => VectorSearch::search(&self.db, table, embedding, limit, 0.0).await,
-            "keyword" => Bm25Search::search(&self.db, table, query, limit).await,
+            "vector" => VectorSearch::search(&self.db, table, embedding, limit, 0.0, filters).await,
+            "keyword" => Bm25Search::search(&self.db, table, query, limit, filters).await,
             "rsf" => {
                 let fetch_limit = limit * 2;
 
                 let (vec_results, kw_results) = tokio::try_join!(
-                    VectorSearch::search(&self.db, table, embedding, fetch_limit, 0.0),
-                    Bm25Search::search(&self.db, table, query, fetch_limit),
+                    VectorSearch::search(&self.db, table, embedding, fetch_limit, 0.0, filters),
+                    Bm25Search::search(&self.db, table, query, fetch_limit, filters),
                 )?;
 
                 let mut fused = RsfFusion::fuse(
@@ -159,8 +184,8 @@ impl SearchEngine {
 
                 // Run vector and BM25 in parallel.
                 let (vec_results, kw_results) = tokio::try_join!(
-                    VectorSearch::search(&self.db, table, embedding, fetch_limit, 0.0),
-                    Bm25Search::search(&self.db, table, query, fetch_limit),
+                    VectorSearch::search(&self.db, table, embedding, fetch_limit, 0.0, filters),
+                    Bm25Search::search(&self.db, table, query, fetch_limit, filters),
                 )?;
 
                 let mut fused = RrfFusion::fuse(
@@ -187,20 +212,21 @@ impl SearchEngine {
 
     /// Apply Ebbinghaus-inspired memory decay to fused results.
     ///
-    /// Queries `last_accessed_at` / `created_at` for each memory ID,
-    /// computes `decay = max(min_score, 2^(-days_since / half_life))`,
-    /// and multiplies each result's score by its decay factor.
+    /// Queries `last_accessed_at`/`created_at`, `access_count`, and
+    /// `importance` for each memory ID and scores via
+    /// `DecayEngine::score_recency_frequency` (recency + frequency +
+    /// importance; coherence isn't available post-RRF-fusion, so stored
+    /// `importance` fills that weight's slot instead of it being dropped).
     async fn apply_decay(&self, results: &mut Vec<SearchResult>) -> Result<(), sqlx::Error> {
         use sqlx::Row;
 
         let ids: Vec<Uuid> = results.iter().map(|r| r.id).collect();
-        let half_life = self.config.decay_half_life_days;
-        let min_score = self.config.decay_min_score;
 
         for chunk in ids.chunks(50) {
             let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("${i}")).collect();
             let sql = format!(
-                "SELECT id, (EXTRACT(EPOCH FROM (now() - COALESCE(last_accessed_at, created_at))) / 86400.0)::FLOAT8 AS days_since \
+                "SELECT id, (EXTRACT(EPOCH FROM (now() - COALESCE(last_accessed_at, created_at))) / 86400.0)::FLOAT8 AS days_since, \
+                        access_count, importance \
                  FROM memories WHERE id IN ({})",
                 placeholders.join(",")
             );
@@ -214,7 +240,13 @@ impl SearchEngine {
             for row in &rows {
                 let id: Uuid = row.get("id");
                 let days_since: f64 = row.get("days_since");
-                let decay = f64::max(min_score, 2_f64.powf(-days_since / half_life));
+                let access_count: i32 = row.get("access_count");
+                let importance: f64 = row.get("importance");
+                let decay = self.decay_engine.score_recency_frequency(
+                    days_since,
+                    access_count as f64,
+                    importance,
+                );
 
                 if let Some(r) = results.iter_mut().find(|r| r.id == id) {
                     r.score *= decay;
@@ -282,9 +314,6 @@ mod tests {
     #[tokio::test]
     async fn search_engine_constructs_with_arcs() {
         let config = Arc::new(Config::default());
-        let _engine = SearchEngine {
-            db: Arc::new(PostgresDb::new_empty()),
-            config,
-        };
+        let _engine = SearchEngine::new(Arc::new(PostgresDb::new_empty()), config);
     }
 }

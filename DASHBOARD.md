@@ -51,3 +51,11 @@ macOS installs a versioned runtime under `~/Library/Application Support/Memory
 Platform/runtime/` and a user LaunchAgent pointing there. This intentionally
 avoids using a temporary checkout path. Linux installs a systemd user service
 and a matching maintenance service used by the dashboard controls.
+
+**Windows** has no LaunchAgent/systemd equivalent. Run
+`powershell -File scripts\install-taskscheduler.ps1` instead — it registers
+`taskscheduler/MemoryPlatformDashboard.xml.template` (logon-triggered,
+restart-on-failure, no execution time limit) alongside the other scheduled
+jobs, reusing the same bash runner scripts via Git Bash rather than
+reimplementing them in PowerShell. See `docs/WINDOWS_PORT_SYNTHESIS.md`
+decision #22.

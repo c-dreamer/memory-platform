@@ -93,11 +93,47 @@ impl DecayEngine {
     /// Returns: `relevance_score * score(days_since, access_count, coherence)`
     /// When disabled, returns `relevance_score` unchanged.
     #[must_use]
-    pub fn apply(&self, relevance_score: f64, days_since: f64, access_count: f64, coherence: f64) -> f64 {
+    pub fn apply(
+        &self,
+        relevance_score: f64,
+        days_since: f64,
+        access_count: f64,
+        coherence: f64,
+    ) -> f64 {
         if !self.enabled {
             return relevance_score;
         }
         relevance_score * self.score(days_since, access_count, coherence)
+    }
+
+    /// Combined recency + frequency + importance score, for callers with no
+    /// coherence (semantic similarity) signal available at the point of
+    /// scoring (e.g. post-RRF-fusion re-ranking).
+    ///
+    /// Stored `importance` fills `semantic_weight`'s slot instead of being
+    /// dropped: it's the closest available proxy signal, and reuses this
+    /// method's existing renormalize-over-available-terms shape rather than
+    /// silently discarding that share of the score.
+    #[must_use]
+    pub fn score_recency_frequency(
+        &self,
+        days_since_access: f64,
+        access_count: f64,
+        importance: f64,
+    ) -> f64 {
+        if !self.enabled {
+            return 1.0;
+        }
+        let recency = self.compute_recency(days_since_access);
+        let frequency = self.compute_frequency(access_count);
+        let total_weight = self.recency_weight + self.frequency_weight + self.semantic_weight;
+        if total_weight <= 0.0 {
+            return recency;
+        }
+        (recency * self.recency_weight
+            + frequency * self.frequency_weight
+            + importance * self.semantic_weight)
+            / total_weight
     }
 
     // Legacy API compatibility — kept for callers not yet migrated.
@@ -213,5 +249,30 @@ mod tests {
         let expected = rrf_score * 0.5;
         let actual = engine.apply_decay(rrf_score, 90.0);
         assert!((actual - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_score_recency_frequency_zero_days_max_access() {
+        let engine = DecayEngine::new(test_config());
+        // recency=1.0 (0 days), frequency=1.0 (access_count >= threshold),
+        // importance=1.0 -> 1.0
+        let actual = engine.score_recency_frequency(0.0, 100.0, 1.0);
+        assert!((actual - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_score_recency_frequency_renormalizes_with_importance() {
+        let engine = DecayEngine::new(test_config());
+        // recency=0.5 (half-life), frequency=0.0 (never accessed), importance=0.8.
+        // weights: recency=0.3, frequency=0.2, semantic(importance)=0.5 -> total 1.0.
+        let actual = engine.score_recency_frequency(90.0, 0.0, 0.8);
+        let expected = 0.5 * 0.3 + 0.0 * 0.2 + 0.8 * 0.5;
+        assert!((actual - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_score_recency_frequency_disabled() {
+        let engine = DecayEngine::new(disabled_config());
+        assert!((engine.score_recency_frequency(1000.0, 0.0, 0.5) - 1.0).abs() < f64::EPSILON);
     }
 }

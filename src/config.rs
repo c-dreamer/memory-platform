@@ -23,6 +23,14 @@ pub enum ConfigError {
 /// Default embedding dimension for the active production embedding backend.
 pub const DEFAULT_EMBEDDING_DIM: usize = 2048;
 
+/// The `model` identifier used before per-model tagging existed (migration
+/// 015) and still the default for `EMBEDDING_MODEL=nvidia`. Any other active
+/// model is treated as non-default: its embeddings go in the `embeddings`
+/// cache only, never a fixed-width source-table column (decision #5,
+/// docs/WINDOWS_PORT_SYNTHESIS.md) — those columns have no model
+/// discriminator, so only one model may ever occupy them unambiguously.
+pub const CLOUD_DEFAULT_EMBEDDING_MODEL: &str = "nvidia/llama-nemotron-embed-1b-v2";
+
 /// Application configuration loaded from environment variables.
 ///
 /// Every field maps to an environment variable (see `.env.example`).
@@ -46,6 +54,10 @@ pub struct Config {
     pub nvidia_api_url: String,
     pub nvidia_api_key: String,
     pub openai_api_key: String,
+    /// `llama-server`'s OpenAI-compatible embeddings endpoint, loopback only.
+    pub llama_cpp_url: String,
+    /// Identifier recorded in `public.embeddings.model` for locally-embedded rows.
+    pub llama_cpp_model_name: String,
 
     // --- Obsidian ---
     pub vault_path: String,
@@ -157,6 +169,10 @@ impl Config {
                 .unwrap_or_else(|| "https://integrate.api.nvidia.com/v1/embeddings".into()),
             nvidia_api_key: env_var("NVIDIA_API_KEY").unwrap_or_default(),
             openai_api_key: env_var("OPENAI_API_KEY").unwrap_or_default(),
+            llama_cpp_url: env_var("LLAMA_CPP_URL")
+                .unwrap_or_else(|| "http://127.0.0.1:8080/v1/embeddings".into()),
+            llama_cpp_model_name: env_var("LLAMA_CPP_MODEL_NAME")
+                .unwrap_or_else(|| "qwen3-embedding-4b".into()),
 
             // --- Obsidian ---
             vault_path: env_var("VAULT_PATH").unwrap_or_else(|| "/vault".into()),
@@ -205,10 +221,10 @@ impl Config {
         };
 
         if cfg.local_only {
-            if cfg.embedding_model != "local" {
+            if cfg.embedding_model != "llama-cpp" {
                 return Err(ConfigError::LocalOnly {
                     reason: format!(
-                        "EMBEDDING_MODEL is \"{}\", must be \"local\"",
+                        "EMBEDDING_MODEL is \"{}\", must be \"llama-cpp\" (the genuinely offline backend)",
                         cfg.embedding_model
                     ),
                 });
@@ -226,6 +242,15 @@ impl Config {
             if !cfg.obsidian_api_key.is_empty() {
                 return Err(ConfigError::LocalOnly {
                     reason: "OBSIDIAN_API_KEY is set".into(),
+                });
+            }
+            if !is_loopback_url(&cfg.llama_cpp_url) {
+                return Err(ConfigError::LocalOnly {
+                    reason: format!(
+                        "LLAMA_CPP_URL \"{}\" is not loopback (must be localhost/127.0.0.1/::1) — \
+                         local-only mode requires the embedding backend to stay on this machine",
+                        cfg.llama_cpp_url
+                    ),
                 });
             }
         }
@@ -246,6 +271,25 @@ pub fn local_only_enabled() -> bool {
     }
 }
 
+/// Which embedding backend `EMBEDDING_MODEL` selects, read directly from the
+/// environment (like `local_only_enabled`) for callers that only hold a bare
+/// `PgPool`, not a full `Config`.
+pub fn active_embedding_backend() -> String {
+    env_var("EMBEDDING_MODEL").unwrap_or_else(|| "local".into())
+}
+
+/// The `public.embeddings.model` identifier for the active backend.
+pub fn active_embedding_model_identifier() -> String {
+    match active_embedding_backend().as_str() {
+        "nvidia" => env_var("NVIDIA_EMBEDDING_MODEL")
+            .unwrap_or_else(|| CLOUD_DEFAULT_EMBEDDING_MODEL.into()),
+        "llama-cpp" => {
+            env_var("LLAMA_CPP_MODEL_NAME").unwrap_or_else(|| "qwen3-embedding-4b".into())
+        }
+        _ => "unknown".into(),
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -261,6 +305,8 @@ impl Default for Config {
             nvidia_api_url: "https://integrate.api.nvidia.com/v1/embeddings".into(),
             nvidia_api_key: String::new(),
             openai_api_key: String::new(),
+            llama_cpp_url: "http://127.0.0.1:8080/v1/embeddings".into(),
+            llama_cpp_model_name: "qwen3-embedding-4b".into(),
             vault_path: "/vault".into(),
             obsidian_api_url: "http://host.docker.internal:27124".into(),
             obsidian_api_key: String::new(),
@@ -315,6 +361,22 @@ where
             source: Box::new(e),
         }),
         None => Ok(default),
+    }
+}
+
+/// Whether `url` resolves to the loopback interface (`127.0.0.1`, `::1`, or
+/// the literal host `localhost`) without needing DNS — the only shapes that
+/// are guaranteed to never leave this machine.
+fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    match parsed.host_str() {
+        Some(h) if h.eq_ignore_ascii_case("localhost") => true,
+        Some(h) => h
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
     }
 }
 
@@ -652,7 +714,11 @@ mod tests {
     #[test]
     fn local_only_rejects_nvidia_api_key() {
         with_env_vars(
-            &[("MEMORY_LOCAL_ONLY", "1"), ("NVIDIA_API_KEY", "nv-key")],
+            &[
+                ("MEMORY_LOCAL_ONLY", "1"),
+                ("EMBEDDING_MODEL", "llama-cpp"),
+                ("NVIDIA_API_KEY", "nv-key"),
+            ],
             || {
                 let err = Config::from_env().unwrap_err();
                 assert!(err.to_string().contains("NVIDIA_API_KEY"));
@@ -663,7 +729,11 @@ mod tests {
     #[test]
     fn local_only_rejects_openai_api_key() {
         with_env_vars(
-            &[("MEMORY_LOCAL_ONLY", "1"), ("OPENAI_API_KEY", "oa-key")],
+            &[
+                ("MEMORY_LOCAL_ONLY", "1"),
+                ("EMBEDDING_MODEL", "llama-cpp"),
+                ("OPENAI_API_KEY", "oa-key"),
+            ],
             || {
                 let err = Config::from_env().unwrap_err();
                 assert!(err.to_string().contains("OPENAI_API_KEY"));
@@ -672,12 +742,48 @@ mod tests {
     }
 
     #[test]
+    fn local_only_rejects_non_loopback_llama_cpp_url() {
+        // Same reasoning as local_only_allows_clean_config below: force the
+        // cloud-credential vars empty so an ambient dev-machine .env doesn't
+        // make an earlier check fail first for an unrelated reason.
+        with_env_vars(
+            &[
+                ("MEMORY_LOCAL_ONLY", "1"),
+                ("EMBEDDING_MODEL", "llama-cpp"),
+                ("NVIDIA_API_KEY", ""),
+                ("OPENAI_API_KEY", ""),
+                ("OBSIDIAN_API_KEY", ""),
+                ("LLAMA_CPP_URL", "http://attacker.example.com/v1/embeddings"),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err();
+                assert!(err.to_string().contains("LLAMA_CPP_URL"));
+            },
+        );
+    }
+
+    #[test]
     fn local_only_allows_clean_config() {
-        with_env_vars(&[("MEMORY_LOCAL_ONLY", "true")], || {
-            let cfg = Config::from_env().expect("local-only with no cloud creds should load");
-            assert!(cfg.local_only);
-            assert_eq!(cfg.embedding_model, "local");
-        });
+        // `with_env_vars` only saves/restores the keys listed here — it doesn't
+        // clear the rest of the real process environment, so a dev machine
+        // with e.g. OBSIDIAN_API_KEY set for actual local use (not from this
+        // repo's .env) fails this "clean config" case for reasons unrelated to
+        // the code under test. Force every cloud-credential var this check
+        // gates on to empty explicitly, rather than assuming ambient cleanliness.
+        with_env_vars(
+            &[
+                ("MEMORY_LOCAL_ONLY", "true"),
+                ("EMBEDDING_MODEL", "llama-cpp"),
+                ("NVIDIA_API_KEY", ""),
+                ("OPENAI_API_KEY", ""),
+                ("OBSIDIAN_API_KEY", ""),
+            ],
+            || {
+                let cfg = Config::from_env().expect("local-only with no cloud creds should load");
+                assert!(cfg.local_only);
+                assert_eq!(cfg.embedding_model, "llama-cpp");
+            },
+        );
     }
 
     // ------------------------------------------------------------------

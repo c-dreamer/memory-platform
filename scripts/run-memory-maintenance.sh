@@ -12,7 +12,11 @@ PAUSE_FILE="$STATE_DIR/neon-maintenance.paused"
 MODE="${1:---daily}"
 
 notify() {
-  osascript -e "display notification \"$1\" with title \"Memory Platform\"" 2>/dev/null || true
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$1\" with title \"Memory Platform\"" 2>/dev/null || true
+  else
+    echo "[memory-platform] $1" >&2
+  fi
 }
 
 [[ -r "$ENV_FILE" ]] || { echo "memory environment file is missing: $ENV_FILE" >&2; exit 78; }

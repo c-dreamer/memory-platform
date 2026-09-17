@@ -26,6 +26,10 @@ path = "src/bin/ingest.rs"
 name = "neon-sync"
 path = "src/bin/neon-sync.rs"
 
+[[bin]]
+name = "search-eval"
+path = "src/bin/search_eval.rs"
+
 [lib]
 name = "memory_platform"
 path = "src/lib.rs"
@@ -33,7 +37,8 @@ path = "src/lib.rs"
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tracing", "matched-path", "original-uri"] }
 tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate", "derive", "macros"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "sqlite", "uuid", "chrono", "json", "migrate", "derive", "macros"] }
+dirs = "5"
 redis = { version = "0.32", default-features = false, features = ["tokio-comp", "aio", "connection-manager"] }
 neo4rs = { version = "0.9.0-rc.10", optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -61,6 +66,14 @@ async-trait = "0.1"
 lru = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 mockito = { version = "1.4", default-features = false }
+age = "0.12"
+# sqlx's "sqlite" feature (src/queue, the local pending-writes queue) links
+# libsqlite3-sys unbundled by default, needing a system sqlite3 findable via
+# pkg-config or vcpkg — neither exists on a stock Windows box. "bundled"
+# compiles SQLite from source with the C compiler the rest of this crate
+# already requires (see CLAUDE.md: MSVC Build Tools), so it adds no new
+# platform dependency instead of a new one (vcpkg).
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 
 
 [features]

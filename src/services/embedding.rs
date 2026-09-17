@@ -1,11 +1,16 @@
-//! Embedding service — NVIDIA NIM API.
+//! Embedding service — NVIDIA NIM API, or a local llama.cpp server.
 //!
 //! `fastembed`'s bundled ONNX models top out at 1024 dimensions and cannot
 //! reach this schema's 2048, so it was removed rather than kept as a broken
-//! "local" option — see docs/WINDOWS_PORT_SYNTHESIS.md decision #4.
+//! "local" option — see docs/WINDOWS_PORT_SYNTHESIS.md decision #4. The
+//! working offline path (decision #1) is `llama-server` (llama.cpp),
+//! loopback-only, serving a Qwen3-Embedding-4B GGUF whose native 2560-dim
+//! output is Matryoshka-truncated to 2048 and renormalized here in Rust
+//! rather than trusted from the server.
 //!
 //! Provides async embedding generation with:
 //! - NVIDIA NIM API
+//! - llama.cpp (`llama-server`) local API
 //! - LRU cache (1000 entries)
 
 #[cfg(test)]
@@ -42,10 +47,29 @@ pub struct EmbeddingConfig {
     pub nvidia_api_key: Option<String>,
     /// NVIDIA embedding model name (e.g., "nvidia/nv-embed-v1").
     pub nvidia_embedding_model: String,
-    /// Required output dimension. Provider responses are rejected if this differs.
+    /// `llama-server`'s OpenAI-compatible embeddings endpoint (loopback only).
+    pub llama_cpp_url: String,
+    /// Model identifier recorded alongside llama.cpp-backed embeddings.
+    pub llama_cpp_model_name: String,
+    /// Required output dimension. Provider responses are rejected if this differs
+    /// (llama.cpp truncates/renormalizes down to this instead of rejecting).
     pub expected_dimension: usize,
     /// LRU cache size (number of entries).
     pub cache_size: usize,
+}
+
+/// Split `text` into pieces of at most `max_chars` characters, each sent as
+/// one embedding request. Shared by every HTTP-backed embedding provider.
+fn split_for_embedding(text: &str, max_chars: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars {
+        return vec![text.to_string()];
+    }
+
+    chars
+        .chunks(max_chars)
+        .map(|chunk| chunk.iter().collect())
+        .collect()
 }
 
 /// NVIDIA NIM embedding backend (HTTP API).
@@ -168,18 +192,6 @@ impl NvidiaNimEmbedding {
             EMBEDDING_REQUEST_RETRIES + 1
         )
     }
-
-    fn split_for_embedding(text: &str, max_chars: usize) -> Vec<String> {
-        let chars: Vec<char> = text.chars().collect();
-        if chars.len() <= max_chars {
-            return vec![text.to_string()];
-        }
-
-        chars
-            .chunks(max_chars)
-            .map(|chunk| chunk.iter().collect())
-            .collect()
-    }
 }
 
 impl EmbeddingService for NvidiaNimEmbedding {
@@ -204,7 +216,7 @@ impl EmbeddingService for NvidiaNimEmbedding {
                 }
             }
 
-            let chunks = Self::split_for_embedding(&text, 4000);
+            let chunks = split_for_embedding(&text, 4000);
             let embedding = if chunks.len() == 1 {
                 Self::embed_remote_chunk(
                     &client,
@@ -265,15 +277,214 @@ impl EmbeddingService for NvidiaNimEmbedding {
     }
 }
 
+/// llama.cpp (`llama-server`) embedding backend, structurally cloned from
+/// `NvidiaNimEmbedding`: same retry/backoff and chunk-and-average shape, but
+/// talking to a loopback-only local process instead of a cloud API, and with
+/// no API key. The server's native output may be wider than
+/// `expected_dimension` (Qwen3-Embedding-4B is natively 2560-dim); this is
+/// the one backend expected to need truncation, applied — and renormalized —
+/// in `parse_llamacpp_response` regardless of whatever the server itself did.
+#[derive(Debug, Clone)]
+pub struct LlamaCppEmbedding {
+    client: Client,
+    api_url: String,
+    model: String,
+    expected_dimension: usize,
+    cache: Arc<Mutex<LruCache<String, Embedding>>>,
+}
+
+impl LlamaCppEmbedding {
+    pub fn new(
+        api_url: String,
+        model: String,
+        cache_size: usize,
+        expected_dimension: usize,
+    ) -> Self {
+        Self {
+            client: Client::builder()
+                .timeout(Duration::from_secs(EMBEDDING_REQUEST_TIMEOUT_SECS))
+                .build()
+                .expect("valid embedding HTTP client configuration"),
+            api_url,
+            model,
+            expected_dimension,
+            cache: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(1000).unwrap()),
+            ))),
+        }
+    }
+
+    fn parse_llamacpp_response(
+        data: serde_json::Value,
+        expected_dimension: usize,
+    ) -> Result<Embedding> {
+        let mut embedding: Vec<f32> = data["data"][0]["embedding"]
+            .as_array()
+            .context("Invalid embedding format in llama.cpp server response")?
+            .iter()
+            .map(|v| v.as_f64().unwrap_or_default() as f32)
+            .collect();
+
+        if embedding.len() < expected_dimension {
+            anyhow::bail!(
+                "llama.cpp embedding backend returned {} dimensions; need at least {}",
+                embedding.len(),
+                expected_dimension
+            );
+        }
+
+        // Matryoshka (MRL) truncation: keep the leading `expected_dimension`
+        // components, then renormalize ourselves — never trust an unverified
+        // server-side truncate/renormalize on this correctness-sensitive path.
+        embedding.truncate(expected_dimension);
+        let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            embedding.iter_mut().for_each(|x| *x /= norm);
+        }
+
+        Ok(Embedding::new(embedding))
+    }
+
+    async fn embed_llamacpp_chunk(
+        client: &Client,
+        api_url: &str,
+        model: &str,
+        expected_dimension: usize,
+        text: &str,
+    ) -> Result<Embedding> {
+        for attempt in 0..=EMBEDDING_REQUEST_RETRIES {
+            let response = client
+                .post(api_url)
+                .json(&serde_json::json!({
+                    "input": text,
+                    "model": model,
+                }))
+                .send()
+                .await;
+
+            match response {
+                Ok(resp) if resp.status().is_success() => {
+                    let data: serde_json::Value = resp
+                        .json()
+                        .await
+                        .context("Failed to parse llama.cpp server response")?;
+                    return Self::parse_llamacpp_response(data, expected_dimension);
+                }
+                Ok(resp) if !resp.status().is_server_error() => {
+                    let status = resp.status();
+                    let error_text = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("llama.cpp server error ({}): {}", status, error_text);
+                }
+                Ok(resp) => {
+                    tracing::warn!(attempt = attempt + 1, status = %resp.status(), "llama.cpp server returned a retryable error");
+                }
+                Err(error) => {
+                    tracing::warn!(attempt = attempt + 1, error = %error, "llama.cpp server request failed; retrying");
+                }
+            }
+
+            if attempt < EMBEDDING_REQUEST_RETRIES {
+                tokio::time::sleep(Duration::from_secs(2_u64.saturating_pow(attempt as u32))).await;
+            }
+        }
+
+        anyhow::bail!(
+            "llama.cpp server failed after {} attempts — is llama-server running on {}?",
+            EMBEDDING_REQUEST_RETRIES + 1,
+            api_url
+        )
+    }
+}
+
+impl EmbeddingService for LlamaCppEmbedding {
+    fn embed(&self, text: &str) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>> {
+        let text = text.to_string();
+        let client = self.client.clone();
+        let api_url = self.api_url.clone();
+        let model = self.model.clone();
+        let expected_dimension = self.expected_dimension;
+        let cache = Arc::clone(&self.cache);
+        Box::pin(async move {
+            if text.trim().is_empty() {
+                anyhow::bail!("cannot embed empty text")
+            }
+
+            {
+                let mut cache = cache.lock().await;
+                if let Some(cached) = cache.get(&text) {
+                    return Ok(cached.clone());
+                }
+            }
+
+            let chunks = split_for_embedding(&text, 4000);
+            let embedding = if chunks.len() == 1 {
+                Self::embed_llamacpp_chunk(
+                    &client,
+                    &api_url,
+                    &model,
+                    expected_dimension,
+                    &chunks[0],
+                )
+                .await?
+            } else {
+                let mut accumulator: Option<Vec<f32>> = None;
+                let mut count = 0usize;
+
+                for chunk in &chunks {
+                    let chunk_embedding = Self::embed_llamacpp_chunk(
+                        &client,
+                        &api_url,
+                        &model,
+                        expected_dimension,
+                        chunk,
+                    )
+                    .await?;
+                    let values = chunk_embedding.into_inner();
+                    if values.len() != expected_dimension {
+                        anyhow::bail!("embedding chunk dimension mismatch")
+                    }
+
+                    if let Some(existing) = accumulator.as_mut() {
+                        for (dst, src) in existing.iter_mut().zip(values.iter()) {
+                            *dst += *src;
+                        }
+                    } else {
+                        accumulator = Some(values);
+                    }
+                    count += 1;
+                }
+
+                let mut values = accumulator.context("Embedding backend returned no vectors")?;
+                if count > 1 {
+                    let scale = 1.0 / count as f32;
+                    for value in &mut values {
+                        *value *= scale;
+                    }
+                }
+                Embedding::new(values)
+            };
+
+            {
+                let mut cache = cache.lock().await;
+                cache.put(text, embedding.clone());
+            }
+
+            Ok(embedding)
+        })
+    }
+}
+
 /// Factory for embedding service.
 pub enum EmbeddingServiceFactory {
     Nvidia(NvidiaNimEmbedding),
+    LlamaCpp(LlamaCppEmbedding),
 }
 
 impl fmt::Debug for EmbeddingServiceFactory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Nvidia(_) => f.debug_tuple("Nvidia").finish(),
+            Self::LlamaCpp(_) => f.debug_tuple("LlamaCpp").finish(),
         }
     }
 }
@@ -283,7 +494,8 @@ impl EmbeddingServiceFactory {
     ///
     /// `model` `"local"` has no working backend yet — see the module doc
     /// comment — and fails clearly rather than silently reaching NVIDIA.
-    /// `model` `"nvidia"` uses NVIDIA NIM API directly.
+    /// `model` `"nvidia"` uses NVIDIA NIM API directly. `model` `"llama-cpp"`
+    /// talks to a local `llama-server` process (decision #1).
     pub async fn new(config: EmbeddingConfig) -> Result<Self> {
         let cache_size = config.cache_size.max(1);
         match config.model.as_str() {
@@ -309,6 +521,12 @@ impl EmbeddingServiceFactory {
                     config.expected_dimension,
                 )))
             }
+            "llama-cpp" => Ok(Self::LlamaCpp(LlamaCppEmbedding::new(
+                config.llama_cpp_url.clone(),
+                config.llama_cpp_model_name.clone(),
+                cache_size,
+                config.expected_dimension,
+            ))),
             _ => anyhow::bail!("Unknown embedding model: {}", config.model),
         }
     }
@@ -319,6 +537,7 @@ impl EmbeddingService for EmbeddingServiceFactory {
         let text = text.to_string();
         match self {
             Self::Nvidia(service) => Box::pin(async move { service.embed(&text).await }),
+            Self::LlamaCpp(service) => Box::pin(async move { service.embed(&text).await }),
         }
     }
 }
@@ -334,6 +553,8 @@ mod tests {
             nvidia_api_url: None,
             nvidia_api_key: None,
             nvidia_embedding_model: String::new(),
+            llama_cpp_url: String::new(),
+            llama_cpp_model_name: String::new(),
             expected_dimension: DEFAULT_EMBEDDING_DIM,
             cache_size: 10,
         };
@@ -366,5 +587,34 @@ mod tests {
             DEFAULT_EMBEDDING_DIM,
         );
         assert!(service.embed("").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_llamacpp_truncates_and_renormalizes() {
+        // Qwen3-Embedding-4B's native 2560-dim output, truncated to 2048 and
+        // renormalized — the Matryoshka truncation this backend exists for.
+        let native_dim = 2560;
+        let response = serde_json::json!({
+            "data": [{"embedding": vec![0.1_f64; native_dim]}]
+        });
+
+        let embedding = LlamaCppEmbedding::parse_llamacpp_response(response, DEFAULT_EMBEDDING_DIM)
+            .expect("Failed to parse embedding");
+        assert_eq!(embedding.as_vec().len(), DEFAULT_EMBEDDING_DIM);
+        let norm: f32 = embedding.as_vec().iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "expected renormalized unit vector, got norm {norm}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_llamacpp_rejects_undersized_response() {
+        let response = serde_json::json!({
+            "data": [{"embedding": vec![0.1_f64; 100]}]
+        });
+        let err = LlamaCppEmbedding::parse_llamacpp_response(response, DEFAULT_EMBEDDING_DIM)
+            .expect_err("response narrower than expected_dimension must be rejected");
+        assert!(err.to_string().contains("need at least"));
     }
 }

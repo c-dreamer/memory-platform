@@ -1,6 +1,7 @@
 //! MCP module — Model Context Protocol stdio server.
 //!
-//! Implements JSON-RPC 2.0 over stdin/stdout with 18 tools.
+//! Implements JSON-RPC 2.0 over stdin/stdout with 22 tools plus a small
+//! read-only resources surface (`memory://...` URIs).
 //! Logs to stderr via `tracing` (stdout is protocol-only).
 
 use std::sync::Arc;
@@ -8,15 +9,17 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::AppState;
 
 /// Maximum line size accepted on stdin (10 MiB).
 const MAX_LINE_SIZE: usize = 10 * 1024 * 1024;
-/// Read timeout on stdin. Long-running calls remain pollable without the MCP
-/// process being torn down prematurely.
+/// Read timeout for the feature-gated HTTP transport (`transport.rs`) only —
+/// the default stdio `listen` loop below has no read timeout, since that pipe
+/// is expected to sit idle between tool calls for the life of the client
+/// session.
+#[cfg_attr(not(feature = "transport-http"), allow(dead_code))]
 pub const STDIN_TIMEOUT_SECS: u64 = 900;
 
 // ---------------------------------------------------------------------------
@@ -35,6 +38,7 @@ pub const ERROR_INVALID_PARAMS: i64 = -32602;
 pub const ERROR_INTERNAL_ERROR: i64 = -32603;
 
 mod hooks;
+mod resources;
 mod tools;
 #[cfg(feature = "transport-http")]
 pub mod transport;
@@ -70,12 +74,15 @@ impl McpServer {
         loop {
             line.clear();
 
-            let bytes_read = timeout(
-                Duration::from_secs(STDIN_TIMEOUT_SECS),
-                reader.read_line(&mut line),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("stdin read timed out after {STDIN_TIMEOUT_SECS}s"))??;
+            // No read timeout here: this pipe belongs to the client session for
+            // its whole lifetime, and idle gaps between tool calls (minutes to
+            // hours in normal agent use) are expected, not exceptional. A
+            // timeout that tears down the process on idle would surface to the
+            // client as a "transport closed" error on its next call even
+            // though nothing went wrong. Real disconnects arrive as bytes_read
+            // == 0 (EOF) below, which the OS delivers promptly once the
+            // client's end of the pipe actually closes.
+            let bytes_read = reader.read_line(&mut line).await?;
 
             if bytes_read == 0 {
                 // EOF
@@ -174,8 +181,16 @@ impl McpServer {
                     "jsonrpc": "2.0",
                 }))
             }
+            "ping" => Ok(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {},
+            })),
             "tools/list" => Ok(self.handle_tools_list(id)),
             "tools/call" => self.handle_tools_call(id, params).await,
+            "resources/list" => Ok(self.handle_resources_list(id)),
+            "resources/templates/list" => Ok(self.handle_resource_templates_list(id)),
+            "resources/read" => self.handle_resources_read(id, params).await,
             _ => Ok(json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -193,10 +208,8 @@ impl McpServer {
             "result": {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {
-                    "tools": {
-                        "list": true,
-                        "call": true,
-                    },
+                    "tools": {},
+                    "resources": {},
                 },
                 "serverInfo": {
                     "name": "memory-mcp",
@@ -224,10 +237,13 @@ impl McpServer {
 
     /// Handle "tools/call" method.
     async fn handle_tools_call(&self, id: Value, params: Value) -> Result<Value> {
-        let name = params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'name' in tools/call params"))?;
+        let Some(name) = params.get("name").and_then(|v| v.as_str()) else {
+            return Ok(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": ERROR_INVALID_PARAMS, "message": "Missing 'name' in tools/call params"},
+            }));
+        };
         let arguments = params
             .get("arguments")
             .cloned()
@@ -252,7 +268,76 @@ impl McpServer {
                     "id": id,
                     "result": {
                         "content": [{"type": "text", "text": json!({"error": format!("{e:#}")}).to_string()}],
+                        "isError": true,
                     },
+                }))
+            }
+        }
+    }
+
+    /// Handle "resources/list" method.
+    fn handle_resources_list(&self, id: Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "resources": resources::list_resources(),
+            },
+        })
+    }
+
+    /// Handle "resources/templates/list" method.
+    fn handle_resource_templates_list(&self, id: Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "resourceTemplates": resources::list_resource_templates(),
+            },
+        })
+    }
+
+    /// Handle "resources/read" method.
+    async fn handle_resources_read(&self, id: Value, params: Value) -> Result<Value> {
+        let Some(uri) = params.get("uri").and_then(|v| v.as_str()) else {
+            return Ok(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": ERROR_INVALID_PARAMS, "message": "Missing 'uri' in resources/read params"},
+            }));
+        };
+        let uri = uri.to_string();
+
+        match resources::read_resource(&self.state, &uri).await {
+            Ok(content) => Ok(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "contents": [{
+                        "uri": uri,
+                        "mimeType": "application/json",
+                        "text": content.to_string(),
+                    }],
+                },
+            })),
+            Err(e) => {
+                warn!("Resource read failed: {e:#}");
+                // Distinguish a client-caused error (unknown/malformed URI, a
+                // bail!() in resources.rs) from a server-caused one (a wrapped
+                // sqlx failure) so the client doesn't see a DB outage reported
+                // as "you sent an invalid request".
+                let is_db_error = e
+                    .chain()
+                    .any(|cause| cause.downcast_ref::<sqlx::Error>().is_some());
+                let code = if is_db_error {
+                    ERROR_INTERNAL_ERROR
+                } else {
+                    ERROR_INVALID_PARAMS
+                };
+                Ok(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": code, "message": format!("{e:#}")},
                 }))
             }
         }
@@ -278,6 +363,7 @@ mod tests {
             experience_service: None,
             ingestion_service: None,
             procedure_service: None,
+            pending_writes: Arc::new(crate::queue::PendingWriteQueue::new_empty()),
         })
     }
 
@@ -317,7 +403,92 @@ mod tests {
 
         let tools = response["result"]["tools"].as_array().unwrap();
         assert!(!tools.is_empty(), "Should return non-empty tools list");
-        assert_eq!(tools.len(), 18, "Should return exactly 18 tools");
+        assert_eq!(tools.len(), 22, "Should return exactly 22 tools");
+    }
+
+    #[tokio::test]
+    async fn test_handle_resources_list() {
+        let state = minimal_state();
+        let server = McpServer::new(state);
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "resources/list",
+            "params": {},
+        });
+
+        let response = server.handle_request(request).await.unwrap();
+        assert_eq!(response["id"], 1);
+        let resources = response["result"]["resources"].as_array().unwrap();
+        assert_eq!(
+            resources.len(),
+            3,
+            "Should return exactly 3 static resources"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_resource_templates_list() {
+        let state = minimal_state();
+        let server = McpServer::new(state);
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "resources/templates/list",
+            "params": {},
+        });
+
+        let response = server.handle_request(request).await.unwrap();
+        assert_eq!(response["id"], 1);
+        let templates = response["result"]["resourceTemplates"].as_array().unwrap();
+        assert_eq!(
+            templates.len(),
+            2,
+            "Should return exactly 2 resource templates"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_resources_read_missing_uri() {
+        let state = minimal_state();
+        let server = McpServer::new(state);
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "resources/read",
+            "params": {},
+        });
+
+        let response = server.handle_request(request).await.unwrap();
+        assert_eq!(response["id"], 1);
+        assert_eq!(
+            response["error"]["code"], ERROR_INVALID_PARAMS,
+            "Missing uri should surface as a JSON-RPC -32602 error, not -32603"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_resources_read_unknown_uri() {
+        let state = minimal_state();
+        let server = McpServer::new(state);
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "resources/read",
+            "params": {"uri": "memory://nonsense"},
+        });
+
+        let response = server.handle_request(request).await.unwrap();
+        assert_eq!(response["id"], 1);
+        assert!(
+            response.get("error").is_some(),
+            "Unknown resource URI should return a JSON-RPC error, not a hard failure"
+        );
+        assert_eq!(response["error"]["code"], ERROR_INVALID_PARAMS);
     }
 
     #[tokio::test]
@@ -376,8 +547,12 @@ mod tests {
             "params": {"arguments": {}},
         });
 
-        let result = server.handle_request(request).await;
-        assert!(result.is_err(), "Should error on missing tool name");
+        let response = server.handle_request(request).await.unwrap();
+        assert_eq!(response["id"], 1);
+        assert_eq!(
+            response["error"]["code"], ERROR_INVALID_PARAMS,
+            "Missing tool name should surface as a JSON-RPC -32602 error, not -32603"
+        );
     }
 
     #[tokio::test]
@@ -403,6 +578,10 @@ mod tests {
             content_str.contains("Unknown tool"),
             "Should mention unknown tool"
         );
+        assert_eq!(
+            response["result"]["isError"], true,
+            "A failed tool call must be flagged isError so clients don't read it as a success"
+        );
     }
 
     #[tokio::test]
@@ -416,7 +595,9 @@ mod tests {
         assert_eq!(response["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(response["result"]["serverInfo"]["name"], "memory-mcp");
         assert_eq!(response["result"]["serverInfo"]["version"], "2.0.0");
-        assert!(response["result"]["capabilities"]["tools"]["list"] == true);
-        assert!(response["result"]["capabilities"]["tools"]["call"] == true);
+        assert!(response["result"]["capabilities"].get("tools").is_some());
+        assert!(response["result"]["capabilities"]
+            .get("resources")
+            .is_some());
     }
 }

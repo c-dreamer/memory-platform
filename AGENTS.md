@@ -13,6 +13,12 @@
 
 - `./sync-to-neon.sh run` is the normal operation. It uses `neon-sync`, a Rust
   outbox synchronizer, not `pg_dump`, Docker, or OrbStack.
+- The sync target is any Postgres-compatible database with pgvector, not only
+  Neon — Supabase and a self-hosted VPS Postgres both work. Set
+  `SYNC_TARGET_URL` (provider-neutral name; `NEON_SYNC_URL`/`NEON_DIRECT`
+  still work for existing Neon setups) to its direct, non-pooled endpoint.
+  `neon-sync` rejects known pooler hostnames/ports for Neon, Supabase, and
+  PgBouncer at startup — see `.env.example`.
 - `reconcile` fetches complete local and Neon inventories before changing live
   data. It archives stale/conflicting Neon rows in `sync_meta.archive`, removes
   them from the live mirror, and queues only missing or mismatched local rows.
@@ -69,3 +75,31 @@
 - `scripts/verify-memory-archive.sh` is safe for scheduled use: it checks the
   mounted Drive bundle files, checksums, archive ledger, tiers, and queue depth,
   but never creates, archives, restores, or compacts records.
+
+## Windows MCP Client Configuration
+
+Every agent below points its "command" at the wrapper, never at `mcp-server.exe`
+directly and never at a bare secret — same rule as macOS/Linux. On Windows the
+wrapper is `scripts/mcp-transport-guard.ps1` (ported from
+`scripts/mcp-transport-guard.sh`; same PID registry/log-then-launch behavior,
+`Get-Process -Id` instead of `kill -0`, `icacls` instead of `chmod`). Since `.ps1`
+isn't directly executable from a JSON `command` field, every config invokes it
+through `powershell.exe -File`.
+
+| Agent | Config path | Command / notes |
+|---|---|---|
+| Claude Code | project `.mcp.json` | `{"mcpServers":{"memory-platform":{"command":"powershell.exe","args":["-NoProfile","-ExecutionPolicy","Bypass","-File","<repo>\\scripts\\mcp-transport-guard.ps1"]}}}` |
+| Codex CLI | `~/.codex/config.toml` | `[mcp_servers.memory-platform]` with the same `command`/`args` shape |
+| OpenCode | its own `mcpServers` block | same shape as Claude Code |
+| Cursor | `%USERPROFILE%\.cursor\mcp.json` | there is an open, unresolved Windows-11-specific community report of project-level config not working (forum.cursor.com/t/.../62182) — smoke-test before documenting as supported on a given box |
+| Windsurf | `%USERPROFILE%\.codeium\windsurf\mcp_config.json` | same `command`/`args` shape |
+| Zed | `%APPDATA%\Zed\settings.json`, `context_servers`, `"source":"custom"` | stdio only, no remote HTTP support at all |
+| VS Code / Copilot | `.vscode/mcp.json` or `~/.copilot/mcp-config.json` | confirm which surface is actually active in the installed VS Code build before documenting both |
+
+The MCP client itself forwards only a small allowlist of environment variables
+to the stdio subprocess — on Windows: `APPDATA`, `HOMEDRIVE`, `HOMEPATH`,
+`LOCALAPPDATA`, `PATH`, `PATHEXT`, `PROCESSOR_ARCHITECTURE`, `SYSTEMDRIVE`,
+`SYSTEMROOT`, `TEMP`, `USERNAME`, `USERPROFILE` — never `DATABASE_URL` or any
+other secret. `mcp-transport-guard.ps1` must keep sourcing the protected
+per-device environment file itself; if that file goes missing, the server must
+fail loudly (`missing_environment`, exit 78), not start silently DB-less.

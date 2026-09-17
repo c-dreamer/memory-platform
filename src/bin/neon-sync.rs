@@ -20,7 +20,7 @@ use sqlx::{
 };
 use uuid::Uuid;
 
-use memory_platform::config::local_only_enabled;
+use memory_platform::config::{local_only_enabled, CLOUD_DEFAULT_EMBEDDING_MODEL};
 use memory_platform::migrations::Migrator;
 
 const DEFAULT_BATCH_ROWS: usize = 25;
@@ -43,7 +43,10 @@ struct Cli {
     /// Local authoritative PostgreSQL URL. Reads LOCAL_URL then DATABASE_URL.
     #[arg(long, env = "LOCAL_URL")]
     local_url: Option<String>,
-    /// Neon direct PostgreSQL URL. Reads NEON_SYNC_URL, then NEON_DIRECT.
+    /// Sync target direct PostgreSQL URL — any Postgres-compatible database
+    /// (Neon, Supabase, a self-hosted VPS with pgvector). Reads
+    /// NEON_SYNC_URL via clap's env binding; `urls()` also accepts the
+    /// provider-neutral SYNC_TARGET_URL and the legacy NEON_DIRECT.
     #[arg(long, env = "NEON_SYNC_URL")]
     neon_url: Option<String>,
 }
@@ -80,6 +83,11 @@ enum Command {
     ResetTarget {
         #[arg(long)]
         confirm_neon_reset: bool,
+    },
+    /// One-time: declare which project (work|personal) this Neon database is for.
+    SetScope {
+        /// "work" or "personal".
+        scope: String,
     },
 }
 
@@ -261,26 +269,46 @@ fn urls(cli: &Cli) -> Result<(String, String)> {
         .clone()
         .or_else(|| env::var("DATABASE_URL").ok())
         .ok_or_else(|| anyhow!("LOCAL_URL or DATABASE_URL is required"))?;
-    let neon = cli
+    // SYNC_TARGET_URL is the provider-neutral name: this target is any
+    // Postgres-compatible database (Neon, Supabase, a self-hosted VPS with
+    // pgvector) — the NEON_* names are kept only for existing setups.
+    let target = cli
         .neon_url
         .clone()
+        .or_else(|| env::var("SYNC_TARGET_URL").ok())
         .or_else(|| env::var("NEON_DIRECT").ok())
         .or_else(|| env::var("NEON_SYNC_URL").ok())
-        .ok_or_else(|| anyhow!("NEON_SYNC_URL or NEON_DIRECT is required"))?;
-    if neon.contains("-pooler") {
-        bail!("NEON_SYNC_URL must be a direct endpoint; refusing to rewrite a pooler URL")
+        .ok_or_else(|| anyhow!("SYNC_TARGET_URL, NEON_SYNC_URL, or NEON_DIRECT is required"))?;
+    // Reject known transaction-pooler endpoints: they don't preserve the
+    // session state (prepared statements, session-level timeouts) this sync
+    // relies on for idempotent replay. Neon's poolers put "-pooler" in the
+    // hostname; Supabase's put "pooler.supabase." in the hostname and
+    // default to port 6543; a self-hosted PgBouncer commonly listens on
+    // 6432. Best-effort, not a guarantee — an unusual custom setup can slip
+    // past this.
+    let looks_pooled = target.contains("-pooler")
+        || target.contains("pooler.supabase.")
+        || target.contains(":6543")
+        || target.contains(":6432");
+    if looks_pooled {
+        bail!(
+            "sync target URL looks like a connection-pooler endpoint; use the direct/session \
+             endpoint instead (required for prepared statements and session-level timeouts \
+             during replay)"
+        )
     }
-    Ok((local, neon))
+    Ok((local, target))
 }
 
-async fn connect(url: &str, label: &str) -> Result<PgPool> {
+async fn connect(url: &str, label: &str, is_sync_target: bool) -> Result<PgPool> {
     let mut options = url
         .parse::<PgConnectOptions>()
         .context("invalid PostgreSQL URL")?;
-    if label == "Neon" {
-        // Enforce the same bound inside PostgreSQL. If a network response is
-        // lost after a write, Neon closes the idle transaction and the local
-        // outbox replays the idempotent batch on the next connection.
+    if is_sync_target {
+        // Enforce the same bound inside Postgres, regardless of provider. If
+        // a network response is lost after a write, the target closes the
+        // idle transaction and the local outbox replays the idempotent
+        // batch on the next connection.
         options = options.options([
             ("statement_timeout", "20s"),
             ("idle_in_transaction_session_timeout", "25s"),
@@ -518,12 +546,42 @@ async fn push_event_batch(local: &PgPool, neon: &PgPool, lease: &TargetLease) ->
     if rows.is_empty() {
         return Ok(0);
     }
+
+    // Category scope-in/out (documents only, MEMORY_SYNC_INCLUDE/EXCLUDE):
+    // excluded rows are stamped pushed_at locally without ever reaching
+    // Neon, so they stop blocking later allowed rows from this same
+    // chronological window on the next run.
+    let include = env_list("MEMORY_SYNC_INCLUDE");
+    let exclude = env_list("MEMORY_SYNC_EXCLUDE");
+    let mut to_push = Vec::new();
+    let mut skip_ids = Vec::new();
+    for row in &rows {
+        let table_name: String = row.try_get(3)?;
+        let payload: Value = row.try_get(6)?;
+        if include.is_empty() && exclude.is_empty()
+            || category_allowed(&table_name, &payload, &include, &exclude)
+        {
+            to_push.push(row);
+        } else {
+            skip_ids.push(row.try_get::<Uuid, _>(0)?);
+        }
+    }
+    if !skip_ids.is_empty() {
+        sqlx::query("UPDATE sync_meta.events SET pushed_at=now() WHERE event_id = ANY($1)")
+            .bind(&skip_ids)
+            .execute(local)
+            .await?;
+    }
+    if to_push.is_empty() {
+        return Ok(0);
+    }
+
     renew_target_lease(neon, lease).await?;
     let mut tx = neon.begin().await?;
     // A lost response after Neon accepts an event must not leave this worker
     // waiting for the operating system's TCP timeout. Events are idempotent,
     // so the guarded writes and commit below can safely be retried.
-    for row in &rows {
+    for row in &to_push {
         tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
             "INSERT INTO sync_meta.events(event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at,received_at) \
              VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now()) ON CONFLICT(event_id) DO NOTHING"
@@ -545,7 +603,7 @@ async fn push_event_batch(local: &PgPool, neon: &PgPool, lease: &TargetLease) ->
     tokio::time::timeout(QUERY_TIMEOUT, tx.commit())
         .await
         .map_err(|_| anyhow!("Neon event commit timed out"))??;
-    let ids: Vec<Uuid> = rows
+    let ids: Vec<Uuid> = to_push
         .iter()
         .map(|r| r.try_get(0))
         .collect::<std::result::Result<_, _>>()?;
@@ -553,7 +611,7 @@ async fn push_event_batch(local: &PgPool, neon: &PgPool, lease: &TargetLease) ->
         .bind(ids)
         .execute(local)
         .await?;
-    Ok(rows.len())
+    Ok(to_push.len())
 }
 
 async fn push_events(local: &PgPool, neon: &PgPool, lease: &TargetLease) -> Result<usize> {
@@ -596,18 +654,23 @@ async fn apply_remote_event(local: &PgPool, table: &str, key: &str, payload: &Va
 }
 
 async fn pull_events(local: &PgPool, neon: &PgPool) -> Result<usize> {
-    let cursor_time: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-        "SELECT (cursor_value->>'created_at')::timestamptz FROM sync_meta.cursors WHERE cursor_name='neon_pull'"
-    ).fetch_optional(local).await?;
-    let cursor_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT (cursor_value->>'event_id')::uuid FROM sync_meta.cursors WHERE cursor_name='neon_pull'"
-    ).fetch_optional(local).await?;
+    // neon_seq (migration 013) is Neon's own commit-order sequence, assigned
+    // by nextval() inside push_event_batch's lease-serialized transaction —
+    // unlike (created_at,event_id), a device whose clock lags can no longer
+    // cause a permanent skip. A cursor row written before this migration has
+    // no 'neon_seq' key; COALESCE treats that the same as no cursor at all,
+    // causing one safe, idempotent full re-pull (ON CONFLICT DO NOTHING plus
+    // the inserted==1 guard below mean already-known events are never
+    // reapplied to source tables).
+    let cursor_seq: i64 = sqlx::query_scalar(
+        "SELECT COALESCE((cursor_value->>'neon_seq')::bigint, 0) FROM sync_meta.cursors WHERE cursor_name='neon_pull'"
+    ).fetch_optional(local).await?.unwrap_or(0);
     let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
-        "SELECT event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at \
-         FROM sync_meta.events WHERE (created_at,event_id) > (COALESCE($1, '-infinity'::timestamptz),COALESCE($2,'00000000-0000-0000-0000-000000000000'::uuid)) ORDER BY created_at,event_id LIMIT $3"
-    ).bind(cursor_time).bind(cursor_id).bind(DEFAULT_BATCH_ROWS as i64).fetch_all(neon))
+        "SELECT event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at,neon_seq \
+         FROM sync_meta.events WHERE neon_seq > $1 ORDER BY neon_seq LIMIT $2"
+    ).bind(cursor_seq).bind(DEFAULT_BATCH_ROWS as i64).fetch_all(neon))
         .await.map_err(|_| anyhow!("remote event read timed out"))??;
-    let mut newest = cursor_time.zip(cursor_id);
+    let mut newest = cursor_seq;
     let mut imported = 0;
     for row in rows {
         let event_id: Uuid = row.try_get(0)?;
@@ -616,9 +679,9 @@ async fn pull_events(local: &PgPool, neon: &PgPool) -> Result<usize> {
             .bind(row.try_get::<String,_>(3)?).bind(row.try_get::<String,_>(4)?).bind(row.try_get::<String,_>(5)?)
             .bind(row.try_get::<Value,_>(6)?).bind(row.try_get::<String,_>(7)?).bind(row.try_get::<Option<Uuid>,_>(8)?)
             .bind(row.try_get::<chrono::DateTime<chrono::Utc>,_>(9)?).execute(local).await?.rows_affected();
-        let created: chrono::DateTime<chrono::Utc> = row.try_get(9)?;
-        if newest.map_or(true, |current| (created, event_id) > current) {
-            newest = Some((created, event_id));
+        let seq: i64 = row.try_get(10)?;
+        if seq > newest {
+            newest = seq;
         }
         if inserted == 1 {
             let operation: String = row.try_get(5)?;
@@ -634,9 +697,9 @@ async fn pull_events(local: &PgPool, neon: &PgPool) -> Result<usize> {
             imported += 1;
         }
     }
-    if let Some((created_at, event_id)) = newest {
-        sqlx::query("INSERT INTO sync_meta.cursors(cursor_name,cursor_value) VALUES('neon_pull',jsonb_build_object('created_at',$1,'event_id',$2)) ON CONFLICT(cursor_name) DO UPDATE SET cursor_value=EXCLUDED.cursor_value,updated_at=now()")
-            .bind(created_at).bind(event_id).execute(local).await?;
+    if newest > cursor_seq {
+        sqlx::query("INSERT INTO sync_meta.cursors(cursor_name,cursor_value) VALUES('neon_pull',jsonb_build_object('neon_seq',$1)) ON CONFLICT(cursor_name) DO UPDATE SET cursor_value=EXCLUDED.cursor_value,updated_at=now()")
+            .bind(newest).execute(local).await?;
     }
     Ok(imported)
 }
@@ -655,18 +718,22 @@ async fn archive_and_delete_many(
     let column = quote_ident(spec.key);
     let mut tx = neon.begin().await?;
     let archive_sql = format!("INSERT INTO sync_meta.archive(run_id,table_name,record_key,row_data,reason) SELECT $1,$2,{column}::text,to_jsonb(t),$4 FROM public.{table} t WHERE {column}::text = ANY($3)");
-    tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(&archive_sql)
-        .bind(run_id)
-        .bind(spec.name)
-        .bind(keys)
-        .bind(reason)
-        .execute(&mut *tx))
+    tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query(&archive_sql)
+            .bind(run_id)
+            .bind(spec.name)
+            .bind(keys)
+            .bind(reason)
+            .execute(&mut *tx),
+    )
     .await
     .map_err(|_| anyhow!("Neon archive write timed out"))??;
     let delete_sql = format!("DELETE FROM public.{table} WHERE {column}::text = ANY($1)");
-    tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(&delete_sql)
-        .bind(keys)
-        .execute(&mut *tx))
+    tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query(&delete_sql).bind(keys).execute(&mut *tx),
+    )
     .await
     .map_err(|_| anyhow!("Neon archive delete timed out"))??;
     tokio::time::timeout(QUERY_TIMEOUT, tx.commit())
@@ -752,8 +819,9 @@ async fn apply_batch(
     let insert = format!("INSERT INTO public.{table} SELECT (jsonb_populate_record(NULL::public.{table}, $1)).* ON CONFLICT ({key}) DO UPDATE SET {}", updates.join(","));
     let vector_sql = format!("UPDATE public.{table} SET embedding=$1::vector WHERE {key}::text=$2");
     let mut tx = neon.begin().await?;
-    tokio::time::timeout(QUERY_TIMEOUT, sqlx::query("SET LOCAL memory.sync_replay='on'")
-        .execute(&mut *tx)
+    tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query("SET LOCAL memory.sync_replay='on'").execute(&mut *tx),
     )
     .await
     .map_err(|_| anyhow!("Neon sync transaction setup timed out"))??;
@@ -768,34 +836,44 @@ async fn apply_batch(
                      SELECT $1,$2,{key}::text,to_jsonb(t),'natural-key-conflict-replaced-by-local' \
                      FROM public.{table} t WHERE {natural}=$3 AND {key}::text <> $4"
                 );
-                tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(&archive)
-                    .bind(run_id)
-                    .bind(spec.name)
-                    .bind(value)
-                    .bind(&row.key)
-                    .execute(&mut *tx))
+                tokio::time::timeout(
+                    QUERY_TIMEOUT,
+                    sqlx::query(&archive)
+                        .bind(run_id)
+                        .bind(spec.name)
+                        .bind(value)
+                        .bind(&row.key)
+                        .execute(&mut *tx),
+                )
                 .await
                 .map_err(|_| anyhow!("Neon conflict archive timed out"))??;
                 let delete =
                     format!("DELETE FROM public.{table} WHERE {natural}=$1 AND {key}::text <> $2");
-                tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(&delete)
-                    .bind(value)
-                    .bind(&row.key)
-                    .execute(&mut *tx))
+                tokio::time::timeout(
+                    QUERY_TIMEOUT,
+                    sqlx::query(&delete)
+                        .bind(value)
+                        .bind(&row.key)
+                        .execute(&mut *tx),
+                )
                 .await
                 .map_err(|_| anyhow!("Neon conflict delete timed out"))??;
             }
         }
-        tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(&insert)
-            .bind(&row.data)
-            .execute(&mut *tx))
+        tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query(&insert).bind(&row.data).execute(&mut *tx),
+        )
         .await
         .map_err(|_| anyhow!("Neon projection write timed out"))??;
         if let Some(vector) = &row.vector {
-            tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(&vector_sql)
-                .bind(vector)
-                .bind(&row.key)
-                .execute(&mut *tx))
+            tokio::time::timeout(
+                QUERY_TIMEOUT,
+                sqlx::query(&vector_sql)
+                    .bind(vector)
+                    .bind(&row.key)
+                    .execute(&mut *tx),
+            )
             .await
             .map_err(|_| anyhow!("Neon vector write timed out"))??;
         }
@@ -1064,14 +1142,24 @@ async fn rebuild_derived(local: &PgPool, neon: &PgPool) -> Result<()> {
     sqlx::raw_sql("TRUNCATE public.embeddings; INSERT INTO public.embeddings(id,source_table,source_id,embedding,model,dimension,created_at) SELECT m.id,m.source_table,m.source_id, CASE m.source_table WHEN 'documents' THEN d.embedding WHEN 'memories' THEN me.embedding WHEN 'experiences' THEN e.embedding END, m.model,m.dimension,m.created_at FROM sync_meta.embedding_manifest m LEFT JOIN public.documents d ON m.source_table='documents' AND d.id=m.source_id LEFT JOIN public.memories me ON m.source_table='memories' AND me.id=m.source_id LEFT JOIN public.experiences e ON m.source_table='experiences' AND e.id=m.source_id WHERE CASE m.source_table WHEN 'documents' THEN d.embedding IS NOT NULL WHEN 'memories' THEN me.embedding IS NOT NULL WHEN 'experiences' THEN e.embedding IS NOT NULL ELSE false END;").execute(&mut *tx).await?;
     for row in manifest {
         let source_table: String = row.try_get(1)?;
-        if matches!(
-            source_table.as_str(),
-            "documents" | "memories" | "experiences"
-        ) {
+        let model: Option<String> = row.try_get(3)?;
+        let is_cloud_default_model = match model.as_deref() {
+            None => true,
+            Some(m) => m == CLOUD_DEFAULT_EMBEDDING_MODEL,
+        };
+        if is_cloud_default_model
+            && matches!(
+                source_table.as_str(),
+                "documents" | "memories" | "experiences"
+            )
+        {
             continue;
         }
-        // Future source types retain their authoritative cache vector rather
-        // than being silently dropped by the known-source reconstruction.
+        // Future source types, and any non-cloud-default model (e.g. a local
+        // llama.cpp embedding) for these three tables, retain their
+        // authoritative cache vector rather than being silently dropped by
+        // the known-source reconstruction above, which only ever reads the
+        // *current* value of the source table's own embedding column.
         let vector = vector_from_text(&row.try_get::<String, _>(6)?)?;
         sqlx::query("INSERT INTO public.embeddings(id,source_table,source_id,embedding,model,dimension,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)")
             .bind(row.try_get::<Uuid,_>(0)?)
@@ -1216,8 +1304,9 @@ async fn main() -> Result<()> {
     }
     let cli = Cli::parse();
     let (local_url, neon_url) = urls(&cli)?;
-    let local = connect(&local_url, "local PostgreSQL").await?;
-    let neon = connect(&neon_url, "Neon").await?;
+    let local = connect(&local_url, "local PostgreSQL", false).await?;
+    let neon = connect(&neon_url, "sync target", true).await?;
+    check_scope_agreement(&neon).await?;
     match cli.command {
         Command::Status => status(&local, &neon).await,
         Command::Health => health(&local, &neon).await,
@@ -1282,7 +1371,101 @@ async fn main() -> Result<()> {
             println!("Neon target reset; run neon-sync reconcile next");
             Ok(())
         }
+        Command::SetScope { scope } => {
+            if scope != "work" && scope != "personal" {
+                bail!("scope must be 'work' or 'personal', got '{scope}'");
+            }
+            sqlx::query("INSERT INTO sync_meta.scope(singleton,scope) VALUES(true,$1) ON CONFLICT(singleton) DO UPDATE SET scope=EXCLUDED.scope,set_at=now()")
+                .bind(&scope)
+                .execute(&neon)
+                .await
+                .context("failed to set Neon project scope (has `neon-sync migrate` been run yet?)")?;
+            println!("Neon project scope set to '{scope}'");
+            Ok(())
+        }
     }
+}
+
+/// Refuses to run when `MEMORY_SCOPE` disagrees with the Neon-side marker
+/// (`sync_meta.scope`, migration 014). A no-op when `MEMORY_SCOPE` is unset —
+/// zero behavior change for existing deployments — and when the marker
+/// hasn't been set yet (`neon-sync set-scope` not run, or table not yet
+/// migrated), since there is nothing to disagree with.
+async fn check_scope_agreement(neon: &PgPool) -> Result<()> {
+    let Ok(local_scope) = env::var("MEMORY_SCOPE") else {
+        return Ok(());
+    };
+    if local_scope.is_empty() {
+        return Ok(());
+    }
+    if local_scope != "work" && local_scope != "personal" {
+        bail!("MEMORY_SCOPE must be 'work' or 'personal', got '{local_scope}'");
+    }
+    let remote_scope: Option<String> =
+        match sqlx::query_scalar("SELECT scope FROM sync_meta.scope WHERE singleton")
+            .fetch_optional(neon)
+            .await
+        {
+            Ok(v) => v,
+            // undefined_table: sync_meta.scope hasn't been migrated/set yet.
+            Err(sqlx::Error::Database(ref db_err)) if db_err.code().as_deref() == Some("42P01") => {
+                None
+            }
+            Err(e) => return Err(e.into()),
+        };
+    if let Some(remote_scope) = remote_scope {
+        if remote_scope != local_scope {
+            bail!(
+                "MEMORY_SCOPE={local_scope} but this Neon project is scoped '{remote_scope}' \
+                 (see `neon-sync set-scope`) — refusing to run"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Comma-separated env var into a trimmed, non-empty list. Empty/unset means
+/// no restriction — matches this feature's default-off requirement.
+fn env_list(name: &str) -> Vec<String> {
+    env::var(name)
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Category scope-in/out for `documents`, keyed on `vault_section` (the one
+/// synced table with an existing scope-shaped column — see
+/// docs/WINDOWS_PORT_SYNTHESIS.md §8 Q5). Every other table is unaffected.
+/// An empty include list means no allowlist restriction; a row with no
+/// `vault_section` is excluded once an allowlist is configured, since it
+/// can't be proven safe to send.
+fn category_allowed(
+    table_name: &str,
+    payload: &Value,
+    include: &[String],
+    exclude: &[String],
+) -> bool {
+    if table_name != "documents" {
+        return true;
+    }
+    let section = payload.get("vault_section").and_then(|v| v.as_str());
+    if !include.is_empty() {
+        match section {
+            Some(s) if include.iter().any(|i| i == s) => {}
+            _ => return false,
+        }
+    }
+    if let Some(s) = section {
+        if exclude.iter().any(|e| e == s) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1306,5 +1489,50 @@ mod tests {
     #[test]
     fn table_order_has_no_derived_cache() {
         assert!(!TABLES.iter().any(|table| table.name == "embeddings"));
+    }
+
+    fn cli_with_target(url: &str) -> Cli {
+        Cli {
+            command: Command::Status,
+            local_url: Some("postgres://local/db".into()),
+            neon_url: Some(url.into()),
+        }
+    }
+
+    #[test]
+    fn urls_rejects_neon_pooler_hostname() {
+        let cli = cli_with_target(
+            "postgres://user:pw@ep-old-tree-12345-pooler.us-east-2.aws.neon.tech/db",
+        );
+        assert!(urls(&cli).is_err());
+    }
+
+    #[test]
+    fn urls_rejects_supabase_pooler_hostname() {
+        let cli =
+            cli_with_target("postgres://user:pw@aws-0-us-east-1.pooler.supabase.com:5432/postgres");
+        assert!(urls(&cli).is_err());
+    }
+
+    #[test]
+    fn urls_rejects_common_pooler_ports() {
+        for port in ["6543", "6432"] {
+            let cli = cli_with_target(&format!(
+                "postgres://user:pw@db.example.com:{port}/postgres"
+            ));
+            assert!(urls(&cli).is_err(), "port {port} should be rejected");
+        }
+    }
+
+    #[test]
+    fn urls_accepts_direct_endpoint_any_provider() {
+        for url in [
+            "postgres://user:pw@ep-old-tree-12345.us-east-2.aws.neon.tech:5432/db",
+            "postgres://user:pw@db.abcxyz.supabase.co:5432/postgres",
+            "postgres://user:pw@my-vps.example.com:5432/memory",
+        ] {
+            let cli = cli_with_target(url);
+            assert!(urls(&cli).is_ok(), "url {url} should be accepted");
+        }
     }
 }

@@ -7,8 +7,10 @@ use std::sync::Arc;
 use memory_platform::config::Config;
 use memory_platform::db::postgres::PostgresDb;
 use memory_platform::mcp;
+use memory_platform::queue::PendingWriteQueue;
 use memory_platform::search::SearchEngine;
 use memory_platform::services::context::ContextService;
+use memory_platform::services::contradiction::ContradictionDetector;
 use memory_platform::services::decay::DecayEngine;
 use memory_platform::services::embedding::{
     EmbeddingConfig, EmbeddingService, EmbeddingServiceFactory,
@@ -32,8 +34,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Connect to PostgreSQL, but keep the MCP server alive in degraded mode if
     // the database is temporarily unreachable. Codex can still complete the
-    // handshake and use any tools that do not need live storage.
-    let db = match PostgresDb::connect(config.as_ref()).await {
+    // handshake and use any tools that do not need live storage. A short
+    // bounded retry rides out a transient blip (e.g. the DB service still
+    // starting) without stalling the MCP handshake the way main.rs's much
+    // longer supervised-daemon retry would.
+    let db = match connect_with_short_retry(config.as_ref()).await {
         Ok(db) => {
             tracing::info!("Connected to PostgreSQL");
             let db = Arc::new(db);
@@ -69,6 +74,8 @@ async fn main() -> anyhow::Result<()> {
             nvidia_api_url: Some(config.nvidia_api_url.clone()),
             nvidia_api_key: Some(config.nvidia_api_key.clone()),
             nvidia_embedding_model: config.nvidia_embedding_model.clone(),
+            llama_cpp_url: config.llama_cpp_url.clone(),
+            llama_cpp_model_name: config.llama_cpp_model_name.clone(),
             expected_dimension: config.embedding_dim,
             cache_size: config.embedding_cache_size,
         };
@@ -103,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let context_service = Arc::new(ContextService::new(pool.clone(), Arc::clone(&search)));
+    let contradiction_detector = Arc::new(ContradictionDetector::new(pool.clone()));
     let decay_engine = Arc::new(DecayEngine::new(Arc::clone(&config)));
     let experience_service = Arc::new(ExperienceService::new(
         pool.clone(),
@@ -110,6 +118,24 @@ async fn main() -> anyhow::Result<()> {
         embedding_service.clone(),
     ));
     let procedure_service = Arc::new(ProcedureService::new(pool.clone()));
+
+    // This binary tolerates a degraded start (see the PostgreSQL match
+    // above), so the pending-writes queue gets the same treatment: try the
+    // real on-disk queue, fall back to an unopened in-memory placeholder
+    // rather than failing the whole MCP session over it.
+    let pending_writes = Arc::new(match PendingWriteQueue::default_path() {
+        Ok(path) => match PendingWriteQueue::open(&path).await {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::warn!("pending-writes queue unavailable: {e:#}");
+                PendingWriteQueue::new_empty()
+            }
+        },
+        Err(e) => {
+            tracing::warn!("pending-writes queue path unavailable: {e:#}");
+            PendingWriteQueue::new_empty()
+        }
+    });
 
     // Build AppState
     let state = Arc::new(memory_platform::AppState {
@@ -119,12 +145,13 @@ async fn main() -> anyhow::Result<()> {
         neo4j_client: None,
         redis_cache: None,
         context_service: Some(context_service),
-        contradiction_detector: None,
+        contradiction_detector: Some(contradiction_detector),
         decay_engine: Some(decay_engine),
         embedding_service,
         experience_service: Some(experience_service),
         ingestion_service: None,
         procedure_service: Some(procedure_service),
+        pending_writes,
     });
 
     // Create MCP server
@@ -137,4 +164,32 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+/// Retry the PostgreSQL connection a few times with a short fixed backoff,
+/// then give up and let the caller fall back to degraded mode. Unlike
+/// `main.rs`'s `connect_with_retry` (a supervised daemon that can afford to
+/// block for minutes and exit non-zero for a restart), this runs once per
+/// stdio MCP invocation — the client is waiting on the handshake, so the
+/// window stays short and failure degrades gracefully instead of exiting.
+async fn connect_with_short_retry(config: &Config) -> anyhow::Result<PostgresDb> {
+    const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    const MAX_ATTEMPTS: u32 = 3;
+
+    let mut last_err = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match PostgresDb::connect(config).await {
+            Ok(db) => return Ok(db),
+            Err(e) => {
+                if attempt < MAX_ATTEMPTS {
+                    tracing::warn!(
+                        "PostgreSQL connect attempt {attempt}/{MAX_ATTEMPTS} failed, retrying in {RETRY_INTERVAL:?}: {e}"
+                    );
+                    tokio::time::sleep(RETRY_INTERVAL).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("loop runs at least once").into())
 }

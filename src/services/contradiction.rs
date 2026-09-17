@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -61,7 +62,7 @@ impl ContradictionDetector {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self {
-            db: Arc::new(PostgresDb { pool }),
+            db: Arc::new(PostgresDb::with_pool(pool)),
         }
     }
 
@@ -90,7 +91,8 @@ impl ContradictionDetector {
 
         let mut contradictions = Vec::new();
         for c in candidates {
-            self.db
+            let stored = self
+                .db
                 .store_contradiction(
                     c.memory_id_a,
                     c.memory_id_b,
@@ -106,14 +108,7 @@ impl ContradictionDetector {
                         c.memory_id_a, c.memory_id_b
                     )
                 })?;
-
-            // Fetch the stored contradiction to return full row data.
-            let stored = self
-                .fetch_contradiction(c.memory_id_a, c.memory_id_b)
-                .await?;
-            if let Some(contra) = stored {
-                contradictions.push(contra);
-            }
+            contradictions.push(stored);
         }
 
         Ok(contradictions)
@@ -146,7 +141,8 @@ impl ContradictionDetector {
                     continue;
                 }
 
-                self.db
+                let stored = self
+                    .db
                     .store_contradiction(
                         c.memory_id_a,
                         c.memory_id_b,
@@ -162,13 +158,7 @@ impl ContradictionDetector {
                             c.memory_id_a, c.memory_id_b
                         )
                     })?;
-
-                if let Some(contra) = self
-                    .fetch_contradiction(c.memory_id_a, c.memory_id_b)
-                    .await?
-                {
-                    all_contradictions.push(contra);
-                }
+                all_contradictions.push(stored);
             }
         }
 
@@ -196,6 +186,96 @@ impl ContradictionDetector {
         .with_context(|| format!("Failed to update confidence for {experience_id}"))?;
 
         Ok(())
+    }
+
+    /// Resolve a stored contradiction: record the outcome, and — when
+    /// `keep_memory_id` names one side of the pair — mark the *other* memory
+    /// as superseded by it. "What's true now" and "what we believed then"
+    /// become separately recoverable, instead of the older belief just
+    /// quietly losing search rank via `decay_score` alone.
+    pub async fn resolve(
+        &self,
+        contradiction_id: &str,
+        resolution_note: &str,
+        keep_memory_id: Option<&str>,
+    ) -> Result<Contradiction> {
+        let id: Uuid = contradiction_id
+            .parse()
+            .with_context(|| format!("Invalid contradiction ID: {contradiction_id}"))?;
+        let existing = self
+            .fetch_contradiction_by_id(id)
+            .await?
+            .with_context(|| format!("Contradiction {contradiction_id} not found"))?;
+
+        if let Some(keep) = keep_memory_id {
+            let keep_id: Uuid = keep
+                .parse()
+                .with_context(|| format!("Invalid keep_memory_id: {keep}"))?;
+            let superseded_id = if keep_id == existing.memory_id_a {
+                existing.memory_id_b
+            } else if keep_id == existing.memory_id_b {
+                existing.memory_id_a
+            } else {
+                anyhow::bail!(
+                    "keep_memory_id {keep_id} is not part of contradiction {contradiction_id}"
+                );
+            };
+            // invalid_at is set only if not already set: an earlier auto-resolve
+            // or manual resolve may have already pinned the real invalidation
+            // instant, and a later resolution of the same pair shouldn't move it.
+            sqlx::query(
+                "UPDATE memories SET superseded_by = $1, superseded_at = now(), \
+                 invalid_at = COALESCE(invalid_at, now()) WHERE id = $2",
+            )
+            .bind(keep_id)
+            .bind(superseded_id)
+            .execute(&self.db.pool)
+            .await
+            .context("Failed to mark memory as superseded")?;
+        }
+
+        sqlx::query(
+            "UPDATE contradictions SET resolved = true, resolution_note = $1, updated_at = now() \
+             WHERE id = $2",
+        )
+        .bind(resolution_note)
+        .bind(id)
+        .execute(&self.db.pool)
+        .await
+        .context("Failed to resolve contradiction")?;
+
+        self.fetch_contradiction_by_id(id)
+            .await?
+            .context("Contradiction vanished after resolving it")
+    }
+
+    /// Auto-resolve a contradiction by comparing the bi-temporal validity of
+    /// its two memories, instead of requiring a human to name `keep_memory_id`.
+    ///
+    /// A memory already marked `invalid_at` loses outright — it's already
+    /// known not to hold any more. Otherwise the memory whose fact became
+    /// true more recently (`valid_at`, falling back to `created_at` when
+    /// unset) wins; the other is marked superseded, same as a manual
+    /// `resolve` call with an explicit `keep_memory_id`.
+    pub async fn auto_resolve(
+        &self,
+        contradiction_id: &str,
+        resolution_note: &str,
+    ) -> Result<Contradiction> {
+        let id: Uuid = contradiction_id
+            .parse()
+            .with_context(|| format!("Invalid contradiction ID: {contradiction_id}"))?;
+        let existing = self
+            .fetch_contradiction_by_id(id)
+            .await?
+            .with_context(|| format!("Contradiction {contradiction_id} not found"))?;
+
+        let a = self.fetch_validity(existing.memory_id_a).await?;
+        let b = self.fetch_validity(existing.memory_id_b).await?;
+        let winner = pick_winner(existing.memory_id_a, existing.memory_id_b, &a, &b);
+
+        self.resolve(contradiction_id, resolution_note, Some(&winner.to_string()))
+            .await
     }
 
     /// Decay confidence scores of old experiences based on time since creation.
@@ -229,7 +309,14 @@ impl ContradictionDetector {
     ) -> Result<Vec<ContradictionCandidate>> {
         let similar = self
             .db
-            .vector_search("memories", embedding, 10, 0.85)
+            .vector_search(
+                "memories",
+                embedding,
+                &self.db.active_embedding_model,
+                10,
+                0.85,
+                None,
+            )
             .await
             .context("Failed to search for similar memories")?;
 
@@ -260,7 +347,13 @@ impl ContradictionDetector {
                     memory_id_a: memory.id,
                     memory_id_b: mem.id,
                     content_a: memory.content.chars().take(200).collect(),
-                    content_b: mem.content.as_deref().unwrap_or("").chars().take(200).collect(),
+                    content_b: mem
+                        .content
+                        .as_deref()
+                        .unwrap_or("")
+                        .chars()
+                        .take(200)
+                        .collect(),
                     similarity: (mem.score * 1000.0).round() / 1000.0,
                     contradiction_type: "semantic".into(),
                 });
@@ -275,7 +368,7 @@ impl ContradictionDetector {
         sqlx::query_as::<_, Memory>(
             "SELECT id, agent_id, session_id, content, content_type, embedding::TEXT AS embedding, \
                     importance, tags, metadata, last_accessed_at, access_count, \
-                    decay_score, created_at, updated_at \
+                    decay_score, created_at, updated_at, expiration_date \
              FROM memories WHERE embedding IS NOT NULL",
         )
         .fetch_all(&self.db.pool)
@@ -284,22 +377,65 @@ impl ContradictionDetector {
         .map_err(Into::into)
     }
 
-    /// Fetch a stored contradiction by its two memory IDs.
-    async fn fetch_contradiction(&self, id_a: Uuid, id_b: Uuid) -> Result<Option<Contradiction>> {
-        let (a, b) = normalize_pair(id_a, id_b);
+    /// Fetch a stored contradiction by its own ID.
+    async fn fetch_contradiction_by_id(&self, id: Uuid) -> Result<Option<Contradiction>> {
         sqlx::query_as::<_, Contradiction>(
             "SELECT id, memory_id_a, memory_id_b, content_a, content_b, \
                     similarity, contradiction_type, detected_by, resolved, \
                     resolution_note, created_at, updated_at \
              FROM contradictions \
-             WHERE memory_id_a = $1 AND memory_id_b = $2",
+             WHERE id = $1",
         )
-        .bind(a)
-        .bind(b)
+        .bind(id)
         .fetch_optional(&self.db.pool)
         .await
         .context("Failed to fetch contradiction")
         .map_err(Into::into)
+    }
+
+    /// Fetch one memory's bi-temporal validity fields, for `auto_resolve`
+    /// only — not part of the general `Memory` model.
+    async fn fetch_validity(&self, memory_id: Uuid) -> Result<MemoryValidity> {
+        let (valid_at, invalid_at, created_at) =
+            sqlx::query_as::<_, (Option<DateTime<Utc>>, Option<DateTime<Utc>>, DateTime<Utc>)>(
+                "SELECT valid_at, invalid_at, created_at FROM memories WHERE id = $1",
+            )
+            .bind(memory_id)
+            .fetch_one(&self.db.pool)
+            .await
+            .with_context(|| format!("Failed to fetch validity for memory {memory_id}"))?;
+        Ok(MemoryValidity {
+            valid_at,
+            invalid_at,
+            created_at,
+        })
+    }
+}
+
+/// Bi-temporal validity fields for one memory, used only by `auto_resolve`.
+struct MemoryValidity {
+    valid_at: Option<DateTime<Utc>>,
+    invalid_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+}
+
+impl MemoryValidity {
+    /// When this memory's fact is treated as having become true: its
+    /// explicit `valid_at`, or `created_at` if that was never set.
+    fn effective_valid_at(&self) -> DateTime<Utc> {
+        self.valid_at.unwrap_or(self.created_at)
+    }
+}
+
+/// Pick which of two memories `auto_resolve` should keep: whichever isn't
+/// already known-invalid, then whichever's fact became true more recently.
+/// Pure and DB-free so the branching can be unit tested directly.
+fn pick_winner(id_a: Uuid, id_b: Uuid, a: &MemoryValidity, b: &MemoryValidity) -> Uuid {
+    match (a.invalid_at.is_some(), b.invalid_at.is_some()) {
+        (true, false) => id_b,
+        (false, true) => id_a,
+        _ if a.effective_valid_at() >= b.effective_valid_at() => id_a,
+        _ => id_b,
     }
 }
 
@@ -350,5 +486,39 @@ mod tests {
         for (a, b) in key_pairs {
             assert!(NEGATION_PAIRS.contains(&(a, b)) || NEGATION_PAIRS.contains(&(b, a)));
         }
+    }
+
+    fn validity(valid_at: Option<i64>, invalid_at: Option<i64>, created_at: i64) -> MemoryValidity {
+        MemoryValidity {
+            valid_at: valid_at.map(|s| DateTime::from_timestamp(s, 0).unwrap()),
+            invalid_at: invalid_at.map(|s| DateTime::from_timestamp(s, 0).unwrap()),
+            created_at: DateTime::from_timestamp(created_at, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn pick_winner_already_invalid_loses_outright() {
+        let (id_a, id_b) = (Uuid::new_v4(), Uuid::new_v4());
+        // a is already known-invalid despite a later valid_at — b still wins.
+        let a = validity(Some(200), Some(300), 100);
+        let b = validity(Some(100), None, 100);
+        assert_eq!(pick_winner(id_a, id_b, &a, &b), id_b);
+        assert_eq!(pick_winner(id_b, id_a, &b, &a), id_b);
+    }
+
+    #[test]
+    fn pick_winner_prefers_later_valid_at() {
+        let (id_a, id_b) = (Uuid::new_v4(), Uuid::new_v4());
+        let a = validity(Some(100), None, 100);
+        let b = validity(Some(200), None, 100);
+        assert_eq!(pick_winner(id_a, id_b, &a, &b), id_b);
+    }
+
+    #[test]
+    fn pick_winner_falls_back_to_created_at_when_valid_at_unset() {
+        let (id_a, id_b) = (Uuid::new_v4(), Uuid::new_v4());
+        let a = validity(None, None, 500);
+        let b = validity(None, None, 100);
+        assert_eq!(pick_winner(id_a, id_b, &a, &b), id_a);
     }
 }

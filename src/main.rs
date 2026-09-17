@@ -13,6 +13,7 @@ use memory_platform::db::neo4j::GraphClient;
 use memory_platform::db::postgres::PostgresDb;
 use memory_platform::db::redis::RedisCache;
 use memory_platform::migrations::Migrator;
+use memory_platform::queue::PendingWriteQueue;
 use memory_platform::search::SearchEngine;
 use memory_platform::services::context::ContextService;
 use memory_platform::services::contradiction::ContradictionDetector;
@@ -54,6 +55,17 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(db);
     Migrator::run(&db.pool).await?;
     tracing::info!("Database migrations applied");
+
+    // Local durability queue ahead of Postgres for POST /events. Required,
+    // not optional like Redis/Neo4j below: it exists specifically so a
+    // momentary Postgres outage never silently loses an event, so a broken
+    // queue is treated the same as a broken primary database — fail fast.
+    let pending_writes = Arc::new(
+        PendingWriteQueue::open(&PendingWriteQueue::default_path()?)
+            .await
+            .context("pending-writes queue is required and never became available")?,
+    );
+    tracing::info!("Pending-writes queue ready");
 
     // Connect to Redis (optional — warn on failure)
     let redis_cache = match RedisCache::connect(&config.redis_url).await {
@@ -102,6 +114,8 @@ async fn main() -> anyhow::Result<()> {
             Some(config.nvidia_api_key.clone())
         },
         nvidia_embedding_model: config.nvidia_embedding_model.clone(),
+        llama_cpp_url: config.llama_cpp_url.clone(),
+        llama_cpp_model_name: config.llama_cpp_model_name.clone(),
         expected_dimension: config.embedding_dim,
         cache_size: config.embedding_cache_size,
     };
@@ -157,7 +171,24 @@ async fn main() -> anyhow::Result<()> {
         experience_service: Some(experience_service),
         ingestion_service,
         procedure_service: Some(procedure_service),
+        pending_writes: Arc::clone(&pending_writes),
     });
+
+    // Background drain: retry anything left in the queue from a past
+    // Postgres outage. Stops at the first failure in a batch rather than
+    // hammering a database that is still down; the next tick tries again.
+    {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Err(e) = api::handlers::events::drain_pending(&state).await {
+                    tracing::warn!("pending-writes drain failed: {e:#}");
+                }
+            }
+        });
+    }
 
     // Build router and inject state
     let app = api::router().with_state(Arc::clone(&state));

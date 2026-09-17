@@ -1,9 +1,9 @@
-use axum::{Json, extract::State};
+use axum::{extract::State, Json};
 use std::sync::Arc;
 
-use crate::AppState;
 use crate::api::auth::Auth;
 use crate::api::dto::{SearchParams, SearchSimilarParams};
+use crate::AppState;
 
 pub async fn search(
     _auth: Auth,

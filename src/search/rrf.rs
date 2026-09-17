@@ -50,14 +50,14 @@ impl RrfFusion {
         let mut seen: HashMap<Uuid, FuseEntry> = HashMap::new();
 
         // Vector side
-        for (rank, r) in vec_results.iter().enumerate() {
+        for (rank, r) in vec_results.into_iter().enumerate() {
             let rrf_score = 1.0 / (k_f64 + rank as f64 + 1.0) * vec_weight;
             seen.insert(
                 r.id,
                 FuseEntry {
                     id: r.id,
-                    content: r.content.clone(),
-                    source_info: r.source_info.clone(),
+                    content: r.content,
+                    source_info: r.source_info,
                     rrf_score,
                     vec_rank: Some(rank as i32 + 1),
                     kw_rank: None,
@@ -66,7 +66,7 @@ impl RrfFusion {
         }
 
         // Keyword side — accumulate for shared IDs
-        for (rank, r) in kw_results.iter().enumerate() {
+        for (rank, r) in kw_results.into_iter().enumerate() {
             let kw_score = 1.0 / (k_f64 + rank as f64 + 1.0) * kw_weight;
             seen.entry(r.id)
                 .and_modify(|e| {
@@ -75,8 +75,8 @@ impl RrfFusion {
                 })
                 .or_insert(FuseEntry {
                     id: r.id,
-                    content: r.content.clone(),
-                    source_info: r.source_info.clone(),
+                    content: r.content,
+                    source_info: r.source_info,
                     rrf_score: kw_score,
                     vec_rank: None,
                     kw_rank: Some(rank as i32 + 1),

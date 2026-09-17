@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  Windows Task Scheduler analog of launchd/com.memory-platform.dashboard.plist.template
+  (decision #22, docs/WINDOWS_PORT_SYNTHESIS.md). NOT gated by MEMORY_LOCAL_ONLY,
+  the dashboard itself runs fine with Neon absent, it just shows less status.
+  launchd's RunAtLoad+KeepAlive has no exact match: LogonTrigger approximates
+  RunAtLoad, RestartOnFailure approximates KeepAlive (bounded to 999 restarts,
+  Task Scheduler has no "restart forever" option). ExecutionTimeLimit=PT0S per
+  decision #22, Task Scheduler's 72h default execution cap would otherwise kill
+  a long-running dashboard process outright.
+-->
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Memory Platform: local dashboard/status API, started at logon and restarted on failure (mirrors com.memory-platform.dashboard on macOS).</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>__USER__</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>__POWERSHELL__</Command>
+      <Arguments>__PS1_ARGS__</Arguments>
+    </Exec>
+  </Actions>
+</Task>

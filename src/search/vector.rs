@@ -3,7 +3,7 @@
 //! Thin orchestration layer that converts the engine's `SearchResult`
 //! type from the DB layer's `db::SearchResult`.
 
-use crate::db::postgres::PostgresDb;
+use crate::db::postgres::{PostgresDb, SearchFilters};
 
 use super::SearchResult;
 
@@ -33,8 +33,18 @@ impl VectorSearch {
         embedding: &[f32],
         limit: i64,
         threshold: f64,
+        filters: Option<&SearchFilters>,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
-        let rows = db.vector_search(table, embedding, limit, threshold).await?;
+        let rows = db
+            .vector_search(
+                table,
+                embedding,
+                &db.active_embedding_model,
+                limit,
+                threshold,
+                filters,
+            )
+            .await?;
         Ok(rows
             .into_iter()
             .map(|r| SearchResult {

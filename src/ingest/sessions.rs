@@ -1,7 +1,7 @@
 //! OpenCode session ingestion — reads `opencode.db` SQLite via Python extraction script
 //! and stores each session + its message parts as experiences / memories.
 
-use crate::ingest::{IngestEngine, IngestReport};
+use crate::ingest::{require_source_timestamp, IngestEngine, IngestReport};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
@@ -15,6 +15,7 @@ pub struct SessionBatch {
     pub total: u64,
     pub skipped: u64,
     pub new: u64,
+    pub errors: u64,
 }
 
 /// Find the extraction script relative to the project root.
@@ -74,6 +75,7 @@ pub async fn ingest_sessions(
         total: 0,
         skipped: 0,
         new: 0,
+        errors: 0,
     };
 
     let mut current_session: Option<(Value, Vec<Value>, Vec<Value>)> = None;
@@ -149,10 +151,11 @@ pub async fn ingest_sessions(
     report.memories_created += batch.new;
     report.experiences_created += batch.new;
     report.sessions_created += batch.new;
+    report.errors += batch.errors;
 
     info!(
-        "Session ingestion complete: {} total, {} new, {} skipped",
-        batch.total, batch.new, batch.skipped
+        "Session ingestion complete: {} total, {} new, {} skipped, {} errors",
+        batch.total, batch.new, batch.skipped, batch.errors
     );
 
     Ok(batch)
@@ -186,12 +189,24 @@ async fn process_session(
 
     let created_iso = ses_data["time_created_iso"].as_str().unwrap_or("");
     let updated_iso = ses_data["time_updated_iso"].as_str().unwrap_or("");
-    let created_dt = created_iso
-        .parse::<chrono::DateTime<Utc>>()
-        .unwrap_or(Utc::now());
-    let updated_dt = updated_iso
-        .parse::<chrono::DateTime<Utc>>()
-        .unwrap_or(Utc::now());
+    let created_dt =
+        match require_source_timestamp(created_iso, &format!("session {ses_id} created_at")) {
+            Ok(dt) => dt,
+            Err(e) => {
+                warn!("  Skipping session '{ses_id}': {e}");
+                batch.errors += 1;
+                return;
+            }
+        };
+    let updated_dt =
+        match require_source_timestamp(updated_iso, &format!("session {ses_id} updated_at")) {
+            Ok(dt) => dt,
+            Err(e) => {
+                warn!("  Skipping session '{ses_id}': {e}");
+                batch.errors += 1;
+                return;
+            }
+        };
     let duration_secs = (updated_dt - created_dt).num_seconds() as i32;
     let imported_at = Utc::now();
     let source_age_seconds = imported_at
@@ -213,7 +228,14 @@ async fn process_session(
 
     // Insert session record
     let mem_session_id = engine
-        .upsert_source_session(&format!("opencode:{ses_id}"), title, "completed", None, created_dt, Some(updated_dt))
+        .upsert_source_session(
+            &format!("opencode:{ses_id}"),
+            title,
+            "completed",
+            None,
+            created_dt,
+            Some(updated_dt),
+        )
         .await
         .unwrap_or_else(|e| {
             warn!("  Failed to insert session '{title}': {e}");

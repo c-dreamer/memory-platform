@@ -19,20 +19,23 @@ PGUSER="${PGUSER:-memory}"
 PGPASSWORD="${PGPASSWORD:-password}"
 PGDATABASE="${PGDATABASE:-memory}"
 
-PSQL="psql -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE -t -A"
+# An array, not a string: PGHOST/PGPORT/PGUSER/PGDATABASE come from an env
+# file, and an unquoted `$PSQL -c ...` string would word-split a value
+# containing whitespace into extra psql flags (argument injection).
+PSQL=(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -t -A)
 
 echo "{\"generatedAt\":\"$(date -Iseconds)\",\"schemaVersion\":\"1.0\"," > "$OUTPUT"
 echo -n '"tables":{' >> "$OUTPUT"
 
 FIRST=true
 for table in documents memories experiences sessions agents procedures contradictions embeddings; do
-  count=$($PSQL -c "SELECT count(*) FROM $table" 2>/dev/null || echo "0")
+  count=$("${PSQL[@]}" -c "SELECT count(*) FROM $table" 2>/dev/null || echo "0")
   $FIRST || echo -n ',' >> "$OUTPUT"
   FIRST=false
   echo -n "\"$table\":$count" >> "$OUTPUT"
 done
 
-db_size=$($PSQL -c "SELECT pg_size_pretty(pg_database_size('memory'))" 2>/dev/null || echo "unknown")
+db_size=$("${PSQL[@]}" -c "SELECT pg_size_pretty(pg_database_size('memory'))" 2>/dev/null || echo "unknown")
 echo "},\"dbSize\":\"$db_size\"" >> "$OUTPUT"
 echo "}" >> "$OUTPUT"
 
