@@ -208,7 +208,7 @@ impl Config {
 
             // --- NVIDIA embedding model ---
             nvidia_embedding_model: env_var("NVIDIA_EMBEDDING_MODEL")
-                .unwrap_or_else(|| "nvidia/llama-nemotron-embed-1b-v2".into()),
+                .unwrap_or_else(|| "nvidia/nemotron-3-embed-1b".into()),
 
             // --- Logging ---
             rust_log: env_var("RUST_LOG").unwrap_or_else(|| "info".into()),
@@ -328,7 +328,7 @@ impl Default for Config {
             chunk_size: 512,
             chunk_overlap: 64,
             max_chunks_per_doc: 100,
-            nvidia_embedding_model: "nvidia/llama-nemotron-embed-1b-v2".into(),
+            nvidia_embedding_model: "nvidia/nemotron-3-embed-1b".into(),
             rust_log: "info".into(),
             embedding_cache_size: 1000,
             local_only: false,
@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(cfg.max_chunks_per_doc, 100);
         assert_eq!(
             cfg.nvidia_embedding_model,
-            "nvidia/llama-nemotron-embed-1b-v2"
+            "nvidia/nemotron-3-embed-1b"
         );
         assert_eq!(cfg.rust_log, "info");
         assert_eq!(cfg.embedding_cache_size, 1000);

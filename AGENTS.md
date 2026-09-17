@@ -41,6 +41,10 @@
   and target databases. Migration `005_embeddings_2048` must preserve a correct
   2048-dimensional cache. Migration `007` must reject non-null legacy 384-dim
   `code_changes` embeddings rather than silently discard them.
+- The canonical embedding model is `nvidia/nemotron-3-embed-1b` (2048-dim). It
+  replaced `nvidia/llama-nemotron-embed-1b-v2`, which NVIDIA retired 2026-08-25
+  (`410 Gone`). The dimension is unchanged, so no vector migration is needed;
+  never re-point the config at a model with a different dimension.
 - Before a recovery is accepted: run a small-table/document canary, two
   consecutive no-op runs, count and fingerprint parity, embedding dimensions and
   null counts, FTS coverage, migration ledger checks, and queue depth zero.

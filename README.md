@@ -4,9 +4,10 @@ A Rust-based memory and knowledge management platform with hybrid search, embedd
 
 ## Features
 
+<<<<<<< HEAD
 - **MCP Server** — JSON-RPC 2.0 stdio server (`src/mcp/`) exposing 22 tools plus a read-only `memory://` resources surface, for Claude Code, Codex, OpenCode, and other MCP clients
-- **Hybrid Search** — Combines vector (pgvector), BM25, and full-text search with Reciprocal Rank Fusion (RRF) or Relative Score Fusion (RSF)
-- **Embedding Service** — Supports local (`llama-cpp`, via a loopback `llama-server`) and cloud (NVIDIA NIM) embedding backends with LRU caching
+- **Hybrid Search** — Combines vector (pgvector), BM25, and full-text search with Reciprocal Rank Fusion (RRF)
+- **Embedding Service** — NVIDIA NIM embeddings (`nvidia/nemotron-3-embed-1b`, 2048-dim) with LRU caching and a fail-closed dimension guard
 - **Vault Ingestion** — Walks Obsidian vault directories, parses frontmatter, chunks by markdown headers, embeds, and upserts
 - **Contradiction Detection** — Finds semantically similar memories with opposing signals using negation word pairs
 - **Experience Tracking** — Records interactions, updates confidence scores, and applies Ebbinghaus-inspired decay
@@ -130,8 +131,9 @@ All configuration is via environment variables (see `.env.example`):
 | `NEO4J_URI` | `bolt://memory-neo4j:7687` | Neo4j bolt URI (optional at runtime) |
 | `API_KEY` | (empty = dev mode) | API key for auth |
 | `API_PORT` | `8000` | HTTP server port |
-| `EMBEDDING_MODEL` | `local` | Embedding backend: `nvidia` or `llama-cpp` are the working options — the `local` default has no backend and fails fast on first use (see `src/services/embedding.rs`) |
-| `EMBEDDING_DIM` | `2048` | Expected embedding vector dimension |
+<<<<<<< HEAD
+| `EMBEDDING_MODEL` | `local` | Embedding backend. `nvidia` is the working backend (`.env.example` sets it). `local` pairs with `MEMORY_LOCAL_ONLY` and has no working backend yet, so it fails fast rather than silently reaching NVIDIA |
+| `NVIDIA_EMBEDDING_MODEL` | `nvidia/nemotron-3-embed-1b` | NVIDIA embedding model (2048-dim). Supersedes the EOL `llama-nemotron-embed-1b-v2` |
 | `VAULT_PATH` | `/vault` | Path to Obsidian vault |
 | `MEMORY_LOCAL_ONLY` | (empty = off) | When set truthy, refuses to start unless `EMBEDDING_MODEL=llama-cpp` and no cloud credential (NVIDIA/OpenAI/Obsidian API key) is set; also blocks `neon-sync`/`memory-dashboard` from dialing Neon |
 | `SYNC_TARGET_URL` | (empty) | Direct, non-pooled Postgres+pgvector endpoint for `neon-sync` (Neon, Supabase, or self-hosted) — see AGENTS.md |
