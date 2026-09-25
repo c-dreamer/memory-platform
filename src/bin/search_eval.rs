@@ -185,7 +185,7 @@ fn ndcg(results: &[memory_platform::search::SearchResult], expected_ids: &[Uuid]
         .map(|(i, r)| grade(&r.id) / ((i as f64 + 2.0).log2()))
         .sum();
     let mut ideal_grades: Vec<f64> = (1..=expected_ids.len()).map(|g| g as f64).rev().collect();
-    ideal_grades.truncate(results.len().max(expected_ids.len()));
+    ideal_grades.truncate(TOP_K as usize);
     let idcg: f64 = ideal_grades
         .iter()
         .enumerate()
@@ -195,5 +195,52 @@ fn ndcg(results: &[memory_platform::search::SearchResult], expected_ids: &[Uuid]
         0.0
     } else {
         dcg / idcg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memory_platform::search::SearchResult;
+
+    fn hit(id: Uuid) -> SearchResult {
+        SearchResult {
+            id,
+            content: String::new(),
+            score: 0.0,
+            source_info: String::new(),
+            vec_rank: None,
+            kw_rank: None,
+            decay_factor: None,
+        }
+    }
+
+    #[test]
+    fn ndcg_is_one_for_ideal_order_and_lower_when_swapped() {
+        let (a, b, noise) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let expected = [a, b];
+        let ideal = ndcg(&[hit(a), hit(b), hit(noise)], &expected);
+        let swapped = ndcg(&[hit(b), hit(a), hit(noise)], &expected);
+        assert!((ideal - 1.0).abs() < 1e-9);
+        assert!(swapped < ideal && swapped > 0.0);
+    }
+
+    #[test]
+    fn ndcg_is_zero_with_no_relevant_hits() {
+        let expected = [Uuid::new_v4()];
+        assert_eq!(ndcg(&[hit(Uuid::new_v4())], &expected), 0.0);
+        assert_eq!(ndcg(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn ndcg_ideal_is_capped_at_top_k() {
+        // More relevant ids than K slots: a perfect top-K must still score 1.0.
+        let expected: Vec<Uuid> = (0..TOP_K + 3).map(|_| Uuid::new_v4()).collect();
+        let results: Vec<SearchResult> = expected
+            .iter()
+            .take(TOP_K as usize)
+            .map(|id| hit(*id))
+            .collect();
+        assert!((ndcg(&results, &expected) - 1.0).abs() < 1e-9);
     }
 }
