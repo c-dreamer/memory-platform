@@ -757,7 +757,7 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
 /// 5. experience_find — find similar past experiences.
 async fn tool_experience_find(state: &AppState, args: Value) -> Result<String> {
     let goal = get_string(&args, "goal")?;
-    let limit = get_usize(&args, "limit").unwrap_or(3);
+    let limit = get_usize(&args, "limit").unwrap_or(3).clamp(1, 100);
 
     info!("experience_find: goal='{goal}', limit={limit}");
 

@@ -49,7 +49,7 @@ pub async fn search(
             &params.q,
             &embedding,
             &mode,
-            params.limit as i64,
+            params.limit.clamp(1, 500) as i64,
         )
         .await
     {
@@ -101,7 +101,7 @@ pub async fn search_similar(
             &params.q,
             &embedding,
             "vector",
-            params.limit as i64,
+            params.limit.clamp(1, 500) as i64,
         )
         .await
     {

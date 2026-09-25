@@ -20,7 +20,11 @@ pub async fn list_experiences(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<ListExperiencesParams>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.db.list_experiences(params.limit as i64).await {
+    match state
+        .db
+        .list_experiences(params.limit.clamp(1, 500) as i64)
+        .await
+    {
         Ok(experiences) => {
             let experiences: Vec<serde_json::Value> = experiences
                 .into_iter()
@@ -51,7 +55,10 @@ pub async fn find_relevant_experiences(
         );
     };
 
-    match svc.find_relevant(&params.goal, params.limit).await {
+    match svc
+        .find_relevant(&params.goal, params.limit.clamp(1, 100))
+        .await
+    {
         Ok(experiences) => {
             let experiences: Vec<serde_json::Value> = experiences
                 .into_iter()
