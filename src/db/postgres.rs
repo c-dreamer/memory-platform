@@ -15,7 +15,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Connection};
+use sqlx::{Connection, PgPool};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -120,6 +120,8 @@ pub struct SimilarExperience {
     pub id2: Uuid,
     pub tags1: Vec<String>,
     pub tags2: Vec<String>,
+    pub actions1: serde_json::Value,
+    pub lessons_learned1: Option<String>,
     pub similarity: f64,
 }
 
@@ -214,12 +216,14 @@ impl PostgresDb {
             .idle_timeout(Duration::from_secs(60))
             .max_lifetime(None)
             .test_before_acquire(false)
-            .before_acquire(|conn, meta| Box::pin(async move {
-                if meta.idle_for.as_secs() > 60 {
-                    conn.ping().await?;
-                }
-                Ok(true)
-            }))
+            .before_acquire(|conn, meta| {
+                Box::pin(async move {
+                    if meta.idle_for.as_secs() > 60 {
+                        conn.ping().await?;
+                    }
+                    Ok(true)
+                })
+            })
             .acquire_slow_threshold(Duration::from_secs(1))
             .connect(&config.database_url)
             .await?;
@@ -366,6 +370,41 @@ impl PostgresDb {
             .await
     }
 
+    /// Walk a session's ancestry up `parent_session_id`, root first.
+    ///
+    /// Sessions already form a tree, but nothing reads it — each session's
+    /// `summary` only ever describes itself, so work spanning a chain of
+    /// linked sessions has no narrative above the individual link. The
+    /// `depth < 50` bound stops a cyclic `parent_session_id` (corrupt data,
+    /// not reachable through normal writes) from recursing forever.
+    pub async fn session_lineage(&self, id: Uuid) -> Result<Vec<Session>, sqlx::Error> {
+        sqlx::query_as::<_, Session>(
+            "WITH RECURSIVE lineage AS ( \
+                 SELECT s.*, 0 AS depth FROM sessions s WHERE s.id = $1 \
+                 UNION ALL \
+                 SELECT s.*, l.depth + 1 FROM sessions s \
+                 JOIN lineage l ON s.id = l.parent_session_id \
+                 WHERE l.depth < 50 \
+             ) \
+             SELECT id, agent_id, parent_session_id, goal, status, summary, \
+                    embedding::TEXT AS embedding, started_at, ended_at, created_at, updated_at \
+             FROM lineage ORDER BY depth DESC",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// List every session row, unfiltered — for a full-fidelity backup snapshot.
+    pub async fn list_all_sessions(&self) -> Result<Vec<Session>, sqlx::Error> {
+        sqlx::query_as::<_, Session>(
+            "SELECT id, agent_id, parent_session_id, goal, status, summary, embedding::TEXT AS embedding, \
+             started_at, ended_at, created_at, updated_at FROM sessions ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Mark a session as completed with a summary.
     pub async fn end_session(&self, id: Uuid, summary: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
@@ -476,6 +515,16 @@ impl PostgresDb {
         )
         .bind(id)
         .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// List every memory row, unfiltered (includes superseded/expired/forgotten
+    /// rows) — for a full-fidelity backup snapshot, not for search/display.
+    pub async fn list_all_memories(&self) -> Result<Vec<Memory>, sqlx::Error> {
+        sqlx::query_as::<_, Memory>(
+            "SELECT id, agent_id, session_id, content, content_type, embedding::TEXT as embedding, importance, tags, metadata, last_accessed_at, access_count, decay_score, created_at, updated_at, expiration_date FROM memories ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
         .await
     }
 
@@ -725,6 +774,32 @@ impl PostgresDb {
         Ok(row)
     }
 
+    /// Get an experience by UUID.
+    pub async fn get_experience(&self, id: Uuid) -> Result<Option<Experience>, sqlx::Error> {
+        sqlx::query_as::<_, Experience>(
+            "SELECT id, agent_id, session_id, goal, reasoning_summary, actions, \
+                    files_changed, result, lessons_learned, confidence, duration_seconds, tags, \
+                    related_project, embedding::TEXT AS embedding, is_procedurized, created_at \
+             FROM experiences WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// List experiences ordered by most recent first.
+    pub async fn list_experiences(&self, limit: i64) -> Result<Vec<Experience>, sqlx::Error> {
+        sqlx::query_as::<_, Experience>(
+            "SELECT id, agent_id, session_id, goal, reasoning_summary, actions, \
+                    files_changed, result, lessons_learned, confidence, duration_seconds, tags, \
+                    related_project, embedding::TEXT AS embedding, is_procedurized, created_at \
+             FROM experiences ORDER BY created_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Find pairs of similar successful experiences via cross-join vector comparison.
     ///
     /// Known gap: self-joins `experiences.embedding` directly (the fixed
@@ -739,6 +814,7 @@ impl PostgresDb {
         sqlx::query_as::<_, SimilarExperience>(
             "SELECT e1.goal AS goal1, e1.id AS id1, e2.id AS id2, \
                     e1.tags AS tags1, e2.tags AS tags2, \
+                    e1.actions AS actions1, e1.lessons_learned AS lessons_learned1, \
                     1 - (e1.embedding <=> e2.embedding) AS similarity \
              FROM experiences e1 \
              JOIN experiences e2 ON e1.id < e2.id \
@@ -751,6 +827,17 @@ impl PostgresDb {
         .bind(threshold)
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// Mark experiences as procedurized so they no longer surface in
+    /// `find_similar_experiences` (which excludes `is_procedurized = true`),
+    /// preventing the same pair from being promoted into a procedure twice.
+    pub async fn mark_experiences_procedurized(&self, ids: &[Uuid]) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE experiences SET is_procedurized = true WHERE id = ANY($1)")
+            .bind(ids)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
     }
 
     // ------------------------------------------------------------------
@@ -1066,104 +1153,6 @@ impl PostgresDb {
 
         merged.truncate(limit as usize);
         Ok(merged)
-    }
-
-    // ------------------------------------------------------------------
-    // Contradictions
-    // ------------------------------------------------------------------
-
-    /// Detect contradictions between a new memory and existing similar ones.
-    pub async fn detect_contradictions(
-        &self,
-        memory_id: Uuid,
-        content: &str,
-        embedding: &[f32],
-    ) -> Result<Vec<ContradictionCandidate>, sqlx::Error> {
-        let similar = self
-            .vector_search(
-                "memories",
-                embedding,
-                &self.active_embedding_model,
-                10,
-                0.6,
-                None,
-            )
-            .await?;
-
-        let mut candidates = Vec::new();
-        let new_lower = content.to_lowercase();
-
-        const NEGATION_PAIRS: &[(&str, &str)] = &[
-            ("buy", "sell"),
-            ("long", "short"),
-            ("bullish", "bearish"),
-            ("increase", "decrease"),
-            ("up", "down"),
-            ("positive", "negative"),
-            ("profitable", "unprofitable"),
-            ("win", "loss"),
-            ("good", "bad"),
-            ("should", "shouldn't"),
-            ("always", "never"),
-            ("yes", "no"),
-            ("support", "resistance"),
-            ("overbought", "oversold"),
-            ("truth", "false"),
-            ("correct", "incorrect"),
-            ("above", "below"),
-            ("high", "low"),
-            ("rise", "fall"),
-            ("gain", "loss"),
-            ("upward", "downward"),
-            ("strong", "weak"),
-            ("overweight", "underweight"),
-            ("exceed", "underperform"),
-            ("better", "worse"),
-            ("improve", "decline"),
-            ("buying", "selling"),
-            ("bull", "bear"),
-            ("overvalued", "undervalued"),
-            ("expensive", "cheap"),
-        ];
-
-        for mem in &similar {
-            if mem.id == memory_id {
-                continue;
-            }
-            if mem.score < 0.65 {
-                continue;
-            }
-
-            let existing_lower = mem.content.as_deref().unwrap_or("").to_lowercase();
-            let mut signals = 0;
-
-            for &(a, b) in NEGATION_PAIRS {
-                if (existing_lower.contains(a) && new_lower.contains(b))
-                    || (existing_lower.contains(b) && new_lower.contains(a))
-                {
-                    signals += 1;
-                }
-            }
-
-            if signals >= 1 {
-                candidates.push(ContradictionCandidate {
-                    memory_id_a: memory_id,
-                    memory_id_b: mem.id,
-                    content_a: content.chars().take(200).collect(),
-                    content_b: mem
-                        .content
-                        .as_deref()
-                        .unwrap_or("")
-                        .chars()
-                        .take(200)
-                        .collect(),
-                    similarity: (mem.score * 1000.0).round() / 1000.0,
-                    contradiction_type: "semantic".into(),
-                });
-            }
-        }
-
-        Ok(candidates)
     }
 
     /// Byte-cap a string without landing mid-character. `content_a`/`content_b`
@@ -1648,6 +1637,8 @@ mod tests {
             id2: Uuid::new_v4(),
             tags1: vec!["auth".into()],
             tags2: vec!["security".into()],
+            actions1: serde_json::json!([{"step": "validate token"}]),
+            lessons_learned1: Some("check expiry".into()),
             similarity: 0.92,
         };
         let json = serde_json::to_string(&se).unwrap();

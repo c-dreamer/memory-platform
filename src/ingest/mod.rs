@@ -211,7 +211,7 @@ impl IngestEngine {
         .bind(session_id)
         .bind(content)
         .bind(content_type)
-        .bind(importance)
+        .bind(importance.clamp(0.0, 1.0))
         .bind(tags)
         .bind(metadata)
         .execute(&self.pool)

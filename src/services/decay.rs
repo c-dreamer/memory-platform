@@ -19,7 +19,7 @@ use std::sync::Arc;
 ///
 /// Combines recency (Ebbinghaus), frequency, and semantic coherence into
 /// a single relevance score. Uses the existing `Config` for all parameters.
-/// When `enabled` is false, `score()` returns 1.0 (no-op).
+/// When `enabled` is false, `score_recency_frequency()` returns 1.0 (no-op).
 #[derive(Debug, Clone)]
 pub struct DecayEngine {
     half_life_days: f64,
@@ -29,6 +29,7 @@ pub struct DecayEngine {
     frequency_weight: f64,
     semantic_weight: f64,
     frequency_threshold: f64,
+    multiplier_floor: f64,
 }
 
 impl DecayEngine {
@@ -43,6 +44,7 @@ impl DecayEngine {
             frequency_weight: config.coherence_weight_frequency,
             semantic_weight: config.coherence_weight_semantic,
             frequency_threshold: config.coherence_frequency_threshold,
+            multiplier_floor: config.decay_multiplier_floor.clamp(0.0, 1.0),
         }
     }
 
@@ -71,41 +73,6 @@ impl DecayEngine {
         (access_count / self.frequency_threshold).min(1.0)
     }
 
-    /// Compute the combined coherence score.
-    ///
-    /// Formula: `α · recency + β · frequency + γ · coherence`
-    ///
-    /// When disabled, always returns 1.0.
-    #[must_use]
-    pub fn score(&self, days_since_access: f64, access_count: f64, coherence: f64) -> f64 {
-        if !self.enabled {
-            return 1.0;
-        }
-        let recency = self.compute_recency(days_since_access);
-        let frequency = self.compute_frequency(access_count);
-        recency * self.recency_weight
-            + frequency * self.frequency_weight
-            + coherence * self.semantic_weight
-    }
-
-    /// Apply the combined coherence score to an existing relevance score.
-    ///
-    /// Returns: `relevance_score * score(days_since, access_count, coherence)`
-    /// When disabled, returns `relevance_score` unchanged.
-    #[must_use]
-    pub fn apply(
-        &self,
-        relevance_score: f64,
-        days_since: f64,
-        access_count: f64,
-        coherence: f64,
-    ) -> f64 {
-        if !self.enabled {
-            return relevance_score;
-        }
-        relevance_score * self.score(days_since, access_count, coherence)
-    }
-
     /// Combined recency + frequency + importance score, for callers with no
     /// coherence (semantic similarity) signal available at the point of
     /// scoring (e.g. post-RRF-fusion re-ranking).
@@ -127,26 +94,16 @@ impl DecayEngine {
         let recency = self.compute_recency(days_since_access);
         let frequency = self.compute_frequency(access_count);
         let total_weight = self.recency_weight + self.frequency_weight + self.semantic_weight;
-        if total_weight <= 0.0 {
-            return recency;
-        }
-        (recency * self.recency_weight
-            + frequency * self.frequency_weight
-            + importance * self.semantic_weight)
-            / total_weight
-    }
-
-    // Legacy API compatibility — kept for callers not yet migrated.
-    /// Compute the legacy decay factor.
-    #[must_use]
-    pub fn compute_decay(&self, days_since_access: f64) -> f64 {
-        self.compute_recency(days_since_access)
-    }
-
-    /// Apply legacy decay to a score.
-    #[must_use]
-    pub fn apply_decay(&self, rrf_score: f64, days_since: f64) -> f64 {
-        rrf_score * self.compute_recency(days_since)
+        let composite = if total_weight <= 0.0 {
+            recency
+        } else {
+            (recency * self.recency_weight
+                + frequency * self.frequency_weight
+                + importance * self.semantic_weight)
+                / total_weight
+        };
+        let composite = composite.clamp(0.0, 1.0);
+        self.multiplier_floor + (1.0 - self.multiplier_floor) * composite
     }
 }
 
@@ -183,72 +140,29 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_decay_zero_days() {
+    fn test_compute_recency_zero_days() {
         let engine = DecayEngine::new(test_config());
-        assert!((engine.compute_decay(0.0) - 1.0).abs() < f64::EPSILON);
+        assert!((engine.compute_recency(0.0) - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_compute_decay_half_life() {
+    fn test_compute_recency_half_life() {
         let engine = DecayEngine::new(test_config());
-        assert!((engine.compute_decay(90.0) - 0.5).abs() < f64::EPSILON);
+        assert!((engine.compute_recency(90.0) - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_compute_decay_one_year() {
-        let engine = DecayEngine::new(test_config());
-        // 365 / 90 ≈ 4.055 → 2^-4.055 ≈ 0.060 → clamped to min_score (0.1)
-        let actual = engine.compute_decay(365.0);
-        assert!((actual - engine.min_score).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_compute_decay_clamped_to_min_score() {
+    fn test_compute_recency_clamped_to_min_score() {
         let engine = DecayEngine::new(test_config());
         // Very large days_since → should clamp to min_score
-        let decay = engine.compute_decay(1000.0);
+        let decay = engine.compute_recency(1000.0);
         assert!((decay - engine.min_score).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_compute_decay_disabled() {
+    fn test_compute_recency_disabled() {
         let engine = DecayEngine::new(disabled_config());
-        assert!((engine.compute_decay(1000.0) - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_apply_decay_zero_days() {
-        let engine = DecayEngine::new(test_config());
-        assert!((engine.apply_decay(1.0, 0.0) - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_apply_decay_half_life() {
-        let engine = DecayEngine::new(test_config());
-        assert!((engine.apply_decay(1.0, 90.0) - 0.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_apply_decay_one_year() {
-        let engine = DecayEngine::new(test_config());
-        // 2^(-365/90) ≈ 0.060 → clamped to min_score (0.1)
-        let actual = engine.apply_decay(1.0, 365.0);
-        assert!((actual - engine.min_score).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_apply_decay_disabled() {
-        let engine = DecayEngine::new(disabled_config());
-        assert!((engine.apply_decay(1.0, 1000.0) - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_apply_decay_with_rrf_score() {
-        let engine = DecayEngine::new(test_config());
-        let rrf_score = 0.8;
-        let expected = rrf_score * 0.5;
-        let actual = engine.apply_decay(rrf_score, 90.0);
-        assert!((actual - expected).abs() < f64::EPSILON);
+        assert!((engine.compute_recency(1000.0) - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -265,8 +179,10 @@ mod tests {
         let engine = DecayEngine::new(test_config());
         // recency=0.5 (half-life), frequency=0.0 (never accessed), importance=0.8.
         // weights: recency=0.3, frequency=0.2, semantic(importance)=0.5 -> total 1.0.
+        let composite = 0.5 * 0.3 + 0.0 * 0.2 + 0.8 * 0.5;
+        let floor = engine.multiplier_floor;
+        let expected = floor + (1.0 - floor) * composite;
         let actual = engine.score_recency_frequency(90.0, 0.0, 0.8);
-        let expected = 0.5 * 0.3 + 0.0 * 0.2 + 0.8 * 0.5;
         assert!((actual - expected).abs() < f64::EPSILON);
     }
 
@@ -274,5 +190,33 @@ mod tests {
     fn test_score_recency_frequency_disabled() {
         let engine = DecayEngine::new(disabled_config());
         assert!((engine.score_recency_frequency(1000.0, 0.0, 0.5) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_score_recency_frequency_bounded_by_multiplier_floor() {
+        let config = test_config();
+        let engine = DecayEngine::new(config.clone());
+        // Best case: no elapsed time, unlimited access, max importance -> composite 1.0.
+        let max = engine.score_recency_frequency(0.0, f64::MAX, 1.0);
+        // Worst case: unlimited elapsed time, zero access, zero importance -> composite 0.0.
+        let min = engine.score_recency_frequency(f64::MAX, 0.0, 0.0);
+        assert!((max - 1.0).abs() < 1e-9);
+        assert!(min >= config.decay_multiplier_floor - 1e-9);
+        assert!(max / min <= 1.0 / config.decay_multiplier_floor + 1e-9);
+    }
+
+    #[test]
+    fn test_score_recency_frequency_total_weight_zero_still_bounded() {
+        let mut config = (*test_config()).clone();
+        config.coherence_weight_recency = 0.0;
+        config.coherence_weight_frequency = 0.0;
+        config.coherence_weight_semantic = 0.0;
+        let engine = DecayEngine::new(Arc::new(config.clone()));
+        // total_weight <= 0.0 guard fires; result must still respect the floor,
+        // not fall through to raw recency in [decay_min_score, 1.0].
+        let actual = engine.score_recency_frequency(0.0, 100.0, 1.0);
+        let floor = config.decay_multiplier_floor;
+        let expected = floor + (1.0 - floor) * 1.0_f64.clamp(0.0, 1.0);
+        assert!((actual - expected).abs() < 1e-9);
     }
 }

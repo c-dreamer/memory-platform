@@ -12,6 +12,7 @@
 //! `experiences`, and `trading_results`.
 
 pub mod bm25;
+pub mod relative_time;
 pub mod rrf;
 pub mod rsf;
 pub mod vector;
@@ -54,7 +55,10 @@ pub struct SearchResult {
     /// Rank in the keyword result list (1-based), if present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kw_rank: Option<i32>,
-    /// Memory decay factor (only populated for "memories" table when decay is enabled).
+    /// Memory decay multiplier (only populated for "memories" table when decay
+    /// is enabled). Range `[decay_multiplier_floor, 1.0]` (default `[0.85, 1.0]`)
+    /// — bounded so decay adjusts ranking within the RRF fusion band rather
+    /// than swamping it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decay_factor: Option<f64>,
 }
@@ -151,7 +155,14 @@ impl SearchEngine {
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
         match mode {
             "vector" => VectorSearch::search(&self.db, table, embedding, limit, 0.0, filters).await,
-            "keyword" => Bm25Search::search(&self.db, table, query, limit, filters).await,
+            "keyword" => {
+                let mut results =
+                    Bm25Search::search(&self.db, table, query, limit, filters).await?;
+                if table == "memories" {
+                    self.apply_relative_time_boost(&mut results, query).await?;
+                }
+                Ok(results)
+            }
             "rsf" => {
                 let fetch_limit = limit * 2;
 
@@ -204,19 +215,80 @@ impl SearchEngine {
                     self.apply_decay(&mut fused).await?;
                 }
 
+                if table == "memories" {
+                    self.apply_relative_time_boost(&mut fused, query).await?;
+                }
+
                 fused.truncate(limit as usize);
                 Ok(fused)
             }
         }
     }
 
+    /// Boost results created inside a time window the query itself named.
+    ///
+    /// Only runs when the query actually carries a relative-time phrase, so
+    /// the extra lookup costs nothing on ordinary queries. The boost is
+    /// multiplicative and small for the same reason the decay multiplier is
+    /// floored: an RRF-fused score band spans roughly 4.8x, so a secondary
+    /// signal has to stay well inside that to adjust ranking rather than
+    /// replace it.
+    async fn apply_relative_time_boost(
+        &self,
+        results: &mut [SearchResult],
+        query: &str,
+    ) -> Result<(), sqlx::Error> {
+        use sqlx::Row;
+
+        const BOOST: f64 = 1.15;
+
+        let Some((start, end)) = relative_time::parse_range(query, chrono::Utc::now()) else {
+            return Ok(());
+        };
+        if results.is_empty() {
+            return Ok(());
+        }
+
+        let ids: Vec<Uuid> = results.iter().map(|r| r.id).collect();
+        let rows = sqlx::query(
+            "SELECT id FROM memories \
+             WHERE id = ANY($1) AND created_at >= $2 AND created_at <= $3",
+        )
+        .bind(&ids)
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.db.pool)
+        .await?;
+
+        for row in &rows {
+            let id: Uuid = row.get("id");
+            if let Some(r) = results.iter_mut().find(|r| r.id == id) {
+                r.score *= BOOST;
+            }
+        }
+
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(())
+    }
+
     /// Apply Ebbinghaus-inspired memory decay to fused results.
     ///
-    /// Queries `last_accessed_at`/`created_at`, `access_count`, and
-    /// `importance` for each memory ID and scores via
+    /// Queries `last_accessed_at`/`created_at`, `access_count`, `importance`,
+    /// and `tags` for each memory ID and scores via
     /// `DecayEngine::score_recency_frequency` (recency + frequency +
     /// importance; coherence isn't available post-RRF-fusion, so stored
     /// `importance` fills that weight's slot instead of it being dropped).
+    /// The returned multiplier is bounded to `[decay_multiplier_floor, 1.0]`.
+    /// A memory tagged `critical` (the same tag `core_memory` surfaces on)
+    /// is exempted from decay entirely — the pinned-memory tier this repo
+    /// already has otherwise only applies outside ranked search, so a
+    /// critical memory would still lose up to `1 - decay_multiplier_floor`
+    /// of its score in ordinary `memory_search` results.
     async fn apply_decay(&self, results: &mut Vec<SearchResult>) -> Result<(), sqlx::Error> {
         use sqlx::Row;
 
@@ -226,7 +298,7 @@ impl SearchEngine {
             let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("${i}")).collect();
             let sql = format!(
                 "SELECT id, (EXTRACT(EPOCH FROM (now() - COALESCE(last_accessed_at, created_at))) / 86400.0)::FLOAT8 AS days_since, \
-                        access_count, importance \
+                        access_count, importance, tags \
                  FROM memories WHERE id IN ({})",
                 placeholders.join(",")
             );
@@ -239,14 +311,19 @@ impl SearchEngine {
 
             for row in &rows {
                 let id: Uuid = row.get("id");
-                let days_since: f64 = row.get("days_since");
-                let access_count: i32 = row.get("access_count");
-                let importance: f64 = row.get("importance");
-                let decay = self.decay_engine.score_recency_frequency(
-                    days_since,
-                    access_count as f64,
-                    importance,
-                );
+                let tags: Vec<String> = row.get("tags");
+                let decay = if tags.iter().any(|t| t == "critical") {
+                    1.0
+                } else {
+                    let days_since: f64 = row.get("days_since");
+                    let access_count: i32 = row.get("access_count");
+                    let importance: f64 = row.get("importance");
+                    self.decay_engine.score_recency_frequency(
+                        days_since,
+                        access_count as f64,
+                        importance,
+                    )
+                };
 
                 if let Some(r) = results.iter_mut().find(|r| r.id == id) {
                     r.score *= decay;

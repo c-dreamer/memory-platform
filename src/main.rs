@@ -15,9 +15,7 @@ use memory_platform::db::redis::RedisCache;
 use memory_platform::migrations::Migrator;
 use memory_platform::queue::PendingWriteQueue;
 use memory_platform::search::SearchEngine;
-use memory_platform::services::context::ContextService;
 use memory_platform::services::contradiction::ContradictionDetector;
-use memory_platform::services::decay::DecayEngine;
 use memory_platform::services::embedding::{EmbeddingConfig, EmbeddingServiceFactory};
 use memory_platform::services::experience::ExperienceService;
 use memory_platform::services::ingestion::IngestionService;
@@ -132,11 +130,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
     // Build business-logic services
-    let decay_engine = Arc::new(DecayEngine::new(Arc::clone(&config)));
-
     let contradiction_detector = Arc::new(ContradictionDetector::new(db.pool.clone()));
-
-    let context_service = Arc::new(ContextService::new(db.pool.clone(), Arc::clone(&search)));
 
     let experience_service = Arc::new(ExperienceService::new(
         db.pool.clone(),
@@ -164,9 +158,7 @@ async fn main() -> anyhow::Result<()> {
         search,
         neo4j_client,
         redis_cache,
-        context_service: Some(context_service),
         contradiction_detector: Some(contradiction_detector),
-        decay_engine: Some(decay_engine),
         embedding_service,
         experience_service: Some(experience_service),
         ingestion_service,
@@ -194,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
     let app = api::router().with_state(Arc::clone(&state));
 
     // Bind to address
-    let addr = format!("0.0.0.0:{}", state.config.api_port);
+    let addr = format!("{}:{}", state.config.api_bind, state.config.api_port);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("Listening on http://{}", addr);

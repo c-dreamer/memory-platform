@@ -18,9 +18,7 @@ fn minimal_state() -> Arc<AppState> {
         search: Arc::new(SearchEngine::new_empty()),
         neo4j_client: None,
         redis_cache: None,
-        context_service: None,
         contradiction_detector: None,
-        decay_engine: None,
         embedding_service: None,
         experience_service: None,
         ingestion_service: None,
@@ -68,7 +66,7 @@ async fn test_mcp_tools_list() {
     let resp = response.unwrap();
 
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 22, "Should return 22 tools");
+    assert_eq!(tools.len(), 25, "Should return 25 tools");
 
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     for name in &[

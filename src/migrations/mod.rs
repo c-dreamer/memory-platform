@@ -120,6 +120,10 @@ impl Migrator {
                 "020_contradictions_unique_pair",
                 include_str!("../../migrations/020_contradictions_unique_pair.sql"),
             ),
+            (
+                "021_index_and_importance_bounds",
+                include_str!("../../migrations/021_index_and_importance_bounds.sql"),
+            ),
         ];
 
         // Apply pending migrations in order

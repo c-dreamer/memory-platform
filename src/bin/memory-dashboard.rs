@@ -148,7 +148,7 @@ async fn record_counts(pool: &PgPool) -> Result<(i64, i64, i64), sqlx::Error> {
         "SELECT \
           count(*) FILTER (WHERE storage_tier='active'), \
           (SELECT count(*) FROM memories WHERE storage_tier='active'), \
-          (SELECT count(*) FROM memories WHERE storage_tier='active' AND (importance >= 0.9 OR 'critical'=ANY(tags) OR metadata @> '{\"critical\":true}'::jsonb)) \
+          (SELECT count(*) FROM memories WHERE storage_tier='active' AND (importance >= 0.9 OR 'critical'=ANY(tags) OR metadata @> '{\"critical\":true}'::jsonb) AND (expiration_date IS NULL OR expiration_date >= CURRENT_DATE)) \
          FROM sessions",
     )
     .fetch_one(pool)

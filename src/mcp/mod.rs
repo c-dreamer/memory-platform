@@ -1,6 +1,6 @@
 //! MCP module — Model Context Protocol stdio server.
 //!
-//! Implements JSON-RPC 2.0 over stdin/stdout with 22 tools plus a small
+//! Implements JSON-RPC 2.0 over stdin/stdout with 25 tools plus a small
 //! read-only resources surface (`memory://...` URIs).
 //! Logs to stderr via `tracing` (stdout is protocol-only).
 
@@ -37,13 +37,11 @@ pub const ERROR_INVALID_PARAMS: i64 = -32602;
 /// Internal error (-32603): Internal JSON-RPC error.
 pub const ERROR_INTERNAL_ERROR: i64 = -32603;
 
-mod hooks;
 mod resources;
 mod tools;
 #[cfg(feature = "transport-http")]
 pub mod transport;
 
-pub use hooks::*;
 pub use tools::*;
 
 /// MCP server — JSON-RPC 2.0 stdio transport.
@@ -356,9 +354,7 @@ mod tests {
             search: Arc::new(crate::search::SearchEngine::new_empty()),
             neo4j_client: None,
             redis_cache: None,
-            context_service: None,
             contradiction_detector: None,
-            decay_engine: None,
             embedding_service: None,
             experience_service: None,
             ingestion_service: None,
@@ -403,7 +399,7 @@ mod tests {
 
         let tools = response["result"]["tools"].as_array().unwrap();
         assert!(!tools.is_empty(), "Should return non-empty tools list");
-        assert_eq!(tools.len(), 22, "Should return exactly 22 tools");
+        assert_eq!(tools.len(), 25, "Should return exactly 25 tools");
     }
 
     #[tokio::test]

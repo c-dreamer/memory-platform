@@ -8,7 +8,6 @@ pub mod handlers;
 
 use axum::Router;
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
 
 #[cfg(feature = "transport-http")]
 use crate::mcp::transport::http_json_rpc_handler;
@@ -112,5 +111,5 @@ pub fn router() -> Router<Arc<AppState>> {
     #[cfg(feature = "transport-http")]
     let router = router.route("/mcp", axum::routing::post(http_json_rpc_handler));
 
-    router.layer(CorsLayer::permissive())
+    router
 }

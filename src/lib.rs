@@ -24,9 +24,7 @@ use db::postgres::PostgresDb;
 use db::redis::RedisCache;
 use queue::PendingWriteQueue;
 use search::SearchEngine;
-use services::context::ContextService;
 use services::contradiction::ContradictionDetector;
-use services::decay::DecayEngine;
 use services::embedding::EmbeddingService;
 use services::experience::ExperienceService;
 use services::ingestion::IngestionService;
@@ -40,9 +38,7 @@ pub struct AppState {
     pub search: Arc<SearchEngine>,
     pub neo4j_client: Option<Arc<GraphClient>>,
     pub redis_cache: Option<Arc<RedisCache>>,
-    pub context_service: Option<Arc<ContextService>>,
     pub contradiction_detector: Option<Arc<ContradictionDetector>>,
-    pub decay_engine: Option<Arc<DecayEngine>>,
     pub embedding_service: Option<Arc<dyn EmbeddingService>>,
     pub experience_service: Option<Arc<ExperienceService>>,
     pub ingestion_service: Option<Arc<IngestionService>>,
@@ -64,9 +60,7 @@ impl std::fmt::Debug for AppState {
                 "redis_cache",
                 &self.redis_cache.as_ref().map(|_| "(RedisCache)"),
             )
-            .field("context_service", &self.context_service)
             .field("contradiction_detector", &self.contradiction_detector)
-            .field("decay_engine", &self.decay_engine)
             .field(
                 "embedding_service",
                 &self

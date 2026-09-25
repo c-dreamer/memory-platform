@@ -30,11 +30,16 @@ path = "src/bin/neon-sync.rs"
 name = "search-eval"
 path = "src/bin/search_eval.rs"
 
+[[bin]]
+name = "memory-snapshot"
+path = "src/bin/memory-snapshot.rs"
+
 [lib]
 name = "memory_platform"
 path = "src/lib.rs"
 
 [dependencies]
+subtle = "2"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tracing", "matched-path", "original-uri"] }
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "sqlite", "uuid", "chrono", "json", "migrate", "derive", "macros"] }

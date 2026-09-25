@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 use crate::AppState;
 
@@ -50,7 +51,7 @@ impl FromRequestParts<Arc<AppState>> for Auth {
             .and_then(|v| v.to_str().ok())
             .ok_or(AuthError)?;
 
-        if api_key != state.config.api_key {
+        if !bool::from(api_key.as_bytes().ct_eq(state.config.api_key.as_bytes())) {
             return Err(AuthError);
         }
 

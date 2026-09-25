@@ -76,6 +76,8 @@ async fn main() -> Result<()> {
     let mut latencies_ms = Vec::with_capacity(fixtures.queries.len());
     let mut hits = 0usize;
     let mut context_chars = 0usize;
+    let mut reciprocal_ranks = Vec::with_capacity(fixtures.queries.len());
+    let mut ndcgs = Vec::with_capacity(fixtures.queries.len());
 
     for q in &fixtures.queries {
         let start = Instant::now();
@@ -85,6 +87,8 @@ async fn main() -> Result<()> {
             .context("search failed")?;
         latencies_ms.push(start.elapsed().as_secs_f64() * 1000.0);
 
+        // `expect` is ordered most-to-least relevant; earlier entries carry a
+        // higher relevance grade for nDCG.
         let expected_ids: Vec<Uuid> = q
             .expect
             .iter()
@@ -95,6 +99,15 @@ async fn main() -> Result<()> {
         } else {
             eprintln!("MISS: query {:?}, expected {:?}", q.query, q.expect);
         }
+
+        let rr = results
+            .iter()
+            .position(|r| expected_ids.contains(&r.id))
+            .map(|pos| 1.0 / (pos as f64 + 1.0))
+            .unwrap_or(0.0);
+        reciprocal_ranks.push(rr);
+        ndcgs.push(ndcg(&results, &expected_ids));
+
         context_chars += results.iter().map(|r| r.content.len()).sum::<usize>();
     }
 
@@ -130,6 +143,14 @@ async fn main() -> Result<()> {
         percentile(&latencies_ms, 95.0)
     );
     println!("  avg context tokens per query (top {TOP_K}): {avg_context_tokens:.0}");
+    println!(
+        "  MRR@{TOP_K}: {:.3}",
+        reciprocal_ranks.iter().sum::<f64>() / reciprocal_ranks.len() as f64
+    );
+    println!(
+        "  nDCG@{TOP_K}: {:.3}",
+        ndcgs.iter().sum::<f64>() / ndcgs.len() as f64
+    );
 
     Ok(())
 }
@@ -140,4 +161,39 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
     }
     let idx = ((pct / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
+}
+
+/// nDCG@K against `expected_ids`, ordered most-to-least relevant.
+///
+/// Relevance grade is `expected_ids.len() - position`, so the first expected
+/// id is worth more than the last — this is what makes nDCG sensitive to
+/// rank order rather than just any-hit, unlike `recall@K`.
+fn ndcg(results: &[memory_platform::search::SearchResult], expected_ids: &[Uuid]) -> f64 {
+    if expected_ids.is_empty() {
+        return 0.0;
+    }
+    let grade = |id: &Uuid| -> f64 {
+        expected_ids
+            .iter()
+            .position(|e| e == id)
+            .map(|pos| (expected_ids.len() - pos) as f64)
+            .unwrap_or(0.0)
+    };
+    let dcg: f64 = results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| grade(&r.id) / ((i as f64 + 2.0).log2()))
+        .sum();
+    let mut ideal_grades: Vec<f64> = (1..=expected_ids.len()).map(|g| g as f64).rev().collect();
+    ideal_grades.truncate(results.len().max(expected_ids.len()));
+    let idcg: f64 = ideal_grades
+        .iter()
+        .enumerate()
+        .map(|(i, g)| g / ((i as f64 + 2.0).log2()))
+        .sum();
+    if idcg == 0.0 {
+        0.0
+    } else {
+        dcg / idcg
+    }
 }

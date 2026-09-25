@@ -1,5 +1,6 @@
-//! MCP tool handlers — 22 tools: 18 matching the Python memory_mcp.py, plus
-//! contradiction_scan/contradiction_resolve/memory_relate/memory_graph (Rust-only).
+//! MCP tool handlers — 25 tools: 18 matching the Python memory_mcp.py, plus
+//! contradiction_scan/contradiction_resolve/memory_relate/memory_graph/core_memory/
+//! procedure_promote/session_lineage (Rust-only).
 //!
 //! Each tool is a standalone async function that takes `&AppState` and
 //! a `serde_json::Value` arguments map, returning a JSON string result.
@@ -140,13 +141,44 @@ pub fn list_tools() -> Value {
         },
         {
             "name": "forget",
-            "description": "Soft-delete a memory by ID. Marks it as removed without permanent deletion.",
+            "description": "Soft-delete a memory by ID. Expires it so it no longer appears in memory_search or memory_graph, without permanent deletion. To undo: clear expiration_date (optionally restoring it from metadata.pre_forget_expiration_date, where the prior value is preserved).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "UUID of memory to forget" }
                 },
                 "required": ["id"]
+            }
+        },
+        {
+            "name": "core_memory",
+            "description": "Return the always-relevant memory block: every memory tagged 'critical', with no search query needed. Mirrors Letta/MemGPT's core memory tier — pin a fact by calling memory_store with critical=true, then it surfaces here on every call instead of only when a query happens to match it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "description": "Max results (default: 20)", "default": 20 }
+                }
+            }
+        },
+        {
+            "name": "procedure_promote",
+            "description": "Cluster successful experiences by embedding similarity and promote each matched pair into a reusable procedure, mirroring the procedural-memory pattern from Memp/ProcMEM research: turn repeated successful action sequences into a named, reusable skill instead of re-discovering them every time. Idempotent — promoted experiences are marked so the same pair is never promoted twice.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "threshold": { "type": "number", "description": "Minimum cosine similarity to count as a match (default: 0.85)", "default": 0.85 }
+                }
+            }
+        },
+        {
+            "name": "session_lineage",
+            "description": "Walk a session's ancestry up parent_session_id, root first, returning each ancestor's goal and summary as one narrative. Sessions already form a tree, but each summary only describes its own session — this is what reads the chain, so work spanning several linked sessions has a story above the individual link.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "UUID of the session to walk up from" }
+                },
+                "required": ["session_id"]
             }
         },
         {
@@ -288,6 +320,9 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result
         "session_end" => tool_session_end(state, arguments).await,
         "recall" => tool_recall(state, arguments).await,
         "forget" => tool_forget(state, arguments).await,
+        "core_memory" => tool_core_memory(state, arguments).await,
+        "procedure_promote" => tool_procedure_promote(state, arguments).await,
+        "session_lineage" => tool_session_lineage(state, arguments).await,
         "list" => tool_list(state, arguments).await,
         "status" => tool_status(state, arguments).await,
         "archive_status" => tool_archive_status(state, arguments).await,
@@ -429,7 +464,7 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
         .get("critical")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut importance = get_f64(&args, "importance").unwrap_or(0.5);
+    let mut importance = get_f64(&args, "importance").unwrap_or(0.5).clamp(0.0, 1.0);
     if critical {
         importance = importance.max(0.9);
         if !tags.iter().any(|tag| tag == "critical") {
@@ -467,19 +502,18 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
     };
     let embedding_slice = embedding.as_deref();
 
-    // Near-duplicate consolidation: an incoming memory whose embedding is
-    // >=0.95 cosine-similar to an existing one is treated as the same fact
-    // restated, not a new memory. 0.95, not the 0.85 ContradictionDetector
-    // uses for "worth comparing" (src/services/contradiction.rs) — merging
-    // is destructive/identity-preserving, so a false-positive match at a
-    // looser threshold would silently discard a genuinely distinct memory.
-    // On a hit: reinforce the existing row (bump access_count via
-    // record_memory_access), union tags, raise importance to the max of
-    // old vs new, and return its id — no new row is inserted. Skipped
-    // without an embedding service: there's no signal to compare on, and
-    // this trades recall (a real near-duplicate slips through as separate
-    // rows) for never mis-merging two unrelated memories.
-    if let Some(emb) = embedding_slice {
+    // Near-duplicate detection: an incoming memory whose embedding is >=0.95
+    // cosine-similar to an existing one is treated as the same fact restated.
+    // 0.95, not the 0.85 ContradictionDetector uses for "worth comparing"
+    // (src/services/contradiction.rs) — a false-positive match at a looser
+    // threshold would wrongly supersede a genuinely distinct memory. The new
+    // memory is stored normally below (nothing dropped from the caller's
+    // content/expiration_date/valid_at/metadata); on a hit, the OLD row is
+    // then superseded via the same UPDATE pattern contradiction_resolve uses,
+    // so vector_search/bm25_search's existing `superseded_by IS NULL` filter
+    // excludes it automatically — no dead-end signal, no caller action
+    // required. Skipped without an embedding service: no signal to compare on.
+    let superseded_id = if let Some(emb) = embedding_slice {
         let similar = state
             .db
             .vector_search(
@@ -492,50 +526,10 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
             )
             .await
             .context("Failed near-duplicate search")?;
-        if let Some(dup) = similar.into_iter().next() {
-            if let Some(existing) = state.db.get_memory(dup.id).await? {
-                state.db.record_memory_access(existing.id).await?;
-                let mut merged_tags = existing.tags.clone();
-                for t in &tags {
-                    if !merged_tags.contains(t) {
-                        merged_tags.push(t.clone());
-                    }
-                }
-                let merged_importance = existing.importance.max(importance);
-                sqlx::query("UPDATE memories SET importance = $1, tags = $2 WHERE id = $3")
-                    .bind(merged_importance)
-                    .bind(&merged_tags)
-                    .bind(existing.id)
-                    .execute(&state.db.pool)
-                    .await
-                    .context("Failed to merge near-duplicate memory")?;
-
-                if let Some(sid) = session_id {
-                    let _ = sqlx::query("SELECT record_memory_access($1, $2, 'accessed', $3)")
-                        .bind(sid)
-                        .bind(existing.id)
-                        .bind(merged_importance)
-                        .execute(&state.db.pool)
-                        .await;
-                }
-
-                info!(
-                    "memory_store: deduplicated into existing memory {} (similarity {:.3})",
-                    existing.id, dup.score
-                );
-
-                let result = json!({
-                    "id": existing.id,
-                    "content_type": existing.content_type,
-                    "importance": merged_importance,
-                    "tags": merged_tags,
-                    "created_at": existing.created_at,
-                    "deduplicated": true,
-                });
-                return Ok(serde_json::to_string(&result)?);
-            }
-        }
-    }
+        similar.into_iter().next().map(|dup| dup.id)
+    } else {
+        None
+    };
 
     let memory = match state
         .db
@@ -570,12 +564,30 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
             .await;
     }
 
+    if let Some(old_id) = superseded_id {
+        sqlx::query(
+            "UPDATE memories SET superseded_by = $1, superseded_at = now(), \
+             invalid_at = COALESCE(invalid_at, now()) WHERE id = $2",
+        )
+        .bind(memory.id)
+        .bind(old_id)
+        .execute(&state.db.pool)
+        .await
+        .context("Failed to supersede near-duplicate memory")?;
+
+        info!(
+            "memory_store: {} supersedes near-duplicate {}",
+            memory.id, old_id
+        );
+    }
+
     let result = json!({
         "id": memory.id,
         "content_type": memory.content_type,
         "importance": memory.importance,
         "tags": memory.tags,
         "created_at": memory.created_at,
+        "superseded_id": superseded_id,
     });
 
     Ok(serde_json::to_string(&result)?)
@@ -986,12 +998,18 @@ async fn tool_forget(state: &AppState, args: Value) -> Result<String> {
 
     info!("forget: id={id}");
 
-    // Soft-delete: set importance to 0 and add a "forgotten" tag
+    // Soft-delete: expire the memory (excluded by the same filter every other
+    // read path already applies), tag it, and stash the prior expiration_date
+    // in metadata so it can be restored rather than lost. The WHERE guard
+    // makes a repeat forget a no-op instead of overwriting the stashed
+    // original date with the previous call's CURRENT_DATE - 1.
     sqlx::query(
-        "UPDATE memories SET importance = 0.0, \
-         tags = array_append(tags, 'forgotten'), \
+        "UPDATE memories SET \
+         metadata = metadata || jsonb_build_object('pre_forget_expiration_date', expiration_date), \
+         expiration_date = CURRENT_DATE - 1, \
+         tags = CASE WHEN 'forgotten' = ANY(tags) THEN tags ELSE array_append(tags, 'forgotten') END, \
          updated_at = now() \
-         WHERE id = $1",
+         WHERE id = $1 AND NOT ('forgotten' = ANY(tags))",
     )
     .bind(id)
     .execute(&state.db.pool)
@@ -1003,6 +1021,81 @@ async fn tool_forget(state: &AppState, args: Value) -> Result<String> {
         "status": "forgotten",
     });
 
+    Ok(serde_json::to_string(&result)?)
+}
+
+/// core_memory — the always-in-context block: every 'critical'-tagged memory,
+/// no query required. Letta/MemGPT calls this tier "core memory"; this reuses
+/// the existing `critical` flag (memory_store already sets importance>=0.9 and
+/// tags 'critical') instead of adding a new column or table for it.
+async fn tool_core_memory(state: &AppState, args: Value) -> Result<String> {
+    let limit = get_i64(&args, "limit").unwrap_or(20).clamp(1, 100);
+
+    let rows = sqlx::query_as::<_, Memory>(
+        "SELECT id, agent_id, session_id, content, content_type, embedding::TEXT AS embedding, \
+         importance, tags, metadata, last_accessed_at, access_count, \
+         decay_score, created_at, updated_at, expiration_date \
+         FROM memories \
+         WHERE 'critical' = ANY(tags) \
+         AND (expiration_date IS NULL OR expiration_date >= CURRENT_DATE) \
+         AND superseded_by IS NULL \
+         ORDER BY importance DESC, updated_at DESC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(&state.db.pool)
+    .await
+    .context("Failed to load core memory")?;
+
+    let result = json!({ "core_memories": rows, "count": rows.len() });
+    Ok(serde_json::to_string(&result)?)
+}
+
+/// procedure_promote — turn clustered successful experiences into a
+/// reusable procedure (Memp/ProcMEM-style procedural memory). Purely
+/// mechanical: no LLM summarization, the earlier experience's own
+/// `actions`/`lessons_learned` become the procedure's steps/description
+/// verbatim, since that's what `find_similar_experiences` and
+/// `create_procedure` were already built to carry (both existed with zero
+/// callers before this tool wired them up).
+async fn tool_procedure_promote(state: &AppState, args: Value) -> Result<String> {
+    let threshold = get_f64(&args, "threshold").unwrap_or(0.85).clamp(0.0, 1.0);
+
+    let svc = state
+        .procedure_service
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Procedure service unavailable"))?;
+    let promoted = svc.promote_from_experiences(threshold).await?;
+
+    let result = json!({ "promoted": promoted, "count": promoted.len() });
+    Ok(serde_json::to_string(&result)?)
+}
+
+async fn tool_session_lineage(state: &AppState, args: Value) -> Result<String> {
+    let id_str = get_string(&args, "session_id")?;
+    let id = Uuid::parse_str(&id_str).with_context(|| format!("Invalid ID: {id_str}"))?;
+
+    let lineage = state
+        .db
+        .session_lineage(id)
+        .await
+        .context("Failed to walk session lineage")?;
+
+    let narrative: Vec<String> = lineage
+        .iter()
+        .map(|s| {
+            let goal = s.goal.as_deref().unwrap_or("(no goal)");
+            match s.summary.as_deref() {
+                Some(summary) => format!("{goal}: {summary}"),
+                None => goal.to_string(),
+            }
+        })
+        .collect();
+
+    let result = json!({
+        "sessions": lineage,
+        "depth": lineage.len(),
+        "narrative": narrative.join("\n\n"),
+    });
     Ok(serde_json::to_string(&result)?)
 }
 
@@ -1021,7 +1114,8 @@ async fn tool_list(state: &AppState, args: Value) -> Result<String> {
                  importance, tags, metadata, last_accessed_at, access_count, \
                  decay_score, created_at, updated_at, expiration_date \
                  FROM memories \
-                 WHERE expiration_date IS NULL OR expiration_date >= CURRENT_DATE \
+                 WHERE (expiration_date IS NULL OR expiration_date >= CURRENT_DATE) \
+                 AND superseded_by IS NULL \
                  ORDER BY created_at DESC LIMIT $1 OFFSET $2",
             )
             .bind(limit)
@@ -1606,7 +1700,9 @@ async fn fetch_memory_previews(
 
     let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("${i}")).collect();
     let sql = format!(
-        "SELECT id, content FROM memories WHERE id IN ({})",
+        "SELECT id, content FROM memories WHERE id IN ({}) \
+         AND (expiration_date IS NULL OR expiration_date >= CURRENT_DATE) \
+         AND superseded_by IS NULL",
         placeholders.join(",")
     );
 
@@ -1781,9 +1877,7 @@ mod tests {
             search: Arc::new(SearchEngine::new_empty()),
             neo4j_client: None,
             redis_cache: None,
-            context_service: None,
             contradiction_detector: None,
-            decay_engine: None,
             embedding_service: None,
             experience_service: None,
             ingestion_service: None,
@@ -1793,10 +1887,10 @@ mod tests {
     }
 
     #[test]
-    fn list_tools_returns_20_tools() {
+    fn list_tools_returns_25_tools() {
         let tools = list_tools();
         let arr = tools.as_array().expect("tools should be an array");
-        assert_eq!(arr.len(), 22, "Expected 22 tools");
+        assert_eq!(arr.len(), 25, "Expected 25 tools");
     }
 
     #[test]

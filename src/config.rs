@@ -18,6 +18,8 @@ pub enum ConfigError {
     },
     #[error("MEMORY_LOCAL_ONLY=1 but {reason} — refusing to start with a possible network egress path configured")]
     LocalOnly { reason: String },
+    #[error("API_BIND \"{bind}\" is not loopback and API_KEY is empty — refusing to start unauthenticated on a network-reachable interface")]
+    InsecureBind { bind: String },
 }
 
 /// Default embedding dimension for the active production embedding backend.
@@ -47,6 +49,7 @@ pub struct Config {
     // --- API ---
     pub api_key: String,
     pub api_port: u16,
+    pub api_bind: String,
 
     // --- Embeddings ---
     pub embedding_model: String,
@@ -70,7 +73,6 @@ pub struct Config {
     pub cache_ttl_long: u64,
 
     // --- Hybrid Search ---
-    pub search_default_mode: String,
     pub rrf_k: u32,
     pub rrf_vector_weight: f64,
     pub rrf_keyword_weight: f64,
@@ -80,6 +82,7 @@ pub struct Config {
     pub decay_half_life_days: f64,
     pub decay_min_score: f64,
     pub decay_apply_to_search: bool,
+    pub decay_multiplier_floor: f64,
     // Coherence-weighted scoring weights (α, β, γ)
     pub coherence_weight_recency: f64,
     pub coherence_weight_frequency: f64,
@@ -125,7 +128,6 @@ impl fmt::Debug for Config {
             .field("vault_path", &self.vault_path)
             .field("obsidian_api_key", &"***redacted***")
             .field("cache_ttl_short", &self.cache_ttl_short)
-            .field("search_default_mode", &self.search_default_mode)
             .field("decay_enabled", &self.decay_enabled)
             .field("embedding_cache_size", &self.embedding_cache_size)
             .field("local_only", &self.local_only)
@@ -161,6 +163,7 @@ impl Config {
             // --- API ---
             api_key: env_var("API_KEY").unwrap_or_default(),
             api_port: parse_env("API_PORT", 8000)?,
+            api_bind: env_var("API_BIND").unwrap_or_else(|| "127.0.0.1".into()),
 
             // --- Embeddings ---
             embedding_model: env_var("EMBEDDING_MODEL").unwrap_or_else(|| "local".into()),
@@ -186,7 +189,6 @@ impl Config {
             cache_ttl_long: parse_env("CACHE_TTL_LONG", 86400)?,
 
             // --- Hybrid Search ---
-            search_default_mode: env_var("SEARCH_DEFAULT_MODE").unwrap_or_else(|| "hybrid".into()),
             rrf_k: parse_env("RRF_K", 20)?,
             rrf_vector_weight: parse_env("RRF_VECTOR_WEIGHT", 0.6)?,
             rrf_keyword_weight: parse_env("RRF_KEYWORD_WEIGHT", 0.4)?,
@@ -196,6 +198,7 @@ impl Config {
             decay_half_life_days: parse_env("DECAY_HALF_LIFE_DAYS", 90.0)?,
             decay_min_score: parse_env("DECAY_MIN_SCORE", 0.1)?,
             decay_apply_to_search: parse_bool("DECAY_APPLY_TO_SEARCH", true)?,
+            decay_multiplier_floor: parse_env("DECAY_MULTIPLIER_FLOOR", 0.85)?,
             coherence_weight_recency: parse_env("COHERENCE_WEIGHT_RECENCY", 0.3)?,
             coherence_weight_frequency: parse_env("COHERENCE_WEIGHT_FREQUENCY", 0.2)?,
             coherence_weight_semantic: parse_env("COHERENCE_WEIGHT_SEMANTIC", 0.5)?,
@@ -219,6 +222,12 @@ impl Config {
             // --- Local-only mode ---
             local_only: local_only_enabled(),
         };
+
+        if !is_loopback_addr(&cfg.api_bind) && cfg.api_key.is_empty() {
+            return Err(ConfigError::InsecureBind {
+                bind: cfg.api_bind.clone(),
+            });
+        }
 
         if cfg.local_only {
             if cfg.embedding_model != "llama-cpp" {
@@ -300,6 +309,7 @@ impl Default for Config {
             neo4j_password: String::new(),
             api_key: String::new(),
             api_port: 8000,
+            api_bind: "127.0.0.1".into(),
             embedding_model: "local".into(),
             embedding_dim: DEFAULT_EMBEDDING_DIM,
             nvidia_api_url: "https://integrate.api.nvidia.com/v1/embeddings".into(),
@@ -313,7 +323,6 @@ impl Default for Config {
             cache_ttl_short: 300,
             cache_ttl_medium: 3600,
             cache_ttl_long: 86400,
-            search_default_mode: "hybrid".into(),
             rrf_k: 20,
             rrf_vector_weight: 0.6,
             rrf_keyword_weight: 0.4,
@@ -321,6 +330,7 @@ impl Default for Config {
             decay_half_life_days: 90.0,
             decay_min_score: 0.1,
             decay_apply_to_search: true,
+            decay_multiplier_floor: 0.85,
             coherence_weight_recency: 0.3,
             coherence_weight_frequency: 0.2,
             coherence_weight_semantic: 0.5,
@@ -367,6 +377,13 @@ where
 /// Whether `url` resolves to the loopback interface (`127.0.0.1`, `::1`, or
 /// the literal host `localhost`) without needing DNS — the only shapes that
 /// are guaranteed to never leave this machine.
+fn is_loopback_addr(addr: &str) -> bool {
+    addr.eq_ignore_ascii_case("localhost")
+        || addr
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 fn is_loopback_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
@@ -494,7 +511,6 @@ mod tests {
         assert_eq!(cfg.cache_ttl_short, 300);
         assert_eq!(cfg.cache_ttl_medium, 3600);
         assert_eq!(cfg.cache_ttl_long, 86400);
-        assert_eq!(cfg.search_default_mode, "hybrid");
         assert_eq!(cfg.rrf_k, 20);
         assert!((cfg.rrf_vector_weight - 0.6).abs() < f64::EPSILON);
         assert!((cfg.rrf_keyword_weight - 0.4).abs() < f64::EPSILON);
@@ -505,10 +521,7 @@ mod tests {
         assert_eq!(cfg.chunk_size, 512);
         assert_eq!(cfg.chunk_overlap, 64);
         assert_eq!(cfg.max_chunks_per_doc, 100);
-        assert_eq!(
-            cfg.nvidia_embedding_model,
-            "nvidia/nemotron-3-embed-1b"
-        );
+        assert_eq!(cfg.nvidia_embedding_model, "nvidia/nemotron-3-embed-1b");
         assert_eq!(cfg.rust_log, "info");
         assert_eq!(cfg.embedding_cache_size, 1000);
         assert!(!cfg.local_only);
@@ -545,14 +558,12 @@ mod tests {
             &[
                 ("DATABASE_URL", "postgres://custom:5432/db"),
                 ("EMBEDDING_MODEL", "openai"),
-                ("SEARCH_DEFAULT_MODE", "vector"),
                 ("RUST_LOG", "debug"),
             ],
             || {
                 let cfg = Config::from_env().expect("from_env should succeed");
                 assert_eq!(cfg.database_url, "postgres://custom:5432/db");
                 assert_eq!(cfg.embedding_model, "openai");
-                assert_eq!(cfg.search_default_mode, "vector");
                 assert_eq!(cfg.rust_log, "debug");
             },
         );
@@ -811,7 +822,6 @@ mod tests {
                 ("CACHE_TTL_SHORT", "60"),
                 ("CACHE_TTL_MEDIUM", "600"),
                 ("CACHE_TTL_LONG", "6000"),
-                ("SEARCH_DEFAULT_MODE", "keyword"),
                 ("RRF_K", "10"),
                 ("RRF_VECTOR_WEIGHT", "0.8"),
                 ("RRF_KEYWORD_WEIGHT", "0.2"),
@@ -849,7 +859,6 @@ mod tests {
                 assert_eq!(cfg.cache_ttl_short, 60);
                 assert_eq!(cfg.cache_ttl_medium, 600);
                 assert_eq!(cfg.cache_ttl_long, 6000);
-                assert_eq!(cfg.search_default_mode, "keyword");
                 assert_eq!(cfg.rrf_k, 10);
                 assert!((cfg.rrf_vector_weight - 0.8).abs() < f64::EPSILON);
                 assert!((cfg.rrf_keyword_weight - 0.2).abs() < f64::EPSILON);

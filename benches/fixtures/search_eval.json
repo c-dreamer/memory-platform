@@ -49,6 +49,21 @@
       "key": "vault-ingest-chunking",
       "content": "Obsidian vault ingestion splits markdown files into chunks at heading boundaries before embedding.",
       "tags": ["ingest", "markdown"]
+    },
+    {
+      "key": "pg-pool-near-dup",
+      "content": "Reusing open Postgres connections via pooling avoids the overhead of a fresh TCP handshake for every request.",
+      "tags": ["database", "performance"]
+    },
+    {
+      "key": "contradiction-pair-loser",
+      "content": "The RRF fusion weight for keyword search was set to 0.9, favoring exact term matches over semantic similarity.",
+      "tags": ["search", "ranking", "stale"]
+    },
+    {
+      "key": "decay-old-but-relevant",
+      "content": "A memory decay half-life of 30 days was chosen so month-old notes still rank above noise, not just this week's.",
+      "tags": ["decay", "ranking"]
     }
   ],
   "queries": [
@@ -61,6 +76,8 @@
     { "query": "superseded memory contradiction", "expect": ["contradiction-resolution"] },
     { "query": "expiration date hides memory search", "expect": ["expiration-soft-hide"] },
     { "query": "outbox batch transport failure", "expect": ["neon-sync-outbox"] },
-    { "query": "markdown chunk heading boundaries", "expect": ["vault-ingest-chunking"] }
+    { "query": "markdown chunk heading boundaries", "expect": ["vault-ingest-chunking"] },
+    { "query": "Postgres connection pooling reuses open connections avoids TCP handshake", "expect": ["pg-pool", "pg-pool-near-dup"] },
+    { "query": "half-life decay so old notes still rank above noise", "expect": ["decay-old-but-relevant", "decay-half-life"] }
   ]
 }

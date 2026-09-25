@@ -9,9 +9,7 @@ use memory_platform::db::postgres::PostgresDb;
 use memory_platform::mcp;
 use memory_platform::queue::PendingWriteQueue;
 use memory_platform::search::SearchEngine;
-use memory_platform::services::context::ContextService;
 use memory_platform::services::contradiction::ContradictionDetector;
-use memory_platform::services::decay::DecayEngine;
 use memory_platform::services::embedding::{
     EmbeddingConfig, EmbeddingService, EmbeddingServiceFactory,
 };
@@ -109,9 +107,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let context_service = Arc::new(ContextService::new(pool.clone(), Arc::clone(&search)));
     let contradiction_detector = Arc::new(ContradictionDetector::new(pool.clone()));
-    let decay_engine = Arc::new(DecayEngine::new(Arc::clone(&config)));
     let experience_service = Arc::new(ExperienceService::new(
         pool.clone(),
         Arc::clone(&search),
@@ -144,9 +140,7 @@ async fn main() -> anyhow::Result<()> {
         search,
         neo4j_client: None,
         redis_cache: None,
-        context_service: Some(context_service),
         contradiction_detector: Some(contradiction_detector),
-        decay_engine: Some(decay_engine),
         embedding_service,
         experience_service: Some(experience_service),
         ingestion_service: None,

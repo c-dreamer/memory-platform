@@ -19,9 +19,9 @@ general improvements. What that actually involves, as of 2026-09-04:
   PowerShell, not new `#[cfg]` branches in the core.
 - `.env.example` defaults are macOS-shaped (`MEMORY_RUNTIME=homebrew`, an iCloud `VAULT_PATH`,
   `host.docker.internal`). Windows needs its own documented defaults, not edits to the macOS ones.
-- CI (`.github/workflows/ci.yml`) runs `ubuntu-latest` and `macos-latest` only. Adding
-  `windows-latest` to that matrix is the acceptance test for "Windows is supported" — don't claim
-  Windows support before it's green there.
+- CI (`.github/workflows/ci.yml`) runs `ubuntu-latest`, `macos-latest` and `windows-latest`.
+  All three were green as of 2026-09-15 (run 35030790433). Keep Windows green there; that
+  remains the acceptance test for Windows support.
 
 ## This Windows machine
 

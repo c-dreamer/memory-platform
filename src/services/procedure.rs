@@ -3,6 +3,7 @@
 //! Detects procedure candidates from similar experiences and executes stored procedures.
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -17,6 +18,15 @@ pub struct ProcedureResult {
     pub output: String,
     pub duration_ms: u64,
     pub steps_completed: usize,
+}
+
+/// One experience pair promoted into a procedure by `promote_from_experiences`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromotedProcedure {
+    pub procedure_id: Uuid,
+    pub name: String,
+    pub source_experience_ids: [Uuid; 2],
+    pub similarity: f64,
 }
 
 /// Procedure service.
@@ -93,5 +103,60 @@ impl ProcedureService {
             .await
             .context("Failed to save procedure")?;
         Ok(())
+    }
+
+    /// Cluster successful experiences by embedding similarity and promote
+    /// each matched pair into a reusable procedure (Memp/ProcMEM-style
+    /// procedural memory). Purely mechanical: the earlier experience's own
+    /// `actions`/`lessons_learned` become the procedure's steps/description
+    /// verbatim, no LLM summarization. Idempotent — promoted experiences are
+    /// marked so the same pair is never promoted twice. Shared by the
+    /// `procedure_promote` MCP tool and the `detect_procedure_candidates`
+    /// HTTP endpoint.
+    pub async fn promote_from_experiences(&self, threshold: f64) -> Result<Vec<PromotedProcedure>> {
+        let pairs = self
+            .db
+            .find_similar_experiences(threshold)
+            .await
+            .context("Failed to find similar experiences")?;
+
+        let mut promoted = Vec::new();
+        for pair in &pairs {
+            let mut tags: Vec<String> = pair
+                .tags1
+                .iter()
+                .chain(pair.tags2.iter())
+                .cloned()
+                .collect();
+            tags.sort();
+            tags.dedup();
+
+            let procedure = self
+                .db
+                .create_procedure(
+                    &pair.goal1,
+                    pair.lessons_learned1.as_deref(),
+                    &pair.actions1,
+                    None,
+                    Some(pair.id1),
+                    &tags,
+                )
+                .await
+                .context("Failed to create procedure")?;
+
+            self.db
+                .mark_experiences_procedurized(&[pair.id1, pair.id2])
+                .await
+                .context("Failed to mark experiences procedurized")?;
+
+            promoted.push(PromotedProcedure {
+                procedure_id: procedure.id,
+                name: procedure.name,
+                source_experience_ids: [pair.id1, pair.id2],
+                similarity: pair.similarity,
+            });
+        }
+
+        Ok(promoted)
     }
 }
