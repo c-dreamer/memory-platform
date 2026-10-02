@@ -1161,7 +1161,9 @@ async fn rebuild_derived(local: &PgPool, neon: &PgPool) -> Result<()> {
         // the known-source reconstruction above, which only ever reads the
         // *current* value of the source table's own embedding column.
         let vector = vector_from_text(&row.try_get::<String, _>(6)?)?;
-        sqlx::query("INSERT INTO public.embeddings(id,source_table,source_id,embedding,model,dimension,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)")
+        // The bulk rebuild above may already hold this id with the source
+        // column's vector; the cache vector is authoritative for this model.
+        sqlx::query("INSERT INTO public.embeddings(id,source_table,source_id,embedding,model,dimension,created_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding")
             .bind(row.try_get::<Uuid,_>(0)?)
             .bind(source_table)
             .bind(row.try_get::<Uuid,_>(2)?)

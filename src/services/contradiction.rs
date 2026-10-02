@@ -12,7 +12,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::db::postgres::PostgresDb;
-use crate::models::{Contradiction, ContradictionCandidate, Memory};
+use crate::models::{Contradiction, ContradictionCandidate, Embedding, Memory};
 
 /// Negation word pairs used to detect opposing signals in memory content.
 const NEGATION_PAIRS: &[(&str, &str)] = &[
@@ -82,10 +82,19 @@ impl ContradictionDetector {
             .with_context(|| format!("Failed to fetch memory {memory_id}"))?
             .with_context(|| format!("Memory {memory_id} not found"))?;
 
-        let embedding = memory
-            .embedding
-            .as_ref()
-            .with_context(|| format!("Memory {memory_id} has no embedding"))?;
+        // Read from the active-model cache, not memories.embedding: the source
+        // column is NULL under non-NVIDIA backends and holds an older model's
+        // vector after a model switch, while find_candidates filters by model.
+        let embedding: Embedding = sqlx::query_scalar(
+            "SELECT embedding::TEXT FROM embeddings \
+             WHERE source_table = 'memories' AND source_id = $1 AND model = $2",
+        )
+        .bind(id)
+        .bind(&self.db.active_embedding_model)
+        .fetch_optional(&self.db.pool)
+        .await
+        .context("Failed to fetch memory embedding")?
+        .with_context(|| format!("Memory {memory_id} has no embedding"))?;
 
         let candidates = self.find_candidates(&memory, embedding.as_vec()).await?;
 
@@ -366,11 +375,15 @@ impl ContradictionDetector {
     /// Fetch all memories that have embeddings.
     async fn fetch_all_memories_with_embeddings(&self) -> Result<Vec<Memory>> {
         sqlx::query_as::<_, Memory>(
-            "SELECT id, agent_id, session_id, content, content_type, embedding::TEXT AS embedding, \
-                    importance, tags, metadata, last_accessed_at, access_count, \
-                    decay_score, created_at, updated_at, expiration_date \
-             FROM memories WHERE embedding IS NOT NULL",
+            "SELECT m.id, m.agent_id, m.session_id, m.content, m.content_type, \
+                    e.embedding::TEXT AS embedding, \
+                    m.importance, m.tags, m.metadata, m.last_accessed_at, m.access_count, \
+                    m.decay_score, m.created_at, m.updated_at, m.expiration_date \
+             FROM memories m \
+             JOIN embeddings e ON e.source_table = 'memories' AND e.source_id = m.id \
+                              AND e.model = $1",
         )
+        .bind(&self.db.active_embedding_model)
         .fetch_all(&self.db.pool)
         .await
         .context("Failed to fetch memories with embeddings")

@@ -290,8 +290,11 @@ pub fn active_embedding_backend() -> String {
 /// The `public.embeddings.model` identifier for the active backend.
 pub fn active_embedding_model_identifier() -> String {
     match active_embedding_backend().as_str() {
-        "nvidia" => env_var("NVIDIA_EMBEDDING_MODEL")
-            .unwrap_or_else(|| CLOUD_DEFAULT_EMBEDDING_MODEL.into()),
+        // Must match Config::from_env's default, or bare-pool services tag and
+        // search under a different model than PostgresDb::connect does.
+        "nvidia" => {
+            env_var("NVIDIA_EMBEDDING_MODEL").unwrap_or_else(|| "nvidia/nemotron-3-embed-1b".into())
+        }
         "llama-cpp" => {
             env_var("LLAMA_CPP_MODEL_NAME").unwrap_or_else(|| "qwen3-embedding-4b".into())
         }

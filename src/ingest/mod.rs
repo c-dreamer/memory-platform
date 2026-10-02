@@ -243,7 +243,15 @@ impl IngestEngine {
             info!("Document already exists (path={path}), updating content");
             sqlx::query(
                 r#"
-                UPDATE documents SET content = $1, frontmatter = $2, file_size_bytes = $3,
+                WITH _drop AS (
+                    DELETE FROM embeddings
+                    WHERE source_table = 'documents' AND source_id = $6
+                      AND EXISTS (SELECT 1 FROM documents
+                                  WHERE id = $6 AND content IS DISTINCT FROM $1)
+                )
+                UPDATE documents SET content = $1,
+                    embedding = CASE WHEN content IS DISTINCT FROM $1 THEN NULL ELSE embedding END,
+                    frontmatter = $2, file_size_bytes = $3,
                     file_modified_at = $4, checksum = COALESCE($5, checksum),
                     updated_at = now()
                 WHERE id = $6

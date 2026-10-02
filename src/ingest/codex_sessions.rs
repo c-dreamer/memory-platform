@@ -453,29 +453,63 @@ pub async fn ingest_codex_sessions(
                         .unwrap_or("n/a"),
                 );
 
-                let _ = engine
-                    .insert_experience(
-                        Some(mem_session_id),
-                        &title,
-                        Some("Codex session mirror"),
-                        Some(&experience_text),
-                        Some("Codex session archived for memory search"),
-                        &tags,
-                        Some((file.modified_at - started_at).num_seconds().max(0) as i32),
-                        Some("codex"),
-                    )
-                    .await;
+                // A changed archive re-runs this block: update the session's
+                // existing rows in place (keeps ids, embeddings, sync identity)
+                // and insert only the first time.
+                let duration = Some((file.modified_at - started_at).num_seconds().max(0) as i32);
+                let exp_updated = sqlx::query(
+                    "UPDATE experiences SET result = $2, duration_seconds = $3, tags = $4 \
+                     WHERE session_id = $1 AND related_project = 'codex'",
+                )
+                .bind(mem_session_id)
+                .bind(&experience_text)
+                .bind(duration)
+                .bind(&tags)
+                .execute(engine.pool())
+                .await
+                .context("updating Codex experience")?
+                .rows_affected();
+                if exp_updated == 0 {
+                    engine
+                        .insert_experience(
+                            Some(mem_session_id),
+                            &title,
+                            Some("Codex session mirror"),
+                            Some(&experience_text),
+                            Some("Codex session archived for memory search"),
+                            &tags,
+                            duration,
+                            Some("codex"),
+                        )
+                        .await
+                        .context("inserting Codex experience")?;
+                }
 
-                let _ = engine
-                    .insert_memory(
-                        Some(mem_session_id),
-                        &summary_text,
-                        "session",
-                        0.7,
-                        &tags,
-                        &meta,
-                    )
-                    .await;
+                let mem_updated = sqlx::query(
+                    "UPDATE memories SET content = $2, metadata = $3, tags = $4, updated_at = now() \
+                     WHERE session_id = $1 AND metadata->>'source' = 'codex-session'",
+                )
+                .bind(mem_session_id)
+                .bind(&summary_text)
+                .bind(&meta)
+                .bind(&tags)
+                .execute(engine.pool())
+                .await
+                .context("updating Codex memory")?
+                .rows_affected();
+                if mem_updated == 0 {
+                    engine
+                        .insert_memory(
+                            Some(mem_session_id),
+                            &summary_text,
+                            "session",
+                            0.7,
+                            &tags,
+                            &meta,
+                        )
+                        .await
+                        .context("inserting Codex memory")?;
+                }
 
                 summary.imported += 1;
                 info!("Imported Codex session: {}", file.path.display());

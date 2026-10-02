@@ -123,15 +123,25 @@ pub async fn sync_vault(
         let file_path = normalize_path(&file.path, vault_path);
         debug!("Processing vault file: {file_path}");
 
+        // Same checksum at another path is only a rename if this path has no
+        // row yet and the old file is gone — otherwise two notes with identical
+        // content would steal one row between them on every sync.
         let existing: Option<(uuid::Uuid, String)> = sqlx::query_as(
             "SELECT id, path FROM documents \
              WHERE checksum = $1 AND (path LIKE 'vault://%' OR path LIKE '%/obsidian-vault/%') \
-             LIMIT 1",
+             AND (path = $2 OR NOT EXISTS (SELECT 1 FROM documents WHERE path = $2)) \
+             ORDER BY (path = $2) DESC LIMIT 1",
         )
         .bind(&file.checksum)
+        .bind(&file_path)
         .fetch_optional(pool)
         .await
         .with_context(|| format!("Failed to query checksum for {}", file.path.display()))?;
+        let existing = existing.filter(|(_, p)| {
+            p == &file_path
+                || p.strip_prefix("vault://")
+                    .is_none_or(|rel| !vault_path.join(rel).exists())
+        });
 
         if let Some((doc_id, db_path)) = existing {
             if db_path != file_path {
@@ -210,8 +220,13 @@ pub async fn sync_vault(
                 .await?;
 
         let result = if let Some(doc_id) = existing {
+            // Content changed (checksum differed), so the old vector is stale:
+            // drop it and NULL the column so repair-embeddings re-embeds.
             sqlx::query(
-                "UPDATE documents SET \
+                "WITH _drop AS (DELETE FROM embeddings \
+                 WHERE source_table = 'documents' AND source_id = $9) \
+                 UPDATE documents SET \
+                 embedding = NULL, \
                  vault_section = $1, \
                  title = $2, \
                  content = $3, \
