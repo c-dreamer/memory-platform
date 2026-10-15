@@ -23,7 +23,8 @@ fn find_script() -> Result<String> {
     let candidates = vec![
         "scripts/extract_sessions.py",
         "../scripts/extract_sessions.py",
-        "/home/humanoracle26/memory-platform-rust/scripts/extract_sessions.py",
+        // the checkout this binary was built from, so it works from any cwd on any machine
+        concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/extract_sessions.py"),
     ];
 
     for c in &candidates {

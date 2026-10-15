@@ -4,10 +4,10 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/humanoracle26/memory-platform-rust
-EnvironmentFile=-/home/humanoracle26/memory-platform-rust/.env
+WorkingDirectory=__ROOT__
+EnvironmentFile=-__ROOT__/.env
 Environment=RUST_LOG=info
-ExecStart=/home/humanoracle26/memory-platform-rust/target/release/memory-platform
+ExecStart=__ROOT__/target/release/memory-platform
 Restart=always
 RestartSec=5
 

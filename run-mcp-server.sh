@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/humanoracle26/memory-platform-rust
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
 
 if [[ -f .env ]]; then
   set -a
@@ -12,4 +13,4 @@ fi
 
 export RUST_LOG="${MCP_RUST_LOG:-off}"
 
-exec /home/humanoracle26/memory-platform-rust/target/release/mcp-server
+exec "$ROOT/target/release/mcp-server"

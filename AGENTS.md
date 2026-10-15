@@ -76,6 +76,14 @@
   mounted Drive bundle files, checksums, archive ledger, tiers, and queue depth,
   but never creates, archives, restores, or compacts records.
 
+## macOS/Linux MCP Client Configuration
+
+Every agent's stdio `command` is `<repo>/scripts/mcp-entrypoint.sh`, with no
+args and no env. `scripts/install-mcp-clients.sh` prints, or with `--apply` runs,
+the add command for the Claude Code, Codex CLI, Gemini CLI and Hermes Agent CLIs on
+PATH, and prints OpenCode/Cursor JSON. `scripts/setup.sh` builds the release and
+creates the protected env file it reads.
+
 ## Windows MCP Client Configuration
 
 Every agent below points its "command" at the wrapper, never at `mcp-server.exe`
