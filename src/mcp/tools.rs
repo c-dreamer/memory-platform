@@ -460,17 +460,11 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
     let content = get_string(&args, "content")?;
     let mut tags = get_string_array(&args, "tags").unwrap_or_default();
     let content_type = get_string(&args, "content_type").unwrap_or_else(|_| "note".to_string());
-    let critical = args
+    let mut critical = args
         .get("critical")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let mut importance = get_f64(&args, "importance").unwrap_or(0.5).clamp(0.0, 1.0);
-    if critical {
-        importance = importance.max(0.9);
-        if !tags.iter().any(|tag| tag == "critical") {
-            tags.push("critical".into());
-        }
-    }
     let session_id = args
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -530,6 +524,28 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
     } else {
         None
     };
+
+    // A restatement must not silently unpin a critical fact: superseding the
+    // old row drops it from core_memory and its decay exemption, so the new
+    // row inherits critical status from the row it replaces.
+    if let Some(old_id) = superseded_id {
+        let old_critical: bool = sqlx::query_scalar(
+            "SELECT COALESCE('critical' = ANY(tags) OR metadata @> '{\"critical\":true}'::jsonb, false) \
+             FROM memories WHERE id = $1",
+        )
+        .bind(old_id)
+        .fetch_optional(&state.db.pool)
+        .await
+        .context("Failed to read near-duplicate memory")?
+        .unwrap_or(false);
+        critical |= old_critical;
+    }
+    if critical {
+        importance = importance.max(0.9);
+        if !tags.iter().any(|tag| tag == "critical") {
+            tags.push("critical".into());
+        }
+    }
 
     let memory = match state
         .db

@@ -72,7 +72,14 @@ pub async fn ingest_config(
         let config_summary = summarize_config(&content);
         let tags = vec!["opencode-config".to_string(), "configuration".to_string()];
         engine
-            .insert_memory(None, &config_summary, "config", 0.7, &tags, &meta)
+            .upsert_source_memory(
+                "opencode-config",
+                &config_summary,
+                "config",
+                0.7,
+                &tags,
+                &meta,
+            )
             .await
             .context("Failed to insert config summary memory")?;
         report.memories_created += 1;
@@ -125,8 +132,8 @@ pub async fn ingest_config(
 
         let tags = vec!["opencode-config".to_string(), "agents".to_string()];
         engine
-            .insert_memory(
-                None,
+            .upsert_source_memory(
+                "opencode-agent-config",
                 &format!("OpenCode agent configuration ({} bytes)", content.len()),
                 "config",
                 0.6,

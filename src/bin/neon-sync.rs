@@ -537,44 +537,47 @@ async fn queue(local: &PgPool, spec: TableSpec, key: &str, op: &str) -> Result<(
     Ok(())
 }
 
+/// Publishes the oldest unpushed events, at most one batch. Returns 0 only
+/// when no unpushed event remains.
 async fn push_event_batch(local: &PgPool, neon: &PgPool, lease: &TargetLease) -> Result<usize> {
-    let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
-        "SELECT event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at \
-         FROM sync_meta.events WHERE pushed_at IS NULL ORDER BY created_at,event_id LIMIT $1"
-    ).bind(DEFAULT_BATCH_ROWS as i64).fetch_all(local))
-        .await.map_err(|_| anyhow!("local event read timed out"))??;
-    if rows.is_empty() {
-        return Ok(0);
-    }
-
     // Category scope-in/out (documents only, MEMORY_SYNC_INCLUDE/EXCLUDE):
     // excluded rows are stamped pushed_at locally without ever reaching
-    // Neon, so they stop blocking later allowed rows from this same
-    // chronological window on the next run.
+    // Neon, so they stop blocking later allowed rows; a fully excluded window
+    // reads the next one rather than reporting the backlog drained.
     let include = env_list("MEMORY_SYNC_INCLUDE");
     let exclude = env_list("MEMORY_SYNC_EXCLUDE");
-    let mut to_push = Vec::new();
-    let mut skip_ids = Vec::new();
-    for row in &rows {
-        let table_name: String = row.try_get(3)?;
-        let payload: Value = row.try_get(6)?;
-        if include.is_empty() && exclude.is_empty()
-            || category_allowed(&table_name, &payload, &include, &exclude)
-        {
-            to_push.push(row);
-        } else {
-            skip_ids.push(row.try_get::<Uuid, _>(0)?);
+    let to_push = loop {
+        let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
+            "SELECT event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at \
+             FROM sync_meta.events WHERE pushed_at IS NULL ORDER BY created_at,event_id LIMIT $1"
+        ).bind(DEFAULT_BATCH_ROWS as i64).fetch_all(local))
+            .await.map_err(|_| anyhow!("local event read timed out"))??;
+        if rows.is_empty() {
+            return Ok(0);
         }
-    }
-    if !skip_ids.is_empty() {
-        sqlx::query("UPDATE sync_meta.events SET pushed_at=now() WHERE event_id = ANY($1)")
-            .bind(&skip_ids)
-            .execute(local)
-            .await?;
-    }
-    if to_push.is_empty() {
-        return Ok(0);
-    }
+        let mut to_push = Vec::new();
+        let mut skip_ids = Vec::new();
+        for row in rows {
+            let table_name: String = row.try_get(3)?;
+            let payload: Value = row.try_get(6)?;
+            if include.is_empty() && exclude.is_empty()
+                || category_allowed(&table_name, &payload, &include, &exclude)
+            {
+                to_push.push(row);
+            } else {
+                skip_ids.push(row.try_get::<Uuid, _>(0)?);
+            }
+        }
+        if !skip_ids.is_empty() {
+            sqlx::query("UPDATE sync_meta.events SET pushed_at=now() WHERE event_id = ANY($1)")
+                .bind(&skip_ids)
+                .execute(local)
+                .await?;
+        }
+        if !to_push.is_empty() {
+            break to_push;
+        }
+    };
 
     renew_target_lease(neon, lease).await?;
     let mut tx = neon.begin().await?;
@@ -612,13 +615,6 @@ async fn push_event_batch(local: &PgPool, neon: &PgPool, lease: &TargetLease) ->
         .execute(local)
         .await?;
     Ok(to_push.len())
-}
-
-async fn push_events(local: &PgPool, neon: &PgPool, lease: &TargetLease) -> Result<usize> {
-    // Keep event publication interleaved with projection writes. A full event
-    // backlog must not consume the entire run budget before one authoritative
-    // record reaches Neon; the outer recovery loop repeats safely.
-    push_event_batch(local, neon, lease).await
 }
 
 async fn apply_remote_event(local: &PgPool, table: &str, key: &str, payload: &Value) -> Result<()> {
@@ -905,19 +901,28 @@ async fn run_queue(
     neon: &PgPool,
     run_id: Uuid,
     lease: &TargetLease,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     let started = Instant::now();
+    let mut events = 0;
     let mut applied = 0;
     let mut bytes = 0;
     let mut batch_size = DEFAULT_BATCH_ROWS;
     let mut committed_batches = 0usize;
     let mut consecutive_successes = 0usize;
     while started.elapsed() < RUN_BUDGET {
+        // Interleave one event batch per projection round: a large event
+        // backlog must neither starve projection writes nor be left behind
+        // at 25 events per invocation once the outbox is empty.
+        let pushed = push_event_batch(local, neon, lease).await?;
+        events += pushed;
         renew_target_lease(neon, lease).await?;
         let queue_rows = sqlx::query("SELECT table_name,record_key,generation,operation FROM sync_meta.outbox ORDER BY changed_at LIMIT 200")
             .fetch_all(local).await?;
         if queue_rows.is_empty() {
-            break;
+            if pushed == 0 {
+                break;
+            }
+            continue;
         }
         let mut grouped: BTreeMap<String, Vec<OutboxItem>> = BTreeMap::new();
         for row in queue_rows {
@@ -1027,7 +1032,7 @@ async fn run_queue(
             break;
         }
     }
-    Ok((applied, bytes))
+    Ok((applied, bytes, events))
 }
 
 async fn bootstrap_events(local: &PgPool) -> Result<usize> {
@@ -1266,8 +1271,7 @@ async fn push_once(local: &PgPool, neon: &PgPool) -> Result<(usize, usize, usize
         .execute(neon)
         .await?;
     let result = async {
-        let event_count = push_events(local, neon, &lease).await?;
-        let (rows, bytes) = run_queue(local, neon, run, &lease).await?;
+        let (rows, bytes, event_count) = run_queue(local, neon, run, &lease).await?;
         sqlx::query("INSERT INTO sync_meta.state(state_key,state_value) VALUES('last_success',jsonb_build_object('at',now(),'rows',$1,'bytes',$2)) ON CONFLICT(state_key) DO UPDATE SET state_value=EXCLUDED.state_value,updated_at=now()")
             .bind(rows as i64)
             .bind(bytes as i64)

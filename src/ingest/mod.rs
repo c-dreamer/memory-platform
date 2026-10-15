@@ -220,6 +220,115 @@ impl IngestEngine {
         Ok(id)
     }
 
+    /// Upsert the single session-less memory a source owns (keyed by
+    /// `metadata->>'source'`), so re-ingesting refreshes it instead of adding
+    /// a row per run. Changed content clears the stale embedding for backfill.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_source_memory(
+        &self,
+        source: &str,
+        content: &str,
+        content_type: &str,
+        importance: f64,
+        tags: &[String],
+        metadata: &Value,
+    ) -> Result<Uuid> {
+        let updated: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            WITH target AS (
+                SELECT id, content FROM memories
+                WHERE session_id IS NULL AND metadata->>'source' = $1
+                ORDER BY created_at DESC LIMIT 1
+            ), _drop AS (
+                DELETE FROM embeddings e USING target t
+                WHERE e.source_table = 'memories' AND e.source_id = t.id
+                  AND t.content IS DISTINCT FROM $2
+            )
+            UPDATE memories m SET content = $2,
+                embedding = CASE WHEN t.content IS DISTINCT FROM $2 THEN NULL ELSE m.embedding END,
+                content_type = $3, importance = $4, tags = $5, metadata = $6, updated_at = now()
+            FROM target t WHERE m.id = t.id
+            RETURNING m.id
+            "#,
+        )
+        .bind(source)
+        .bind(content)
+        .bind(content_type)
+        .bind(importance.clamp(0.0, 1.0))
+        .bind(tags)
+        .bind(metadata)
+        .fetch_optional(&self.pool)
+        .await
+        .context("updating source memory")?;
+        match updated {
+            Some(id) => Ok(id),
+            None => {
+                self.insert_memory(None, content, content_type, importance, tags, metadata)
+                    .await
+            }
+        }
+    }
+
+    /// Upsert the single session-less experience a source owns (keyed by
+    /// `goal` + `related_project`), same contract as `upsert_source_memory`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_source_experience(
+        &self,
+        goal: &str,
+        reasoning_summary: Option<&str>,
+        result: Option<&str>,
+        lessons_learned: Option<&str>,
+        tags: &[String],
+        related_project: &str,
+    ) -> Result<Uuid> {
+        let updated: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            WITH target AS (
+                SELECT id, reasoning_summary, result, lessons_learned FROM experiences
+                WHERE session_id IS NULL AND goal = $1 AND related_project = $6
+                ORDER BY created_at DESC LIMIT 1
+            ), changed AS (
+                SELECT id FROM target
+                WHERE (reasoning_summary, result, lessons_learned)
+                      IS DISTINCT FROM ($2::text, $3::text, $4::text)
+            ), _drop AS (
+                DELETE FROM embeddings e USING changed c
+                WHERE e.source_table = 'experiences' AND e.source_id = c.id
+            )
+            UPDATE experiences x SET reasoning_summary = $2, result = $3,
+                lessons_learned = $4, tags = $5,
+                embedding = CASE WHEN EXISTS (SELECT 1 FROM changed) THEN NULL ELSE x.embedding END
+            FROM target t WHERE x.id = t.id
+            RETURNING x.id
+            "#,
+        )
+        .bind(goal)
+        .bind(reasoning_summary)
+        .bind(result)
+        .bind(lessons_learned)
+        .bind(tags)
+        .bind(related_project)
+        .fetch_optional(&self.pool)
+        .await
+        .context("updating source experience")?;
+        match updated {
+            Some(id) => Ok(id),
+            None => {
+                self.insert_experience(
+                    None,
+                    goal,
+                    reasoning_summary,
+                    result,
+                    lessons_learned,
+                    tags,
+                    None,
+                    Some(related_project),
+                )
+                .await
+            }
+        }
+    }
+
     /// Insert a document. Returns the new document UUID, or None if a duplicate path exists.
     pub async fn insert_document(
         &self,

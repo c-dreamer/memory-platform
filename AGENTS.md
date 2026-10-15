@@ -43,8 +43,13 @@
   `code_changes` embeddings rather than silently discard them.
 - The canonical embedding model is `nvidia/nemotron-3-embed-1b` (2048-dim). It
   replaced `nvidia/llama-nemotron-embed-1b-v2`, which NVIDIA retired 2026-08-25
-  (`410 Gone`). The dimension is unchanged, so no vector migration is needed;
-  never re-point the config at a model with a different dimension.
+  (`410 Gone`). The dimension is unchanged, so no schema migration is needed;
+  never re-point the config at a model with a different dimension. Existing
+  vectors still need a one-off re-embed: they came from the retired model
+  and/or were embedded as `input_type=query` (before `e48983f`), while the
+  asymmetric model expects stored text as `passage`. See
+  `docs/OPERATIONS_STATUS.md` for the procedure; it is operator-run, never
+  automatic.
 - Before a recovery is accepted: run a small-table/document canary, two
   consecutive no-op runs, count and fingerprint parity, embedding dimensions and
   null counts, FTS coverage, migration ledger checks, and queue depth zero.
