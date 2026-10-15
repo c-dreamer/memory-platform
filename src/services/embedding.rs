@@ -32,8 +32,18 @@ const EMBEDDING_REQUEST_RETRIES: usize = 4;
 
 /// Embedding service trait.
 pub trait EmbeddingService: Send + Sync {
-    /// Generate embedding for a single text string.
+    /// Generate embedding for a single text string, as a search query.
     fn embed(&self, text: &str) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>>;
+
+    /// Embed text that is being stored for later retrieval. Asymmetric
+    /// models (NVIDIA retrieval embedders) need passage mode here, or
+    /// retrieval accuracy drops sharply; symmetric backends use `embed`.
+    fn embed_passage(
+        &self,
+        text: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>> {
+        self.embed(text)
+    }
 }
 
 /// Configuration for embedding service.
@@ -142,21 +152,20 @@ impl NvidiaNimEmbedding {
         model: &str,
         expected_dimension: usize,
         text: &str,
+        input_type: &str,
     ) -> Result<Embedding> {
-        // Truncate to ~512 tokens (Unicode-safe, ~2048 bytes)
-        let truncated_text = if text.chars().count() > 512 {
-            text.chars().take(512).collect::<String>()
-        } else {
-            text.to_string()
-        };
+        // Chunks are <= 4000 chars, well under nemotron-3-embed-1b's 4096-token
+        // limit; truncate=END covers token-dense (e.g. CJK) text instead of
+        // erroring.
         for attempt in 0..=EMBEDDING_REQUEST_RETRIES {
             let response = client
                 .post(api_url)
                 .header("Authorization", format!("Bearer {}", api_key))
                 .json(&serde_json::json!({
-                    "input": truncated_text,
+                    "input": text,
                     "model": model,
-                    "input_type": "query",
+                    "input_type": input_type,
+                    "truncate": "END",
                 }))
                 .send()
                 .await;
@@ -196,7 +205,25 @@ impl NvidiaNimEmbedding {
 
 impl EmbeddingService for NvidiaNimEmbedding {
     fn embed(&self, text: &str) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>> {
+        self.embed_as(text, "query")
+    }
+
+    fn embed_passage(
+        &self,
+        text: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>> {
+        self.embed_as(text, "passage")
+    }
+}
+
+impl NvidiaNimEmbedding {
+    fn embed_as(
+        &self,
+        text: &str,
+        input_type: &'static str,
+    ) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>> {
         let text = text.to_string();
+        let cache_key = format!("{input_type}\u{0}{text}");
         let client = self.client.clone();
         let api_url = self.api_url.clone();
         let api_key = self.api_key.clone();
@@ -211,7 +238,7 @@ impl EmbeddingService for NvidiaNimEmbedding {
             // Check cache first
             {
                 let mut cache = cache.lock().await;
-                if let Some(cached) = cache.get(&text) {
+                if let Some(cached) = cache.get(&cache_key) {
                     return Ok(cached.clone());
                 }
             }
@@ -225,6 +252,7 @@ impl EmbeddingService for NvidiaNimEmbedding {
                     &model,
                     expected_dimension,
                     &chunks[0],
+                    input_type,
                 )
                 .await?
             } else {
@@ -239,6 +267,7 @@ impl EmbeddingService for NvidiaNimEmbedding {
                         &model,
                         expected_dimension,
                         chunk,
+                        input_type,
                     )
                     .await?;
                     let values = chunk_embedding.into_inner();
@@ -269,7 +298,7 @@ impl EmbeddingService for NvidiaNimEmbedding {
             // Update cache
             {
                 let mut cache = cache.lock().await;
-                cache.put(text, embedding.clone());
+                cache.put(cache_key, embedding.clone());
             }
 
             Ok(embedding)
@@ -538,6 +567,16 @@ impl EmbeddingService for EmbeddingServiceFactory {
         match self {
             Self::Nvidia(service) => Box::pin(async move { service.embed(&text).await }),
             Self::LlamaCpp(service) => Box::pin(async move { service.embed(&text).await }),
+        }
+    }
+
+    fn embed_passage(
+        &self,
+        text: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>> {
+        match self {
+            Self::Nvidia(service) => service.embed_passage(text),
+            Self::LlamaCpp(service) => service.embed_passage(text),
         }
     }
 }

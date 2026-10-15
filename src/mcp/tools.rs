@@ -495,7 +495,7 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
     // Generate embedding if available
     let embedding = match &state.embedding_service {
         Some(svc) => {
-            let emb = svc.embed(&content).await?;
+            let emb = svc.embed_passage(&content).await?;
             Some(emb.as_vec().to_vec())
         }
         None => None,
@@ -857,7 +857,7 @@ async fn tool_session_start(state: &AppState, args: Value) -> Result<String> {
         .context("Failed to create session")?;
 
     if let Some(svc) = &state.embedding_service {
-        if let Ok(embedding) = svc.embed(&format!("goal: {goal}")).await {
+        if let Ok(embedding) = svc.embed_passage(&format!("goal: {goal}")).await {
             let _ = state
                 .db
                 .update_session_embedding(session.id, embedding.as_vec())
@@ -893,7 +893,7 @@ async fn tool_session_end(state: &AppState, args: Value) -> Result<String> {
 
     if let Some(svc) = &state.embedding_service {
         let text = format!("summary: {summary}");
-        if let Ok(embedding) = svc.embed(&text).await {
+        if let Ok(embedding) = svc.embed_passage(&text).await {
             let _ = state
                 .db
                 .update_session_embedding(session_id, embedding.as_vec())

@@ -107,7 +107,7 @@ impl ExperienceService {
 
         let embedding = if let Some(service) = &self.embedding_service {
             let text = compose_experience_text(&data);
-            Some(service.embed(&text).await?.into_inner())
+            Some(service.embed_passage(&text).await?.into_inner())
         } else {
             None
         };

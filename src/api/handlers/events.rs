@@ -98,7 +98,7 @@ async fn store_event(state: &AppState, body: &EventCreate) -> anyhow::Result<Mem
     };
 
     let embedding = match &state.embedding_service {
-        Some(svc) => match svc.embed(&content).await {
+        Some(svc) => match svc.embed_passage(&content).await {
             Ok(emb) => Some(emb.as_vec().to_vec()),
             Err(e) => {
                 tracing::warn!("Failed to embed event content: {e}");

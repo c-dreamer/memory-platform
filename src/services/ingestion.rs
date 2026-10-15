@@ -133,7 +133,7 @@ impl IngestionService {
         if chunks.is_empty() {
             // Single chunk for the whole body
             let checksum = compute_checksum(&body);
-            let embedding = self.embedder.embed(&body).await?;
+            let embedding = self.embedder.embed_passage(&body).await?;
             let chunk_path = relative_path_str(file_path, vault_root);
 
             self.db
@@ -161,7 +161,7 @@ impl IngestionService {
         for (i, (heading, text)) in chunks.iter().enumerate() {
             let chunk_path = format!("{}#chunk_{}", relative_path_str(file_path, vault_root), i);
             let checksum = compute_checksum(text);
-            let embedding = self.embedder.embed(text).await?;
+            let embedding = self.embedder.embed_passage(text).await?;
 
             self.db
                 .upsert_document(
@@ -208,7 +208,7 @@ impl IngestionService {
         files_scanned = docs.len() as u64;
 
         for doc in &docs {
-            match self.embedder.embed(&doc.content).await {
+            match self.embedder.embed_passage(&doc.content).await {
                 Ok(embedding) => {
                     let result = self
                         .db
@@ -282,7 +282,7 @@ impl IngestionService {
 
             match tokio::time::timeout(
                 std::time::Duration::from_secs(REPAIR_EMBED_TIMEOUT_SECS),
-                self.embedder.embed(&memory.content),
+                self.embedder.embed_passage(&memory.content),
             )
             .await
             {
@@ -356,7 +356,7 @@ impl IngestionService {
             let text = compose_experience_text(experience);
             match tokio::time::timeout(
                 std::time::Duration::from_secs(REPAIR_EMBED_TIMEOUT_SECS),
-                self.embedder.embed(&text),
+                self.embedder.embed_passage(&text),
             )
             .await
             {
@@ -421,7 +421,7 @@ impl IngestionService {
             let text = compose_session_text(session);
             match tokio::time::timeout(
                 std::time::Duration::from_secs(REPAIR_EMBED_TIMEOUT_SECS),
-                self.embedder.embed(&text),
+                self.embedder.embed_passage(&text),
             )
             .await
             {
@@ -495,7 +495,7 @@ impl IngestionService {
                 };
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(REPAIR_EMBED_TIMEOUT_SECS),
-                    self.embedder.embed(embed_text),
+                    self.embedder.embed_passage(embed_text),
                 )
                 .await
                 {

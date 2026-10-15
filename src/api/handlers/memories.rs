@@ -40,7 +40,7 @@ pub async fn store_memory(
     };
 
     let embedding = match &state.embedding_service {
-        Some(svc) => match svc.embed(&body.content).await {
+        Some(svc) => match svc.embed_passage(&body.content).await {
             Ok(e) => Some(e.as_vec().to_vec()),
             Err(e) => return err(e),
         },
