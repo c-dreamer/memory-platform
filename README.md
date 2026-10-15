@@ -67,7 +67,7 @@ JSON-RPC dispatcher and `src/mcp/tools.rs` for the tool implementations.
 # Clone and build
 git clone https://github.com/c-dreamer/memory-platform.git
 cd memory-platform
-cp .env.example .env   # Edit for your environment
+./scripts/setup.sh     # creates ~/.config/memory-platform/memory.env (edit it); .env links to it
 
 # Run database migrations
 cargo run --bin memory-platform  # Runs migrations on startup
@@ -114,7 +114,9 @@ This will:
 
 ### Persistent MCP
 
-OpenCode should point to the HTTP MCP endpoint served by the main daemon:
+Every agent can launch the stdio server through `scripts/mcp-entrypoint.sh` (see
+"Linux / macOS in one step" above). OpenCode can alternatively use the HTTP MCP
+endpoint served by the main daemon:
 
 - Build with `transport-http` enabled.
 - Run `memory-platform` as a persistent user service.

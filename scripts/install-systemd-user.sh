@@ -15,4 +15,5 @@ systemctl --user daemon-reload
 
 echo "Installed memory-platform user units into $UNITS for $ROOT. Enable what you need, e.g.:"
 echo "  systemctl --user enable --now memory-platform.service"
-echo "  systemctl --user enable --now memory-neon-sync.timer memory-ingest.timer memory-backup-verify.timer memory-archive-verify.timer"
+echo "  systemctl --user enable --now memory-neon-sync.timer memory-ingest.timer"
+echo "memory-archive-verify.timer needs MEMORY_ARCHIVE_ROOT and memory-backup-verify.timer your rclone remotes (scripts/verify_backups.py)."

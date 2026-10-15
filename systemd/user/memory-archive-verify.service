@@ -6,4 +6,4 @@ After=network-online.target
 Type=oneshot
 WorkingDirectory=__ROOT__
 EnvironmentFile=-__ROOT__/.env
-ExecStart=__ROOT__/scripts/verify-memory-archive.sh
+ExecStart="__ROOT__/scripts/verify-memory-archive.sh"

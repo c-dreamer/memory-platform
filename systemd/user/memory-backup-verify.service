@@ -6,4 +6,4 @@ After=network-online.target
 Type=oneshot
 WorkingDirectory=__ROOT__
 EnvironmentFile=-__ROOT__/.env
-ExecStart=/usr/bin/env python3 __ROOT__/scripts/verify_backups.py
+ExecStart=/usr/bin/env python3 "__ROOT__/scripts/verify_backups.py"

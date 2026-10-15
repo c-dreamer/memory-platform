@@ -6,9 +6,9 @@ After=network-online.target
 Type=oneshot
 WorkingDirectory=__ROOT__
 EnvironmentFile=-__ROOT__/.env
-Environment=MEMORY_ENV_FILE=__ROOT__/.env
+Environment="MEMORY_ENV_FILE=__ROOT__/.env"
 Environment=RUST_LOG=info
 # Sync requires a Neon direct endpoint. It is intentionally not derived from a
 # pooler URL: add NEON_DIRECT or NEON_SYNC_URL to the protected environment
 # file after obtaining the direct connection string from Neon.
-ExecStart=__ROOT__/sync-to-neon.sh
+ExecStart="__ROOT__/sync-to-neon.sh"
