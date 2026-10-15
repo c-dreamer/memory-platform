@@ -67,7 +67,7 @@ JSON-RPC dispatcher and `src/mcp/tools.rs` for the tool implementations.
 # Clone and build
 git clone https://github.com/c-dreamer/memory-platform.git
 cd memory-platform
-cp .env.example .env   # Edit for your environment
+./scripts/setup.sh     # creates ~/.config/memory-platform/memory.env (edit it); .env links to it
 
 # Run database migrations
 cargo run --bin memory-platform  # Runs migrations on startup
@@ -79,6 +79,23 @@ cargo test --test integration
 # Run with live database
 DATABASE_URL=postgresql://... cargo test --test integration -- --include-ignored
 ```
+
+### Linux / macOS in one step
+
+```bash
+git clone https://github.com/c-dreamer/memory-platform.git && cd memory-platform
+./scripts/setup.sh                 # build, create ~/.config/memory-platform/memory.env, install user units (Linux)
+$EDITOR ~/.config/memory-platform/memory.env
+./scripts/install-mcp-clients.sh   # prints the add command for each agent CLI found
+./scripts/install-mcp-clients.sh --apply
+```
+
+`setup.sh` never overwrites an existing env file and never touches the database;
+re-run it after a `git pull` to rebuild. Every agent (Claude Code, Codex CLI,
+Gemini CLI, Hermes Agent, OpenCode, Cursor) launches `scripts/mcp-entrypoint.sh`
+over stdio, which loads the env file itself, so no secret goes into client config.
+`install-mcp-clients.sh` registers the CLIs it finds on PATH and prints JSON
+snippets for OpenCode and Cursor.
 
 ### Bootstrap
 
@@ -97,15 +114,19 @@ This will:
 
 ### Persistent MCP
 
-OpenCode should point to the HTTP MCP endpoint served by the main daemon:
+Every agent can launch the stdio server through `scripts/mcp-entrypoint.sh` (see
+"Linux / macOS in one step" above). OpenCode can alternatively use the HTTP MCP
+endpoint served by the main daemon:
 
 - Build with `transport-http` enabled.
 - Run `memory-platform` as a persistent user service.
 - Point OpenCode at `http://127.0.0.1:8000/mcp`.
 
-Recommended service control (macOS/Linux, via the systemd user unit in `systemd/user/`):
+Recommended service control on Linux, via the systemd user units in `systemd/user/`
+(templates; `scripts/install-systemd-user.sh` renders them for this checkout):
 
 ```bash
+./scripts/install-systemd-user.sh
 systemctl --user enable --now memory-platform.service
 ```
 

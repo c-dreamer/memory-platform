@@ -4,7 +4,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/humanoracle26/memory-platform-rust
-EnvironmentFile=-/home/humanoracle26/memory-platform-rust/.env
+WorkingDirectory=__ROOT__
+EnvironmentFile=-__ROOT__/.env
 Environment=RUST_LOG=info
-ExecStart=/home/humanoracle26/memory-platform-rust/ingest.sh all
+ExecStart="__ROOT__/ingest.sh" all
