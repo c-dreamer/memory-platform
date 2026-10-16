@@ -1,0 +1,18 @@
+{
+  "documents": [
+    {
+      "title": "Vault Isolation",
+      "content": "# Main Vault\nGeneral project notes.\n\n## Scope Guard\nExplicit scopes exclude other vaults from structural evidence.",
+      "scope": "Main Vault",
+      "query": "How do explicit scopes prevent vault leaks?",
+      "expected_section": "Scope Guard"
+    },
+    {
+      "title": "Archive Safety",
+      "content": "# Archive Protocol\nArchives retain raw records locally.\n\n## Verification\nDo not compact any record before a verified archive bundle exists.",
+      "scope": "Job Hunt 2026",
+      "query": "When can raw records be compacted?",
+      "expected_section": "Verification"
+    }
+  ]
+}

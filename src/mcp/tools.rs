@@ -5,7 +5,7 @@
 //! a `serde_json::Value` arguments map, returning a JSON string result.
 //! The `call_tool` dispatcher routes by tool name.
 
-use std::{env, path::PathBuf, process::Stdio};
+use std::{env, io::Write, path::PathBuf, process::Stdio};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -34,6 +34,8 @@ pub fn list_tools() -> Value {
                     "limit": { "type": "integer", "description": "Maximum results (default: 10)", "default": 10 },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter by tags (memories/experiences only; ignored for documents/trading_results)", "default": null },
                     "tag_match_mode": { "type": "string", "description": "'any' (default) or 'all' — how `tags` must match", "default": "any" },
+                    "scope": { "type": "string", "description": "Optional explicit vault scope. When supplied, unscoped or other-vault document evidence is excluded.", "default": null },
+                    "structural": { "type": "boolean", "description": "Opt in to experimental section evidence and ranking. Default false until retrieval release gates pass.", "default": false },
                     "start_date": { "type": "string", "description": "ISO-8601 lower bound on created_at (inclusive)", "default": null },
                     "end_date": { "type": "string", "description": "ISO-8601 upper bound on created_at (inclusive)", "default": null }
                 },
@@ -47,6 +49,7 @@ pub fn list_tools() -> Value {
                 "type": "object",
                 "properties": {
                     "content": { "type": "string", "description": "Memory content text" },
+                    "scope": { "type": "string", "description": "Explicit provenance scope; omitted records remain unclassified." },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags for categorization", "default": [] },
                     "content_type": { "type": "string", "description": "Type: note, insight, decision, observation, error", "default": "note" },
                     "importance": { "type": "number", "description": "Importance 0.0-1.0 (default: 0.5)", "default": 0.5 },
@@ -312,6 +315,11 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result
 async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
     let query = get_string(&args, "query")?;
     let limit = get_i64(&args, "limit").unwrap_or(10).clamp(1, 500);
+    let scope = match args.get("scope") {
+        None => None,
+        Some(value) => Some(value.as_str().map(str::trim)
+            .filter(|s| !s.is_empty()).context("scope must be a non-empty string")?),
+    };
     let session_id = args
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -334,7 +342,7 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
             .transpose()
             .context("invalid end_date (expected ISO-8601)")?
             .map(|d| d.with_timezone(&chrono::Utc));
-        if tags.is_none() && start_date.is_none() && end_date.is_none() {
+        if tags.is_none() && start_date.is_none() && end_date.is_none() && scope.is_none() {
             None
         } else {
             Some(crate::db::postgres::SearchFilters {
@@ -342,24 +350,25 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
                 tags_match_any,
                 start_date,
                 end_date,
+                scope: scope.map(str::to_string),
             })
         }
     };
 
-    info!("memory_search: query='{query}', limit={limit}");
-
-    let search_mode = if state.embedding_service.is_some() {
-        "hybrid"
-    } else {
-        warn!("No embedding service — using keyword-only search");
-        "keyword"
-    };
-
-    // Generate embedding if embedding service is available
-    let embedding = match &state.embedding_service {
-        Some(svc) => svc.embed(&query).await?.as_vec().to_vec(),
-        None => vec![],
-    };
+    let structural = args.get("structural").and_then(Value::as_bool).unwrap_or(false);
+    let document_limit = if structural { 30 } else { limit };
+    info!("memory_search: limit={limit}, structural={structural}");
+    // Scoped content stays local until an explicit query-egress policy exists.
+    let embedding = if scope.is_none() {
+        match &state.embedding_service {
+            Some(svc) => match svc.embed(&query).await {
+                Ok(vector) => vector.as_vec().to_vec(),
+                Err(_) => { warn!("Query embedding unavailable; using keyword retrieval"); vec![] }
+            },
+            None => vec![],
+        }
+    } else { vec![] };
+    let search_mode = if embedding.is_empty() { "keyword" } else { "hybrid" };
 
     // Search across all four tables in parallel
     let (memories, documents, experiences, trading) = match tokio::try_join!(
@@ -376,7 +385,7 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
             &query,
             &embedding,
             search_mode,
-            limit,
+            document_limit,
             filters.as_ref()
         ),
         state.search.hybrid_search_filtered(
@@ -403,7 +412,50 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
         }
     };
 
-    // Record cross-references if session_id was provided
+    let mut documents = documents;
+    let mut structural_evidence = Vec::new();
+    let mut hierarchy_available = false;
+    let mut refinement_used = false;
+    if structural {
+    match crate::services::structure::rerank_documents(
+        &state.db.pool,
+        std::mem::take(&mut documents),
+        &query,
+        filters.as_ref(),
+        limit as usize,
+    )
+    .await
+    {
+        Ok(result) => {
+            hierarchy_available = true;
+            refinement_used = result.refinement_used;
+            documents = result.documents;
+            for document in &mut documents {
+                if let Some(node) = result.evidence.get(&document.id) {
+                    document.source_info = format!(
+                        "{}; scope={}; section={}; strategy={search_mode}+structure",
+                        document.source_info, node.root_scope, node.section_path
+                    );
+                    structural_evidence.push(json!({
+                        "document_id": document.id,
+                        "node_id": node.node_id,
+                        "source_checksum": node.source_checksum,
+                        "observed_at": node.observed_at,
+                        "scope": node.root_scope,
+                        "section_path": node.section_path,
+                        "evidence_score": node.score_boost,
+                        "selection_stages": [if refinement_used {"scoped lexical retry"} else {"source retrieval"}, "source-verified section", "score fusion"],
+                        "excerpt": node.excerpt,
+                    }));
+                }
+            }
+        }
+        Err(error) => {
+            warn!("Structural evidence unavailable: {error}");
+            documents.clear();
+        }
+    }
+    }
     if let Some(sid) = session_id {
         let mem_refs: Vec<(Uuid, f64)> = memories.iter().map(|m| (m.id, m.score)).collect();
         let doc_refs: Vec<(Uuid, f64)> = documents.iter().map(|d| (d.id, d.score)).collect();
@@ -415,6 +467,15 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
         "documents": documents,
         "experiences": experiences,
         "trading_results": trading,
+        "structural_evidence": structural_evidence,
+        "retrieval": {
+            "mode": if structural && hierarchy_available { "structural-experimental" } else { "baseline" },
+            "hierarchy_available": hierarchy_available,
+            "refinement_used": refinement_used,
+            "embedding_mode": search_mode,
+            "scope": scope,
+            "insufficient_evidence": documents.is_empty() && memories.is_empty() && experiences.is_empty() && trading.is_empty(),
+        },
     });
 
     Ok(serde_json::to_string(&result)?)
@@ -423,6 +484,11 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
 /// 2. memory_store — store a new memory.
 async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
     let content = get_string(&args, "content")?;
+    let scope = match args.get("scope") {
+        None => "unclassified",
+        Some(value) => value.as_str().map(str::trim).filter(|s| !s.is_empty())
+            .context("scope must be a non-empty string")?,
+    };
     let mut tags = get_string_array(&args, "tags").unwrap_or_default();
     let content_type = get_string(&args, "content_type").unwrap_or_else(|_| "note".to_string());
     let critical = args
@@ -459,26 +525,19 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
 
     // Generate embedding if available
     let embedding = match &state.embedding_service {
+        Some(_) if args.get("scope").is_some() && !state.config.local_only => None,
         Some(svc) => {
-            let emb = svc.embed(&content).await?;
-            Some(emb.as_vec().to_vec())
+            match svc.embed(&content).await {
+                Ok(emb) => Some(emb.as_vec().to_vec()),
+                Err(_) => { warn!("Memory embedding unavailable; preserving source without vector"); None }
+            }
         }
         None => None,
     };
     let embedding_slice = embedding.as_deref();
 
-    // Near-duplicate consolidation: an incoming memory whose embedding is
-    // >=0.95 cosine-similar to an existing one is treated as the same fact
-    // restated, not a new memory. 0.95, not the 0.85 ContradictionDetector
-    // uses for "worth comparing" (src/services/contradiction.rs) — merging
-    // is destructive/identity-preserving, so a false-positive match at a
-    // looser threshold would silently discard a genuinely distinct memory.
-    // On a hit: reinforce the existing row (bump access_count via
-    // record_memory_access), union tags, raise importance to the max of
-    // old vs new, and return its id — no new row is inserted. Skipped
-    // without an embedding service: there's no signal to compare on, and
-    // this trades recall (a real near-duplicate slips through as separate
-    // rows) for never mis-merging two unrelated memories.
+    // Similarity only locates a candidate. Merge exact text in the same scope;
+    // semantic similarity alone must never discard a distinct source memory.
     if let Some(emb) = embedding_slice {
         let similar = state
             .db
@@ -488,12 +547,12 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
                 &state.db.active_embedding_model,
                 1,
                 0.95,
-                None,
+                Some(&crate::db::postgres::SearchFilters {scope:Some(scope.into()), ..Default::default()}),
             )
             .await
             .context("Failed near-duplicate search")?;
         if let Some(dup) = similar.into_iter().next() {
-            if let Some(existing) = state.db.get_memory(dup.id).await? {
+            if let Some(existing) = state.db.get_memory(dup.id).await?.filter(|m| m.content == content) {
                 state.db.record_memory_access(existing.id).await?;
                 let mut merged_tags = existing.tags.clone();
                 for t in &tags {
@@ -544,7 +603,7 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
             &content_type,
             importance,
             &tags,
-            &json!({"critical": critical}),
+            &json!({"critical": critical, "scope":scope}),
             None,
             None,
             embedding_slice,
@@ -1179,6 +1238,23 @@ async fn tool_memory_health(state: &AppState) -> Result<String> {
     .ok()
     .flatten();
     let dimensions = state.db.embedding_dimensions().await.unwrap_or_default();
+    let hierarchy: Option<Value> = sqlx::query(
+        "SELECT count(*)::bigint AS nodes, count(DISTINCT source_id)::bigint AS sources, \
+                count(*) FILTER (WHERE storage_tier='active')::bigint AS active_nodes, \
+                coalesce((SELECT jsonb_object_agg(root_scope, node_count) \
+                          FROM (SELECT root_scope, count(*)::bigint AS node_count \
+                                FROM content_nodes GROUP BY root_scope) scopes), '{}'::jsonb) AS scopes \
+         FROM content_nodes",
+    )
+    .fetch_one(&state.db.pool)
+    .await
+    .ok()
+    .map(|row| json!({
+        "nodes": row.get::<i64, _>("nodes"),
+        "sources": row.get::<i64, _>("sources"),
+        "active_nodes": row.get::<i64, _>("active_nodes"),
+        "scopes": row.get::<Value, _>("scopes"),
+    }));
     let retrieval_mode = if !state.db.health().await {
         "degraded"
     } else if state.embedding_service.is_some() {
@@ -1199,6 +1275,7 @@ async fn tool_memory_health(state: &AppState) -> Result<String> {
             "mode": retrieval_mode,
             "configured_dimension": state.config.embedding_dim,
             "active_dimensions": dimensions,
+            "hierarchy": hierarchy,
         },
         "sync": { "pending_outbox": pending_sync, "pull_cursor": cursor },
     })
@@ -1206,12 +1283,48 @@ async fn tool_memory_health(state: &AppState) -> Result<String> {
 }
 
 fn dashboard_state_dir() -> PathBuf {
-    env::var("XDG_STATE_HOME")
+    env::var_os("XDG_STATE_HOME")
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|| {
             PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/state")
         })
         .join("memory-platform")
+}
+
+fn pause_marker_present(state_dir: &std::path::Path) -> bool {
+    match std::fs::symlink_metadata(state_dir.join("neon-maintenance.paused")) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+fn write_pause_marker(state_dir: &std::path::Path, message: &str) -> std::io::Result<()> {
+    let path = state_dir.join("neon-maintenance.paused");
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    file.write_all(message.as_bytes())
+}
+
+fn remove_pause_marker(state_dir: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::remove_file(state_dir.join("neon-maintenance.paused")) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 async fn tool_dashboard_status(state: &AppState) -> Result<String> {
@@ -1224,12 +1337,13 @@ async fn tool_dashboard_status(state: &AppState) -> Result<String> {
     .fetch_one(&state.db.pool)
     .await?;
     let state_dir = dashboard_state_dir();
+    let paused = pause_marker_present(&state_dir);
     Ok(json!({
         "queue_depth": queue_depth,
         "events_total": events_total,
         "events_published": events_published,
         "events_unpublished": events_total - events_published,
-        "paused": state_dir.join("neon-maintenance.paused").exists(),
+        "paused": paused,
         "retry_pending": state_dir.join("neon-maintenance.retry").exists(),
     })
     .to_string())
@@ -1239,15 +1353,19 @@ async fn tool_dashboard_control(args: Value) -> Result<String> {
     let action = get_string(&args, "action")?;
     let state_dir = dashboard_state_dir();
     std::fs::create_dir_all(&state_dir)?;
-    let pause = state_dir.join("neon-maintenance.paused");
     match action.as_str() {
-        "pause" => std::fs::write(&pause, "paused by MCP\n")?,
+        "pause" => write_pause_marker(&state_dir, "paused by MCP\n")?,
         "resume" | "start" | "retry" | "push_critical" => {
-            let _ = std::fs::remove_file(&pause);
-            run_dashboard_scheduler("start").await?;
+            let was_paused = remove_pause_marker(&state_dir)?;
+            if let Err(error) = run_dashboard_scheduler("start").await {
+                if was_paused {
+                    write_pause_marker(&state_dir, "paused after scheduler start failed\n")?;
+                }
+                return Err(error);
+            }
         }
         "stop" => {
-            std::fs::write(&pause, "stopped by MCP\n")?;
+            write_pause_marker(&state_dir, "stopped by MCP\n")?;
             run_dashboard_scheduler("stop").await?;
         }
         _ => anyhow::bail!("action must be start, pause, resume, retry, push_critical, or stop"),

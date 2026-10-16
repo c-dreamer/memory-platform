@@ -15,11 +15,13 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Connection};
+use sqlx::{Connection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::config::Config;
 use crate::models::*;
+use crate::services::structure;
+use tracing::warn;
 
 // ---------------------------------------------------------------------------
 // Helper structs — not DB-backed, used for insert parameters and return types
@@ -86,13 +88,22 @@ pub struct SearchFilters {
     pub tags_match_any: bool,
     pub start_date: Option<DateTime<Utc>>,
     pub end_date: Option<DateTime<Utc>>,
+    /// Explicit retrieval scope. Tables without a trustworthy scope field fail
+    /// closed rather than returning a potentially cross-vault result.
+    pub scope: Option<String>,
 }
 
 impl SearchFilters {
     /// Build the " AND ..." WHERE-clause fragment for whichever filters are
     /// set, numbering placeholders starting at `start_param`. Returns the SQL
     /// fragment and the next unused placeholder number.
-    fn clause(&self, extra_col: &str, column_prefix: &str, start_param: usize) -> (String, usize) {
+    fn clause(
+        &self,
+        extra_col: &str,
+        column_prefix: &str,
+        start_param: usize,
+        scope_expression: &str,
+    ) -> (String, usize) {
         let mut sql = String::new();
         let mut next = start_param;
         if self.tags.is_some() && extra_col == "tags" {
@@ -106,6 +117,10 @@ impl SearchFilters {
         }
         if self.end_date.is_some() {
             sql.push_str(&format!(" AND {column_prefix}created_at <= ${next}"));
+            next += 1;
+        }
+        if self.scope.is_some() {
+            sql.push_str(&format!(" AND {scope_expression} = ${next}"));
             next += 1;
         }
         (sql, next)
@@ -214,12 +229,14 @@ impl PostgresDb {
             .idle_timeout(Duration::from_secs(60))
             .max_lifetime(None)
             .test_before_acquire(false)
-            .before_acquire(|conn, meta| Box::pin(async move {
-                if meta.idle_for.as_secs() > 60 {
-                    conn.ping().await?;
-                }
-                Ok(true)
-            }))
+            .before_acquire(|conn, meta| {
+                Box::pin(async move {
+                    if meta.idle_for.as_secs() > 60 {
+                        conn.ping().await?;
+                    }
+                    Ok(true)
+                })
+            })
             .acquire_slow_threshold(Duration::from_secs(1))
             .connect(&config.database_url)
             .await?;
@@ -343,7 +360,7 @@ impl PostgresDb {
         goal: Option<&str>,
         parent_session_id: Option<Uuid>,
     ) -> Result<Session, sqlx::Error> {
-        sqlx::query_as::<_, Session>(
+        let row = sqlx::query_as::<_, Session>(
             "INSERT INTO sessions (agent_id, goal, parent_session_id) \
              VALUES ($1, $2, $3) \
              RETURNING id, agent_id, parent_session_id, goal, status, summary, embedding::TEXT as embedding, started_at, ended_at, created_at, updated_at",
@@ -352,7 +369,26 @@ impl PostgresDb {
         .bind(goal)
         .bind(parent_session_id)
         .fetch_one(&self.pool)
+        .await?;
+        if let Err(error) = structure::rebuild_flat_node(
+            &self.pool,
+            "sessions",
+            row.id,
+            "session",
+            "sessions",
+            row.goal.as_deref().unwrap_or("Session"),
+            row.summary
+                .as_deref()
+                .unwrap_or_else(|| row.goal.as_deref().unwrap_or("")),
+            "active",
+            Some(row.updated_at),
+            serde_json::json!({"derived": true, "status": row.status}),
+        )
         .await
+        {
+            warn!(session_id = %row.id, "Session created but structural index rebuild failed: {error}");
+        }
+        Ok(row)
     }
 
     /// Get a session by UUID.
@@ -368,13 +404,35 @@ impl PostgresDb {
 
     /// Mark a session as completed with a summary.
     pub async fn end_session(&self, id: Uuid, summary: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE sessions SET status = 'completed', summary = $1, ended_at = now(), updated_at = now() WHERE id = $2",
+        let row = sqlx::query(
+            "UPDATE sessions SET status = 'completed', summary = $1, ended_at = now(), updated_at = now() \
+             WHERE id = $2 RETURNING goal, status, updated_at",
         )
         .bind(summary)
         .bind(id)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
+        if let Some(row) = row {
+            let goal: Option<String> = row.try_get("goal")?;
+            let status: String = row.try_get("status")?;
+            let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
+            if let Err(error) = structure::rebuild_flat_node(
+                &self.pool,
+                "sessions",
+                id,
+                "session",
+                "sessions",
+                goal.as_deref().unwrap_or("Session"),
+                summary,
+                "active",
+                Some(updated_at),
+                serde_json::json!({"derived": true, "status": status}),
+            )
+            .await
+            {
+                warn!(session_id = %id, "Session completed but structural index rebuild failed: {error}");
+            }
+        }
         Ok(())
     }
 
@@ -464,6 +522,28 @@ impl PostgresDb {
 
         if let Some(embedding) = embedding {
             self.store_embedding("memories", row.id, embedding).await?;
+        }
+
+        let scope = row
+            .metadata
+            .get("scope")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("general");
+        if let Err(error) = structure::rebuild_flat_node(
+            &self.pool,
+            "memories",
+            row.id,
+            "memory",
+            scope,
+            &row.content_type,
+            &row.content,
+            "active",
+            Some(row.updated_at),
+            serde_json::json!({"derived": true, "tags": row.tags}),
+        )
+        .await
+        {
+            warn!(memory_id = %row.id, "Memory saved but structural index rebuild failed: {error}");
         }
 
         Ok(row)
@@ -839,6 +919,16 @@ impl PostgresDb {
         ("content", "tags") // safe fallback
     }
 
+    fn scope_expression(table: &str, prefix: &str) -> String {
+        match table {
+            "memories" => format!("COALESCE(NULLIF(btrim({prefix}metadata->>'scope'), ''), 'unclassified')"),
+            "documents" => format!(
+                "COALESCE(NULLIF(btrim({prefix}frontmatter->>'vault_scope'), ''), 'unclassified')"
+            ),
+            _ => "NULL::text".to_string(),
+        }
+    }
+
     /// Vector similarity search using pgvector `<=>` (cosine distance).
     ///
     /// `model` restricts the comparison to embeddings produced by one model —
@@ -880,8 +970,9 @@ impl PostgresDb {
         } else {
             ""
         };
+        let scope_expression = Self::scope_expression(table, "s.");
         let (filter_clause, limit_param) = filters
-            .map(|f| f.clause(extra_col, "s.", 5))
+            .map(|f| f.clause(extra_col, "s.", 5, &scope_expression))
             .unwrap_or((String::new(), 5));
         let sql = format!(
             "SELECT s.id, COALESCE(s.{text_col}, '') AS content, COALESCE({extra_col_sql}, '') AS source_info, \
@@ -891,6 +982,7 @@ impl PostgresDb {
              WHERE e.source_table = $2 \
                AND e.model = $3 \
                AND e.embedding IS NOT NULL \
+               AND s.storage_tier = 'active' \
                AND (1 - (e.embedding <=> $1::vector))::float8 > $4 \
                {superseded_filter}{expiration_filter}{filter_clause} \
              ORDER BY score DESC \
@@ -902,19 +994,7 @@ impl PostgresDb {
             .bind(table)
             .bind(model)
             .bind(threshold);
-        if let Some(f) = filters {
-            if let Some(tags) = &f.tags {
-                if extra_col == "tags" {
-                    q = q.bind(tags);
-                }
-            }
-            if let Some(d) = f.start_date {
-                q = q.bind(d);
-            }
-            if let Some(d) = f.end_date {
-                q = q.bind(d);
-            }
-        }
+        q = Self::bind_search_filters(q, filters, extra_col);
         q.bind(limit).fetch_all(&self.pool).await
     }
 
@@ -957,8 +1037,9 @@ impl PostgresDb {
         } else {
             ""
         };
+        let scope_expression = Self::scope_expression(table, "");
         let (filter_clause, limit_param) = filters
-            .map(|f| f.clause(extra_col, "", 2))
+            .map(|f| f.clause(extra_col, "", 2, &scope_expression))
             .unwrap_or((String::new(), 2));
 
         if has_fts {
@@ -968,6 +1049,7 @@ impl PostgresDb {
                         ts_rank(fts, plainto_tsquery('english', $1), 32)::float8 AS score \
                  FROM {table} \
                  WHERE fts @@ plainto_tsquery('english', $1) \
+                   AND storage_tier = 'active' \
                  {superseded_filter}{expiration_filter}{filter_clause} \
                  ORDER BY score DESC \
                  LIMIT ${limit_param}"
@@ -990,6 +1072,7 @@ impl PostgresDb {
                     similarity({text_col}, $1)::float8 AS score \
              FROM {table} \
              WHERE {text_col} % $1 \
+               AND storage_tier = 'active' \
              {superseded_filter}{expiration_filter}{filter_clause} \
              ORDER BY score DESC \
              LIMIT ${limit_param}"
@@ -1019,6 +1102,9 @@ impl PostgresDb {
         }
         if let Some(d) = f.end_date {
             q = q.bind(d);
+        }
+        if let Some(scope) = &f.scope {
+            q = q.bind(scope);
         }
         q
     }
@@ -1492,7 +1578,7 @@ mod tests {
     #[test]
     fn search_filters_clause_empty_when_unset() {
         let f = SearchFilters::default();
-        let (sql, next) = f.clause("tags", "s.", 5);
+        let (sql, next) = f.clause("tags", "s.", 5, "'unscoped'");
         assert_eq!(sql, "");
         assert_eq!(next, 5);
     }
@@ -1504,12 +1590,12 @@ mod tests {
             tags_match_any: true,
             ..Default::default()
         };
-        let (sql, next) = f.clause("tags", "s.", 5);
+        let (sql, next) = f.clause("tags", "s.", 5, "'unscoped'");
         assert_eq!(sql, " AND s.tags && $5::text[]");
         assert_eq!(next, 6);
 
         // Ignored on a table without a tags column (e.g. documents/trading_results).
-        let (sql, next) = f.clause("path", "s.", 5);
+        let (sql, next) = f.clause("path", "s.", 5, "'unscoped'");
         assert_eq!(sql, "");
         assert_eq!(next, 5);
     }
@@ -1521,7 +1607,7 @@ mod tests {
             tags_match_any: false,
             ..Default::default()
         };
-        let (sql, _) = f.clause("tags", "s.", 5);
+        let (sql, _) = f.clause("tags", "s.", 5, "'unscoped'");
         assert_eq!(sql, " AND s.tags @> $5::text[]");
     }
 
@@ -1532,13 +1618,40 @@ mod tests {
             tags_match_any: true,
             start_date: Some(Utc::now()),
             end_date: Some(Utc::now()),
+            scope: None,
         };
-        let (sql, next) = f.clause("tags", "", 2);
+        let (sql, next) = f.clause("tags", "", 2, "'unscoped'");
         assert_eq!(
             sql,
             " AND tags && $2::text[] AND created_at >= $3 AND created_at <= $4"
         );
         assert_eq!(next, 5);
+    }
+
+    #[test]
+    fn search_filters_scope_is_bound_last() {
+        let f = SearchFilters {
+            scope: Some("Main Vault".into()),
+            ..Default::default()
+        };
+        let (sql, next) = f.clause(
+            "path",
+            "",
+            2,
+            "COALESCE(frontmatter->>'vault_scope', 'unscoped')",
+        );
+        assert_eq!(
+            sql,
+            " AND COALESCE(frontmatter->>'vault_scope', 'unscoped') = $2"
+        );
+        assert_eq!(next, 3);
+    }
+
+    #[test]
+    fn document_scope_expression_prefers_explicit_scope() {
+        let expression = PostgresDb::scope_expression("documents", "s.");
+        assert!(expression.contains("frontmatter->>'vault_scope'"));
+        assert!(!expression.contains("s.vault_section"));
     }
 
     // ------------------------------------------------------------------

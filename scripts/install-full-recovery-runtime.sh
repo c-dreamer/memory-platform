@@ -14,9 +14,10 @@ PLIST="$HOME/Library/LaunchAgents/com.memory-platform.full-recovery.plist"
   exit 78
 }
 
-install -d "$RUNTIME_ROOT/target/release" "$RUNTIME_ROOT/scripts" "$STATE_DIR" "$HOME/Library/LaunchAgents"
+install -d "$RUNTIME_ROOT/target/release" "$RUNTIME_ROOT/scripts/lib" "$STATE_DIR" "$HOME/Library/LaunchAgents"
 install -m 755 "$ROOT/target/release/neon-sync" "$RUNTIME_ROOT/target/release/neon-sync"
 install -m 755 "$ROOT/scripts/run-full-neon-recovery.sh" "$RUNTIME_ROOT/scripts/run-full-neon-recovery.sh"
+install -m 644 "$ROOT/scripts/lib/pg-env.sh" "$RUNTIME_ROOT/scripts/lib/pg-env.sh"
 printf '%s\n' "$REVISION" > "$RUNTIME_ROOT/target/release/.memory-platform-release"
 chmod 600 "$RUNTIME_ROOT/target/release/.memory-platform-release"
 

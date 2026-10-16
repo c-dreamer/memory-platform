@@ -37,6 +37,10 @@ struct Args {
     #[arg(short = 'n', long = "dry-run")]
     dry_run: bool,
 
+    /// Explicit provenance label for one vault root. Multi-vault parents are refused.
+    #[arg(long, env = "VAULT_SCOPE")]
+    scope: Option<String>,
+
     /// Verbose output.
     #[arg(short = 'V', long = "verbose")]
     verbose: bool,
@@ -69,7 +73,14 @@ async fn main() -> Result<()> {
         .context("Failed to connect to database")?;
     info!("Database connected");
 
-    let summary = vault::sync_vault(&pool, &args.vault_path, args.limit, args.dry_run).await?;
+    let summary = vault::sync_vault(
+        &pool,
+        &args.vault_path,
+        args.limit,
+        args.dry_run,
+        args.scope.as_deref(),
+    )
+    .await?;
 
     println!();
     println!("=== Sync Summary ===");

@@ -6,6 +6,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     env,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -130,6 +131,12 @@ const TABLES: &[TableSpec] = &[
         key: "id",
         natural_key: Some("path"),
         has_embedding: true,
+    },
+    TableSpec {
+        name: "content_nodes",
+        key: "id",
+        natural_key: None,
+        has_embedding: false,
     },
     TableSpec {
         name: "memories",
@@ -380,6 +387,12 @@ BEGIN
         RAISE EXCEPTION 'sync_meta.runtime is not configured; run neon-sync migrate with MEMORY_DEVICE_ID';
     END IF;
     event_payload := record_value - 'embedding' - 'fts';
+    -- Hierarchy content is a local retrieval cache. Only its safe structural
+    -- metadata and checksum reach Neon until a redaction policy explicitly
+    -- approves text for projection.
+    IF TG_TABLE_NAME = 'content_nodes' THEN
+        event_payload := jsonb_set(event_payload, '{content}', to_jsonb(''::text));
+    END IF;
     IF TG_OP = 'DELETE' OR record_value ->> 'storage_tier' <> 'active' THEN
         event_payload := event_payload - 'content' - 'goal' - 'summary';
     END IF;
@@ -538,6 +551,7 @@ async fn queue(local: &PgPool, spec: TableSpec, key: &str, op: &str) -> Result<(
 }
 
 async fn push_event_batch(local: &PgPool, neon: &PgPool, lease: &TargetLease) -> Result<usize> {
+    ensure_sync_not_paused()?;
     let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
         "SELECT event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at \
          FROM sync_meta.events WHERE pushed_at IS NULL ORDER BY created_at,event_id LIMIT $1"
@@ -621,7 +635,12 @@ async fn push_events(local: &PgPool, neon: &PgPool, lease: &TargetLease) -> Resu
     push_event_batch(local, neon, lease).await
 }
 
-async fn apply_remote_event(local: &PgPool, table: &str, key: &str, payload: &Value) -> Result<()> {
+async fn apply_remote_event(tx: &mut sqlx::Transaction<'_, Postgres>, table: &str, key: &str, payload: &Value) -> Result<()> {
+    // The cloud contains a redacted projection; replay must never replace the
+    // authoritative local hierarchy or its source text with that projection.
+    if table == "content_nodes" {
+        return Ok(());
+    }
     let spec = TABLES
         .iter()
         .find(|spec| spec.name == table)
@@ -632,7 +651,7 @@ async fn apply_remote_event(local: &PgPool, table: &str, key: &str, payload: &Va
     let table = quote_ident(spec.name);
     let key_col = quote_ident(spec.key);
     let columns = sqlx::query("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 AND is_generated='NEVER' AND column_name NOT IN ('fts','embedding') ORDER BY ordinal_position")
-        .bind(spec.name).fetch_all(local).await?;
+        .bind(spec.name).fetch_all(&mut **tx).await?;
     let updates: Vec<String> = columns
         .into_iter()
         .map(|row| row.get::<String, _>(0))
@@ -643,12 +662,7 @@ async fn apply_remote_event(local: &PgPool, table: &str, key: &str, payload: &Va
         })
         .collect();
     let sql = format!("INSERT INTO public.{table} SELECT (jsonb_populate_record(NULL::public.{table}, $1)).* ON CONFLICT ({key_col}) DO UPDATE SET {}", updates.join(","));
-    let mut tx = local.begin().await?;
-    sqlx::query("SET LOCAL memory.sync_replay='on'")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(&sql).bind(payload).execute(&mut *tx).await?;
-    tx.commit().await?;
+    sqlx::query(&sql).bind(payload).execute(&mut **tx).await?;
     let _ = key;
     Ok(())
 }
@@ -672,13 +686,17 @@ async fn pull_events(local: &PgPool, neon: &PgPool) -> Result<usize> {
         .await.map_err(|_| anyhow!("remote event read timed out"))??;
     let mut newest = cursor_seq;
     let mut imported = 0;
+    // Commit receipt, projection, and cursor together. Otherwise a failure
+    // after recording receipt causes the next run to skip unapplied data.
+    let mut tx = local.begin().await?;
+    sqlx::query("SET LOCAL memory.sync_replay='on'").execute(&mut *tx).await?;
     for row in rows {
         let event_id: Uuid = row.try_get(0)?;
         let inserted = sqlx::query("INSERT INTO sync_meta.events(event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at,received_at,pushed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),now()) ON CONFLICT(event_id) DO NOTHING")
             .bind(event_id).bind(row.try_get::<String,_>(1)?).bind(row.try_get::<i64,_>(2)?)
             .bind(row.try_get::<String,_>(3)?).bind(row.try_get::<String,_>(4)?).bind(row.try_get::<String,_>(5)?)
             .bind(row.try_get::<Value,_>(6)?).bind(row.try_get::<String,_>(7)?).bind(row.try_get::<Option<Uuid>,_>(8)?)
-            .bind(row.try_get::<chrono::DateTime<chrono::Utc>,_>(9)?).execute(local).await?.rows_affected();
+            .bind(row.try_get::<chrono::DateTime<chrono::Utc>,_>(9)?).execute(&mut *tx).await?.rows_affected();
         let seq: i64 = row.try_get(10)?;
         if seq > newest {
             newest = seq;
@@ -687,7 +705,7 @@ async fn pull_events(local: &PgPool, neon: &PgPool) -> Result<usize> {
             let operation: String = row.try_get(5)?;
             if operation == "upsert" {
                 apply_remote_event(
-                    local,
+                    &mut tx,
                     &row.try_get::<String, _>(3)?,
                     &row.try_get::<String, _>(4)?,
                     &row.try_get::<Value, _>(6)?,
@@ -699,8 +717,9 @@ async fn pull_events(local: &PgPool, neon: &PgPool) -> Result<usize> {
     }
     if newest > cursor_seq {
         sqlx::query("INSERT INTO sync_meta.cursors(cursor_name,cursor_value) VALUES('neon_pull',jsonb_build_object('neon_seq',$1)) ON CONFLICT(cursor_name) DO UPDATE SET cursor_value=EXCLUDED.cursor_value,updated_at=now()")
-            .bind(newest).execute(local).await?;
+            .bind(newest).execute(&mut *tx).await?;
     }
+    tx.commit().await?;
     Ok(imported)
 }
 
@@ -754,7 +773,15 @@ async fn source_rows(local: &PgPool, spec: TableSpec, keys: &[String]) -> Result
     } else {
         ""
     };
-    let sql = format!("SELECT {}::text, to_jsonb(t) - 'fts' - 'embedding'{} FROM public.{} t WHERE {}::text = ANY($1) AND storage_tier='active'", quote_ident(spec.key), vector, quote_ident(spec.name), quote_ident(spec.key));
+    let projection = projection_json(spec, "t");
+    let sql = format!(
+        "SELECT {}::text, {}{} FROM public.{} t WHERE {}::text = ANY($1) AND storage_tier='active'",
+        quote_ident(spec.key),
+        projection,
+        vector,
+        quote_ident(spec.name),
+        quote_ident(spec.key)
+    );
     sqlx::query(&sql)
         .bind(keys)
         .fetch_all(local)
@@ -775,6 +802,19 @@ async fn source_rows(local: &PgPool, spec: TableSpec, keys: &[String]) -> Result
             })
         })
         .collect()
+}
+
+/// Return the cloud-safe representation of a source row. `content_nodes`
+/// retain their raw leaf text locally but project only a blank placeholder,
+/// allowing Neon to track hierarchy, checksums, and scope without receiving
+/// private source bodies by default.
+fn projection_json(spec: TableSpec, alias: &str) -> String {
+    let base = format!("to_jsonb({alias}) - 'fts' - 'embedding'");
+    if spec.name == "content_nodes" {
+        format!("jsonb_set(({base}), '{{content}}', to_jsonb(''::text))")
+    } else {
+        base
+    }
 }
 
 fn batches(rows: Vec<SourceRow>, max_rows: usize) -> Vec<Vec<SourceRow>> {
@@ -913,6 +953,7 @@ async fn run_queue(
     let mut committed_batches = 0usize;
     let mut consecutive_successes = 0usize;
     while started.elapsed() < RUN_BUDGET {
+        ensure_sync_not_paused()?;
         renew_target_lease(neon, lease).await?;
         let queue_rows = sqlx::query("SELECT table_name,record_key,generation,operation FROM sync_meta.outbox ORDER BY changed_at LIMIT 200")
             .fetch_all(local).await?;
@@ -945,6 +986,7 @@ async fn run_queue(
                 }
             }
             for delete_batch in deletes.chunks(batch_size) {
+                ensure_sync_not_paused()?;
                 let keys: Vec<String> = delete_batch.iter().map(|item| item.key.clone()).collect();
                 archive_and_delete_many(neon, run_id, *spec, &keys, "local-delete").await?;
                 acknowledge(local, delete_batch).await?;
@@ -959,6 +1001,7 @@ async fn run_queue(
             // `batch_size` here would otherwise retry the same oversized batch.
             let mut pending_batches = batches(rows, batch_size);
             while let Some(batch) = pending_batches.pop() {
+                ensure_sync_not_paused()?;
                 let entries: Vec<OutboxItem> = batch
                     .iter()
                     .filter_map(|r| {
@@ -979,6 +1022,7 @@ async fn run_queue(
                     .sum();
                 let mut attempt = 0;
                 loop {
+                    ensure_sync_not_paused()?;
                     match apply_batch(neon, run_id, *spec, &cols, &batch).await {
                         Ok(count) => {
                             committed_batches += 1;
@@ -1035,13 +1079,15 @@ async fn bootstrap_events(local: &PgPool) -> Result<usize> {
 }
 
 async fn bootstrap_events_with_limit(local: &PgPool, limit: usize) -> Result<usize> {
+    ensure_sync_not_paused()?;
     let device_id =
         env::var("MEMORY_DEVICE_ID").context("MEMORY_DEVICE_ID is required for bootstrap")?;
     let mut created = 0;
     for spec in TABLES {
+        ensure_sync_not_paused()?;
         let sql = format!(
-            "SELECT {}::text, to_jsonb(t) - 'fts' - 'embedding' FROM public.{} t WHERE storage_tier='active' AND NOT EXISTS (SELECT 1 FROM sync_meta.events e WHERE e.table_name=$1 AND e.record_key={}::text AND e.operation='upsert') ORDER BY {} LIMIT $2",
-            quote_ident(spec.key), quote_ident(spec.name), quote_ident(spec.key), quote_ident(spec.key)
+            "SELECT {}::text, {} FROM public.{} t WHERE storage_tier='active' AND NOT EXISTS (SELECT 1 FROM sync_meta.events e WHERE e.table_name=$1 AND e.record_key={}::text AND e.operation='upsert') ORDER BY {} LIMIT $2",
+            quote_ident(spec.key), projection_json(*spec, "t"), quote_ident(spec.name), quote_ident(spec.key), quote_ident(spec.key)
         );
         let rows = sqlx::query(&sql)
             .bind(spec.name)
@@ -1049,6 +1095,7 @@ async fn bootstrap_events_with_limit(local: &PgPool, limit: usize) -> Result<usi
             .fetch_all(local)
             .await?;
         for row in rows {
+            ensure_sync_not_paused()?;
             let key: String = row.get(0);
             let payload: Value = row.get(1);
             let inserted = sqlx::query(
@@ -1069,6 +1116,7 @@ async fn bootstrap_events_with_limit(local: &PgPool, limit: usize) -> Result<usi
 }
 
 async fn audit_page(local: &PgPool, neon: &PgPool) -> Result<usize> {
+    ensure_sync_not_paused()?;
     let state: Option<Value> = sqlx::query_scalar(
         "SELECT cursor_value FROM sync_meta.cursors WHERE cursor_name='audit_page'",
     )
@@ -1088,7 +1136,7 @@ async fn audit_page(local: &PgPool, neon: &PgPool) -> Result<usize> {
     let spec = TABLES
         .get(table_index % TABLES.len())
         .ok_or_else(|| anyhow!("no sync tables configured"))?;
-    let sql = format!("SELECT {}::text, md5((to_jsonb(t) - 'fts' - 'embedding')::text) FROM public.{} t WHERE storage_tier='active' AND {}::text > $1 ORDER BY {} LIMIT $2", quote_ident(spec.key), quote_ident(spec.name), quote_ident(spec.key), quote_ident(spec.key));
+    let sql = format!("SELECT {}::text, md5(({})::text) FROM public.{} t WHERE storage_tier='active' AND {}::text > $1 ORDER BY {} LIMIT $2", quote_ident(spec.key), projection_json(*spec, "t"), quote_ident(spec.name), quote_ident(spec.key), quote_ident(spec.key));
     let rows = tokio::time::timeout(
         QUERY_TIMEOUT,
         sqlx::query(&sql)
@@ -1101,6 +1149,7 @@ async fn audit_page(local: &PgPool, neon: &PgPool) -> Result<usize> {
     let mut repaired = 0;
     let mut last = None;
     for row in rows {
+        ensure_sync_not_paused()?;
         let key: String = row.get(0);
         let local_hash: String = row.get(1);
         let remote_sql = format!("SELECT md5((to_jsonb(t) - 'fts' - 'embedding')::text) FROM public.{} t WHERE {}::text=$1", quote_ident(spec.name), quote_ident(spec.key));
@@ -1113,6 +1162,7 @@ async fn audit_page(local: &PgPool, neon: &PgPool) -> Result<usize> {
         .await
         .map_err(|_| anyhow!("remote audit lookup timed out"))??;
         if remote_hash.as_deref() != Some(&local_hash) {
+            ensure_sync_not_paused()?;
             queue(local, *spec, &key, "upsert").await?;
             repaired += 1;
         }
@@ -1123,24 +1173,31 @@ async fn audit_page(local: &PgPool, neon: &PgPool) -> Result<usize> {
     } else {
         table_index
     };
+    ensure_sync_not_paused()?;
     sqlx::query("INSERT INTO sync_meta.cursors(cursor_name,cursor_value) VALUES('audit_page',jsonb_build_object('table_index',$1,'after_key',$2)) ON CONFLICT(cursor_name) DO UPDATE SET cursor_value=EXCLUDED.cursor_value,updated_at=now()")
         .bind(next_index as i64).bind(last.unwrap_or_default()).execute(local).await?;
     Ok(repaired)
 }
 
 async fn rebuild_derived(local: &PgPool, neon: &PgPool) -> Result<()> {
+    ensure_sync_not_paused()?;
     let manifest = sqlx::query(
         "SELECT id,source_table,source_id,model,dimension,created_at,embedding::text FROM public.embeddings",
     )
     .fetch_all(local)
     .await?;
+    ensure_sync_not_paused()?;
     let mut tx = neon.begin().await?;
     for row in &manifest {
+        ensure_sync_not_paused()?;
         sqlx::query("INSERT INTO sync_meta.embedding_manifest(id,source_table,source_id,model,dimension,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(source_table,source_id) DO UPDATE SET id=EXCLUDED.id,model=EXCLUDED.model,dimension=EXCLUDED.dimension,created_at=EXCLUDED.created_at")
             .bind(row.try_get::<Uuid,_>(0)?).bind(row.try_get::<String,_>(1)?).bind(row.try_get::<Uuid,_>(2)?).bind(row.try_get::<Option<String>,_>(3)?).bind(row.try_get::<Option<i32>,_>(4)?).bind(row.try_get::<Option<chrono::DateTime<chrono::Utc>>,_>(5)?).execute(&mut *tx).await?;
     }
+    ensure_sync_not_paused()?;
     sqlx::raw_sql("TRUNCATE public.embeddings; INSERT INTO public.embeddings(id,source_table,source_id,embedding,model,dimension,created_at) SELECT m.id,m.source_table,m.source_id, CASE m.source_table WHEN 'documents' THEN d.embedding WHEN 'memories' THEN me.embedding WHEN 'experiences' THEN e.embedding END, m.model,m.dimension,m.created_at FROM sync_meta.embedding_manifest m LEFT JOIN public.documents d ON m.source_table='documents' AND d.id=m.source_id LEFT JOIN public.memories me ON m.source_table='memories' AND me.id=m.source_id LEFT JOIN public.experiences e ON m.source_table='experiences' AND e.id=m.source_id WHERE CASE m.source_table WHEN 'documents' THEN d.embedding IS NOT NULL WHEN 'memories' THEN me.embedding IS NOT NULL WHEN 'experiences' THEN e.embedding IS NOT NULL ELSE false END;").execute(&mut *tx).await?;
+    ensure_sync_not_paused()?;
     for row in manifest {
+        ensure_sync_not_paused()?;
         let source_table: String = row.try_get(1)?;
         let model: Option<String> = row.try_get(3)?;
         let is_cloud_default_model = match model.as_deref() {
@@ -1172,7 +1229,9 @@ async fn rebuild_derived(local: &PgPool, neon: &PgPool) -> Result<()> {
             .execute(&mut *tx)
             .await?;
     }
+    ensure_sync_not_paused()?;
     sqlx::raw_sql("UPDATE public.documents SET content=content; UPDATE public.memories SET content=content; UPDATE public.experiences SET goal=goal;").execute(&mut *tx).await?;
+    ensure_sync_not_paused()?;
     tx.commit().await?;
     Ok(())
 }
@@ -1257,6 +1316,7 @@ async fn health(local: &PgPool, neon: &PgPool) -> Result<()> {
 }
 
 async fn push_once(local: &PgPool, neon: &PgPool) -> Result<(usize, usize, usize)> {
+    ensure_sync_not_paused()?;
     let lease = acquire_target_lease(neon).await?;
     let run = Uuid::new_v4();
     sqlx::query("INSERT INTO sync_meta.runs(run_id,status) VALUES($1,'running')")
@@ -1264,6 +1324,7 @@ async fn push_once(local: &PgPool, neon: &PgPool) -> Result<(usize, usize, usize
         .execute(neon)
         .await?;
     let result = async {
+        ensure_sync_not_paused()?;
         let event_count = push_events(local, neon, &lease).await?;
         let (rows, bytes) = run_queue(local, neon, run, &lease).await?;
         sqlx::query("INSERT INTO sync_meta.state(state_key,state_value) VALUES('last_success',jsonb_build_object('at',now(),'rows',$1,'bytes',$2)) ON CONFLICT(state_key) DO UPDATE SET state_value=EXCLUDED.state_value,updated_at=now()")
@@ -1296,13 +1357,41 @@ async fn push_once(local: &PgPool, neon: &PgPool) -> Result<(usize, usize, usize
     }
 }
 
+fn ensure_sync_not_paused() -> Result<()> {
+    let state_home = env::var_os("XDG_STATE_HOME")
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+        })
+        .context("cannot determine the memory platform state directory")?;
+    let pause_file = state_home.join("memory-platform/neon-maintenance.paused");
+    match std::fs::symlink_metadata(&pause_file) {
+        Ok(_) => bail!(
+            "memory sync is paused by the local control panel; resume it before running write operations"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!("failed to check memory sync pause marker at {}", pause_file.display())
+        }),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if !matches!(&cli.command, Command::Status | Command::Health) {
+        ensure_sync_not_paused()?;
+    }
     dotenvy::dotenv().ok();
+    // Recheck after loading ordinary project dotenv values so a configured
+    // XDG_STATE_HOME cannot point the dashboard and binary at different markers.
+    if !matches!(&cli.command, Command::Status | Command::Health) {
+        ensure_sync_not_paused()?;
+    }
     if local_only_enabled() {
         bail!("MEMORY_LOCAL_ONLY=1 — neon-sync refuses to run; this device must not reach Neon");
     }
-    let cli = Cli::parse();
     let (local_url, neon_url) = urls(&cli)?;
     let local = connect(&local_url, "local PostgreSQL", false).await?;
     let neon = connect(&neon_url, "sync target", true).await?;
@@ -1311,8 +1400,11 @@ async fn main() -> Result<()> {
         Command::Status => status(&local, &neon).await,
         Command::Health => health(&local, &neon).await,
         Command::Migrate => {
+            ensure_sync_not_paused()?;
             Migrator::run(&local).await?;
+            ensure_sync_not_paused()?;
             Migrator::run(&neon).await?;
+            ensure_sync_not_paused()?;
             ensure_local_queue(&local).await?;
             ensure_target_meta(&neon).await?;
             println!("migrations and local capture triggers are installed");
@@ -1334,14 +1426,23 @@ async fn main() -> Result<()> {
             }
             let mut pages = 0usize;
             loop {
+                ensure_sync_not_paused()?;
                 let created = bootstrap_events_with_limit(&local, FULL_BASELINE_PAGE_ROWS).await?;
+                ensure_sync_not_paused()?;
                 let (rows, bytes, events) = push_once(&local, &neon).await?;
                 pages += 1;
-                println!("full page {pages}: baseline={created} rows={rows} events={events} bytes={bytes}");
+                ensure_sync_not_paused()?;
                 let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_meta.outbox")
                     .fetch_one(&local)
                     .await?;
-                if created == 0 && remaining == 0 {
+                let unpublished_events: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM sync_meta.events WHERE pushed_at IS NULL",
+                )
+                .fetch_one(&local)
+                .await?;
+                println!("full page {pages}: baseline={created} rows={rows} events={events} bytes={bytes} remaining_queue={remaining} unpublished_events={unpublished_events}");
+                ensure_sync_not_paused()?;
+                if created == 0 && remaining == 0 && unpublished_events == 0 {
                     break;
                 }
             }
@@ -1471,6 +1572,58 @@ fn category_allowed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "requires two isolated localhost test databases"]
+    async fn pull_is_atomic_and_preserves_local_hierarchy() -> Result<()> {
+        async fn test_pool(key: &str) -> Result<PgPool> {
+            let value=env::var(key)?;
+            let options: sqlx::postgres::PgConnectOptions=value.parse()?;
+            anyhow::ensure!(matches!(options.get_host(),"127.0.0.1"|"localhost"|"::1"),"test must be local");
+            anyhow::ensure!(options.get_database().is_some_and(|name|name.starts_with("memory_structure_test")),"test database name required");
+            Ok(PgPool::connect(&value).await?)
+        }
+        let local=test_pool("STRUCTURE_TEST_DATABASE_URL").await?;
+        let remote=test_pool("STRUCTURE_TEST_TARGET_URL").await?;
+        Migrator::run(&local).await?;
+        Migrator::run(&remote).await?;
+        let before:i64=sqlx::query_scalar("SELECT coalesce(max(neon_seq),0) FROM sync_meta.events").fetch_one(&remote).await?;
+        sqlx::query("INSERT INTO sync_meta.cursors(cursor_name,cursor_value) VALUES('neon_pull',jsonb_build_object('neon_seq',$1)) ON CONFLICT(cursor_name) DO UPDATE SET cursor_value=EXCLUDED.cursor_value")
+            .bind(before).execute(&local).await?;
+        let device=Uuid::new_v4().to_string();
+        let ids=[Uuid::new_v4(),Uuid::new_v4()];
+        let keys=[format!("test-{device}-1"),format!("test-{device}-2")];
+        for i in 0..2 {
+            let payload=if i==0 {serde_json::json!({"key":keys[i],"value":"preserved","storage_tier":"active"})}
+                else {serde_json::json!({"key":keys[i],"storage_tier":"active"})};
+            sqlx::query("INSERT INTO sync_meta.events(event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum) VALUES($1,$2,$3,'config',$4,'upsert',$5,md5($5::text))")
+                .bind(ids[i]).bind(&device).bind(i as i64).bind(&keys[i]).bind(payload).execute(&remote).await?;
+        }
+        anyhow::ensure!(pull_events(&local,&remote).await.is_err(),"invalid projection should fail");
+        let receipts:i64=sqlx::query_scalar("SELECT count(*) FROM sync_meta.events WHERE event_id=ANY($1)").bind(ids.as_slice()).fetch_one(&local).await?;
+        let rows:i64=sqlx::query_scalar("SELECT count(*) FROM config WHERE key=ANY($1)").bind(keys.as_slice()).fetch_one(&local).await?;
+        anyhow::ensure!(receipts==0&&rows==0,"partial receipt or projection committed");
+        let cursor:i64=sqlx::query_scalar("SELECT (cursor_value->>'neon_seq')::bigint FROM sync_meta.cursors WHERE cursor_name='neon_pull'").fetch_one(&local).await?;
+        anyhow::ensure!(cursor==before,"failed batch advanced cursor");
+        // Repair the deliberately malformed synthetic event and replay.
+        sqlx::query("UPDATE sync_meta.events SET payload=payload||'{\"value\":\"repaired\"}'::jsonb WHERE event_id=$1").bind(ids[1]).execute(&remote).await?;
+        anyhow::ensure!(pull_events(&local,&remote).await?==2,"batch did not resume");
+        anyhow::ensure!(pull_events(&local,&remote).await?==0,"duplicate replay was not a no-op");
+        let spec=*TABLES.iter().find(|t|t.name=="content_nodes").unwrap();
+        let source=Uuid::new_v4();
+        let node=Uuid::new_v4();
+        sqlx::query("INSERT INTO content_nodes(id,source_table,source_id,node_key,root_scope,node_type,title,section_path,content,checksum) VALUES($1,'documents',$2,'test','Main Vault','root','Title','Path','private local body','hash')")
+            .bind(node).bind(source).execute(&local).await?;
+        let exported=source_rows(&local,spec,&[node.to_string()]).await?;
+        anyhow::ensure!(exported[0].data["content"]=="","cloud projection contains raw body");
+        let mut tx=local.begin().await?;
+        apply_remote_event(&mut tx,"content_nodes",&node.to_string(),&exported[0].data).await?;
+        tx.commit().await?;
+        let body:String=sqlx::query_scalar("SELECT content FROM content_nodes WHERE id=$1").bind(node).fetch_one(&local).await?;
+        anyhow::ensure!(body=="private local body","redacted replay erased the local hierarchy");
+        println!("Verified atomic pull rollback/resume/no-op, actual SQL redaction, and local hierarchy preservation.");
+        local.close().await; remote.close().await;
+        Ok(())
+    }
     #[test]
     fn vector_binary_is_dimension_then_floats() {
         assert_eq!(PgVector(vec![1.0, 2.0]).size_hint(), 12);
@@ -1489,6 +1642,19 @@ mod tests {
     #[test]
     fn table_order_has_no_derived_cache() {
         assert!(!TABLES.iter().any(|table| table.name == "embeddings"));
+    }
+
+    #[test]
+    fn hierarchy_projection_never_contains_raw_content() {
+        let spec = TABLES
+            .iter()
+            .copied()
+            .find(|table| table.name == "content_nodes")
+            .expect("content_nodes must be syncable");
+        let projection = projection_json(spec, "t");
+        assert!(projection.contains("jsonb_set"));
+        assert!(projection.contains("{content}"));
+        assert!(projection.contains("''::text"));
     }
 
     fn cli_with_target(url: &str) -> Cli {

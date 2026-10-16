@@ -79,6 +79,43 @@ deletes data.
 ## Recovery Safety
 
 - `neon-sync full --confirm-full-push` is manual-only and resumable.
+- The `neon-maintenance.paused` marker is stored under `$XDG_STATE_HOME` or
+  `$HOME/.local/state`, in the `memory-platform` subdirectory. `status` and `health`
+  remain available while paused. The source wrapper rejects unsupported
+  commands before loading the protected environment file. The maintenance runner
+  checks before loading it and between ingestion/sync steps; the full-recovery
+  runner rechecks before each attempt, before its final pull, and before
+  reporting that its queues are drained. It propagates `full`, `pull`, `status`,
+  and database-query failures instead of reporting success. These shell guards
+  fail closed if they cannot inspect the marker.
+- The marker blocks Neon sync through the guarded wrappers and the combined
+  `scripts/run-memory-maintenance.sh` ingestion/sync runner. The separate direct
+  `systemd/user/memory-ingest.service` -> `ingest.sh all` local ingestion path
+  does not check this marker: local capture may continue during paused Neon
+  sync and may create more local work. This ingestion path does not drain the
+  sync queue or publish queued events to Neon.
+- The source `neon-sync` binary checks before connecting and at bounded event,
+  bootstrap, and projection batch boundaries. These binary checks require a
+  rebuild and install to become active. The currently installed release predates
+  them, so a running `full` invocation can continue until that attempt finishes.
+  Among installed full-recovery snapshots, only the active Application Support
+  script has the shell guard; older snapshots and direct binary invocations are
+  not covered by it. The source compatibility and maintenance wrappers are guarded.
+- `rebuild-derived` checks the marker while rebuilding inside a transaction; a
+  pause before commit aborts and rolls that work back. Other single-step commands
+  check at entry, so an already-running database statement can finish.
+- Dashboard and MCP status treat an unreadable or dangling pause marker as
+  paused. If scheduler start fails after a resume removed an existing marker,
+  the control restores the marker and keeps sync paused.
+- Use the dashboard or MCP maintenance controls to resume. Their `start`,
+  `resume`, `retry`, and `push_critical` actions all remove the pause marker and
+  start the scheduler, so retry is not a pause-preserving operation.
+- The active full-recovery runtime uses the shared Postgres environment helper
+  so `psql` receives a password-free URL in its arguments. The runtime installer
+  copies that helper alongside the runner.
+- The full-recovery runner reports that its local sync queues are drained; the
+  parity, retrieval, migration, archive, and health checks below still determine
+  whether recovery is complete.
 - Event publication and projection rows are interleaved, so metadata backlog
   cannot consume an entire recovery run before active records advance.
 - Every Neon connection has bounded connection, statement, and idle transaction
@@ -89,19 +126,28 @@ deletes data.
 
 ## Paused Checkpoint: 2026-07-24
 
+This is a historical snapshot, not the current live status. Recheck the live
+pause marker, local queue, and target before following the recovery steps.
+
 - Full recovery was intentionally paused to avoid overnight CPU/network use.
 - The durable local outbox contains 3,022 projection records: 907 documents and
   2,115 memories.
 - Event publication has completed; only active projection rows remain queued.
 - The dashboard is healthy from the stable Application Support runtime.
 
-To resume deliberately on macOS, install the current recovery runtime and
+To resume deliberately on macOS, first build and install a `neon-sync` release
+that contains the source pause guards, then install the recovery runtime. Use
+the dashboard or MCP `resume` control to remove the pause marker; installing
+the runtime alone leaves recovery paused. Only after that deliberate resume,
 bootstrap `com.memory-platform.full-recovery`. It resumes from the outbox and
-does not retransmit or delete confirmed rows.
+does not retransmit or delete confirmed rows. The currently installed release
+predates the source guards, so do not treat an install of that binary as
+pause-safe.
 
 ## Before Declaring Recovery Complete
 
-1. Outbox depth is zero.
+1. Outbox depth and the count of local events where `pushed_at IS NULL` are
+   both zero.
 2. Two consecutive `neon-sync push` runs are no-ops.
 3. Active authoritative-table counts and fingerprints match policy.
 4. Both clients report 2048-dimensional semantic retrieval and pass a real

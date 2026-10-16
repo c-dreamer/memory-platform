@@ -30,6 +30,14 @@ path = "src/bin/neon-sync.rs"
 name = "search-eval"
 path = "src/bin/search_eval.rs"
 
+[[bin]]
+name = "structure-index"
+path = "src/bin/structure_index.rs"
+
+[[bin]]
+name = "structure-eval"
+path = "src/bin/structure_eval.rs"
+
 [lib]
 name = "memory_platform"
 path = "src/lib.rs"

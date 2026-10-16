@@ -10,3 +10,4 @@ pub mod embedding;
 pub mod experience;
 pub mod ingestion;
 pub mod procedure;
+pub mod structure;

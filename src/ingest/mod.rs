@@ -6,9 +6,11 @@
 //! - `config` — OpenCode config, rules, skills
 //! - `logs` — OpenCode log file
 
+pub mod claude_sessions;
 pub mod codex_sessions;
 pub mod config;
 pub mod logs;
+pub mod session_safety;
 pub mod sessions;
 pub mod vault;
 
@@ -17,8 +19,10 @@ use chrono::Utc;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
+
+use crate::services::structure;
 
 /// Cumulative report of what was ingested.
 #[derive(Debug, Default, Clone)]
@@ -128,6 +132,22 @@ impl IngestEngine {
         .execute(&self.pool)
         .await
         .context("inserting session")?;
+        if let Err(error) = structure::rebuild_flat_node(
+            &self.pool,
+            "sessions",
+            id,
+            "session",
+            "sessions",
+            goal,
+            summary.unwrap_or(goal),
+            "active",
+            ended_at.or(Some(started_at)),
+            serde_json::json!({"derived": true, "status": status}),
+        )
+        .await
+        {
+            warn!(session_id = %id, "Session saved but structural index rebuild failed: {error}");
+        }
         Ok(id)
     }
 
@@ -141,16 +161,46 @@ impl IngestEngine {
         started_at: chrono::DateTime<Utc>,
         ended_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<Uuid> {
-        sqlx::query_scalar(
+        let updated_id: Option<Uuid> = sqlx::query_scalar(
             r#"INSERT INTO sessions (goal,status,summary,started_at,ended_at,source_key)
                VALUES ($1,$2,$3,$4,$5,$6)
-               ON CONFLICT (source_key) WHERE source_key IS NOT NULL DO UPDATE SET goal=EXCLUDED.goal,
-                 status=EXCLUDED.status, summary=EXCLUDED.summary,
-                 ended_at=EXCLUDED.ended_at, updated_at=now()
+               ON CONFLICT (source_key) WHERE source_key IS NOT NULL DO UPDATE SET
+                 goal=EXCLUDED.goal, status=EXCLUDED.status, summary=EXCLUDED.summary,
+                 started_at=LEAST(sessions.started_at, EXCLUDED.started_at),
+                 ended_at=GREATEST(sessions.ended_at, EXCLUDED.ended_at), updated_at=now()
+               WHERE (sessions.goal, sessions.status, sessions.summary, sessions.started_at, sessions.ended_at)
+                 IS DISTINCT FROM (EXCLUDED.goal, EXCLUDED.status, EXCLUDED.summary,
+                   LEAST(sessions.started_at, EXCLUDED.started_at),
+                   GREATEST(sessions.ended_at, EXCLUDED.ended_at))
                RETURNING id"#,
         )
         .bind(goal).bind(status).bind(summary).bind(started_at).bind(ended_at).bind(source_key)
-        .fetch_one(&self.pool).await.context("upserting source session")
+        .fetch_optional(&self.pool).await.context("upserting source session")?;
+        let id = match updated_id {
+            Some(id) => id,
+            None => sqlx::query_scalar("SELECT id FROM sessions WHERE source_key = $1")
+                .bind(source_key)
+                .fetch_one(&self.pool)
+                .await
+                .context("loading unchanged source session")?,
+        };
+        if let Err(error) = structure::rebuild_flat_node(
+            &self.pool,
+            "sessions",
+            id,
+            "session",
+            "sessions",
+            goal,
+            summary.unwrap_or(goal),
+            "active",
+            ended_at.or(Some(started_at)),
+            serde_json::json!({"derived": true, "status": status, "source_key": source_key}),
+        )
+        .await
+        {
+            warn!(session_id = %id, "Source session saved but structural index rebuild failed: {error}");
+        }
+        Ok(id)
     }
 
     /// Insert an experience record.

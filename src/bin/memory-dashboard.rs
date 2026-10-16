@@ -1,6 +1,9 @@
 //! Local-only operational dashboard for the memory platform.
 
-use std::{collections::BTreeMap, env, net::SocketAddr, path::PathBuf, process::Stdio, sync::Arc};
+use std::{
+    collections::BTreeMap, env, io::Write, net::SocketAddr, path::PathBuf, process::Stdio,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -104,12 +107,48 @@ fn root() -> Result<PathBuf> {
 }
 
 fn state_dir() -> PathBuf {
-    env::var("XDG_STATE_HOME")
+    env::var_os("XDG_STATE_HOME")
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|| {
             PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/state")
         })
         .join("memory-platform")
+}
+
+fn pause_marker_present(state_dir: &std::path::Path) -> bool {
+    match std::fs::symlink_metadata(state_dir.join("neon-maintenance.paused")) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+fn write_pause_marker(state_dir: &std::path::Path, message: &str) -> std::io::Result<()> {
+    let path = state_dir.join("neon-maintenance.paused");
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    file.write_all(message.as_bytes())
+}
+
+fn remove_pause_marker(state_dir: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::remove_file(state_dir.join("neon-maintenance.paused")) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn authorized(
@@ -256,7 +295,7 @@ async fn status(
     .fetch_optional(&state.local)
     .await
     .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let pause = state.state_dir.join("neon-maintenance.paused");
+    let paused = pause_marker_present(&state.state_dir);
     let retry = state.state_dir.join("neon-maintenance.retry");
     let neon_reachable = match &state.neon {
         Some(pool) => tokio::time::timeout(
@@ -314,7 +353,7 @@ async fn status(
             "~/.config/systemd/user/memory-platform-maintenance.service".into(),
         ]
     };
-    let next_action = if pause.exists() {
+    let next_action = if paused {
         "Sync is paused. Resume only when you want background work to continue.".into()
     } else if !neon_reachable {
         "Neon is unavailable. The queue is safe locally; retry when the network recovers.".into()
@@ -333,7 +372,7 @@ async fn status(
         documents_active,
         documents_archived,
         last_success,
-        paused: pause.exists(),
+        paused,
         retry_pending: retry.exists(),
         scheduler: if cfg!(target_os = "macos") {
             "launchd"
@@ -429,16 +468,21 @@ async fn control(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     authorized(&headers, &query, &state)
         .map_err(|_| (StatusCode::UNAUTHORIZED, "dashboard token required".into()))?;
-    let pause = state.state_dir.join("neon-maintenance.paused");
     std::fs::create_dir_all(&state.state_dir).map_err(internal)?;
     match action.as_str() {
-        "pause" => std::fs::write(&pause, "paused by dashboard\n").map_err(internal)?,
+        "pause" => write_pause_marker(&state.state_dir, "paused by dashboard\n").map_err(internal)?,
         "resume" | "start" | "retry" | "push_critical" => {
-            let _ = std::fs::remove_file(&pause);
-            scheduler(&state.root, "start").await.map_err(internal)?;
+            let was_paused = remove_pause_marker(&state.state_dir).map_err(internal)?;
+            if let Err(error) = scheduler(&state.root, "start").await {
+                if was_paused {
+                    write_pause_marker(&state.state_dir, "paused after scheduler start failed\n")
+                        .map_err(internal)?;
+                }
+                return Err(internal(error));
+            }
         }
         "stop" => {
-            std::fs::write(&pause, "stopped by dashboard\n").map_err(internal)?;
+            write_pause_marker(&state.state_dir, "stopped by dashboard\n").map_err(internal)?;
             scheduler(&state.root, "stop").await.map_err(internal)?;
         }
         _ => return Err((StatusCode::BAD_REQUEST, "unknown action".into())),

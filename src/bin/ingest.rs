@@ -13,8 +13,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use memory_platform::ingest::{
-    codex_sessions as ingest_codex_sessions, config as ingest_config, logs as ingest_logs,
-    sessions as ingest_sessions, vault as ingest_vault,
+    claude_sessions as ingest_claude_sessions, codex_sessions as ingest_codex_sessions,
+    config as ingest_config, logs as ingest_logs, sessions as ingest_sessions,
+    vault as ingest_vault,
 };
 use memory_platform::ingest::{IngestEngine, IngestReport};
 use memory_platform::migrations::Migrator;
@@ -55,6 +56,10 @@ enum Commands {
         /// Max files to process (default: all)
         #[arg(short = 'l', long = "limit", default_value = "0")]
         limit: usize,
+
+        /// Explicit provenance label for one vault root. Multi-vault parents are refused.
+        #[arg(long, env = "VAULT_SCOPE")]
+        scope: Option<String>,
     },
     /// Ingest OpenCode config, rules, and skills
     Config {
@@ -85,6 +90,16 @@ enum Commands {
         #[arg(long, default_value_t = 120)]
         settle_seconds: i64,
     },
+    /// Ingest local Claude Code session archives after sync-capture preflight.
+    Claude {
+        #[arg(long, default_value = "~/.claude/projects")]
+        sessions_path: PathBuf,
+    },
+    /// Read-only fingerprint inventory of local Claude Code session archives.
+    ClaudeInventory {
+        #[arg(long, default_value = "~/.claude/projects")]
+        sessions_path: PathBuf,
+    },
     /// Run all ingest steps
     All {
         /// Path to opencode.db (SQLite)
@@ -102,6 +117,10 @@ enum Commands {
             default_value = "~/obsidian-vault"
         )]
         vault_path: PathBuf,
+
+        /// Required when the vault path contains multiple vault roots.
+        #[arg(long = "vault-scope", env = "VAULT_SCOPE")]
+        vault_scope: Option<String>,
 
         /// Path to opencode config directory
         #[arg(long = "config-dir", default_value = "~/.config/opencode")]
@@ -130,6 +149,35 @@ fn expand_path(path: &PathBuf) -> PathBuf {
     path.clone()
 }
 
+async fn verify_session_sync_capture(pool: &sqlx::PgPool) -> Result<()> {
+    let definitions = sqlx::query_as::<_, (String, String)>(
+        r#"SELECT t.tgname, pg_get_functiondef(t.tgfoid)
+           FROM pg_trigger t
+           JOIN pg_class c ON c.oid = t.tgrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE NOT t.tgisinternal AND t.tgenabled <> 'D'
+             AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+             AND c.relname = ANY(ARRAY['documents','sessions','memories','experiences','content_nodes'])"#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("checking local session sync-capture triggers")?;
+    for (trigger_name, definition) in definitions {
+        let lower = definition.to_ascii_lowercase();
+        let normalized: String = lower.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let writes_outbox = trigger_name.starts_with("trg_sync_outbox_")
+            || lower.contains("sync_meta.outbox")
+            || lower.contains("sync_meta.capture_change");
+        let has_session_replay_guard = normalized.contains(
+            "ifcurrent_setting('memory.sync_replay',true)='on'thenreturncoalesce(new,old);endif;",
+        );
+        if writes_outbox && !has_session_replay_guard {
+            anyhow::bail!("Session import stopped: a local database sync trigger does not honor the session-only replay suppression flag; no rows were written");
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -143,17 +191,52 @@ async fn main() -> Result<()> {
 
     // Connect to Postgres
     info!("Connecting to database...");
+    let session_import = matches!(
+        &cli.command,
+        Commands::Codex { .. } | Commands::Claude { .. } | Commands::All { .. }
+    );
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&cli.db_url)
         .await
         .context("Failed to connect to PostgreSQL")?;
+    let session_pool = if session_import {
+        let pool = PgPoolOptions::new()
+            .max_connections(3)
+            .after_connect(|connection, _meta| {
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('memory.sync_replay', 'on', false)")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&cli.db_url)
+            .await
+            .context("Failed to connect to PostgreSQL for local session import")?;
+        // Gate before migrations or scanning so legacy capture triggers cannot
+        // stage session content for a future remote sync.
+        verify_session_sync_capture(&pool).await?;
+        Some(pool)
+    } else {
+        None
+    };
 
-    Migrator::run(&pool)
-        .await
-        .context("Failed to run database migrations")?;
+    // Inventory and direct session import commands must not run migrations implicitly.
+    if !matches!(
+        &cli.command,
+        Commands::CodexInventory { .. }
+            | Commands::ClaudeInventory { .. }
+            | Commands::Codex { .. }
+            | Commands::Claude { .. }
+    ) {
+        Migrator::run(&pool)
+            .await
+            .context("Failed to run database migrations")?;
+    }
 
     let engine = IngestEngine::new(pool);
+    let session_engine = session_pool.map(IngestEngine::new);
     let mut report = IngestReport::default();
 
     match &cli.command {
@@ -164,12 +247,24 @@ async fn main() -> Result<()> {
             }
             ingest_sessions::ingest_sessions(&engine, &path, &mut report).await?;
         }
-        Commands::Vault { vault_path, limit } => {
+        Commands::Vault {
+            vault_path,
+            limit,
+            scope,
+        } => {
             let path = expand_path(vault_path);
             if !path.is_dir() {
                 anyhow::bail!("Vault directory not found: {}", path.display());
             }
-            ingest_vault::ingest_vault(&engine, &path, *limit, false, &mut report).await?;
+            ingest_vault::ingest_vault(
+                &engine,
+                &path,
+                *limit,
+                false,
+                scope.as_deref(),
+                &mut report,
+            )
+            .await?;
         }
         Commands::Config { config_dir } => {
             let path = expand_path(config_dir);
@@ -181,7 +276,8 @@ async fn main() -> Result<()> {
         }
         Commands::Codex { sessions_path } => {
             let path = expand_path(sessions_path);
-            ingest_codex_sessions::ingest_codex_sessions(&engine, &path, &mut report).await?;
+            let local_engine = session_engine.as_ref().expect("session pool preflighted");
+            ingest_codex_sessions::ingest_codex_sessions(local_engine, &path, &mut report).await?;
         }
         Commands::CodexInventory {
             sessions_path,
@@ -192,13 +288,43 @@ async fn main() -> Result<()> {
                 ingest_codex_sessions::inventory_codex_sessions(&engine, &path, *settle_seconds)
                     .await?;
             println!("{}", serde_json::to_string_pretty(&inventory)?);
-            if !inventory.missing_source_ids.is_empty() || !inventory.changed_documents.is_empty() {
+            if !inventory.missing_source_ids.is_empty()
+                || !inventory.extra_source_ids.is_empty()
+                || !inventory.duplicate_source_ids.is_empty()
+                || !inventory.duplicate_source_keys.is_empty()
+                || !inventory.missing_documents.is_empty()
+                || !inventory.changed_documents.is_empty()
+                || !inventory.database_only_documents.is_empty()
+                || !inventory.settled
+            {
                 anyhow::bail!("Codex inventory is not synchronized");
+            }
+        }
+        Commands::Claude { sessions_path } => {
+            let path = expand_path(sessions_path);
+            let summary =
+                ingest_claude_sessions::ingest_claude_sessions(&engine, &path, &mut report).await?;
+            println!("Claude archives: {} scanned, {} imported, {} unchanged, {} sessions reconciled, {} errors",
+                summary.scanned, summary.imported, summary.skipped_unchanged, summary.sessions_reconciled, summary.errors.len());
+        }
+        Commands::ClaudeInventory { sessions_path } => {
+            let path = expand_path(sessions_path);
+            let inventory =
+                ingest_claude_sessions::inventory_claude_sessions(&engine, &path).await?;
+            println!("{}", serde_json::to_string_pretty(&inventory)?);
+            if !inventory.missing_artifact_ids.is_empty()
+                || !inventory.extra_artifact_ids.is_empty()
+                || !inventory.changed_artifact_ids.is_empty()
+                || !inventory.missing_session_artifact_ids.is_empty()
+                || !inventory.extra_session_artifact_ids.is_empty()
+            {
+                anyhow::bail!("Claude inventory is not synchronized");
             }
         }
         Commands::All {
             sessions_db,
             vault_path,
+            vault_scope,
             config_dir,
             log_path,
             codex_path,
@@ -224,7 +350,15 @@ async fn main() -> Result<()> {
             let vault = expand_path(vault_path);
             if vault.is_dir() {
                 println!("\n[2/4] Ingesting Obsidian vault...");
-                ingest_vault::ingest_vault(&engine, &vault, 0, false, &mut report).await?;
+                ingest_vault::ingest_vault(
+                    &engine,
+                    &vault,
+                    0,
+                    false,
+                    vault_scope.as_deref(),
+                    &mut report,
+                )
+                .await?;
                 println!("  ✓ Vault complete");
             } else {
                 warn!("Vault not found at {}, skipping", vault.display());
@@ -254,8 +388,13 @@ async fn main() -> Result<()> {
             let codex_root = expand_path(codex_path);
             if codex_root.is_dir() {
                 println!("\n[5/5] Ingesting Codex session archives...");
-                ingest_codex_sessions::ingest_codex_sessions(&engine, &codex_root, &mut report)
-                    .await?;
+                let local_engine = session_engine.as_ref().expect("session pool preflighted");
+                ingest_codex_sessions::ingest_codex_sessions(
+                    local_engine,
+                    &codex_root,
+                    &mut report,
+                )
+                .await?;
                 println!("  ✓ Codex sessions complete");
             } else {
                 warn!(

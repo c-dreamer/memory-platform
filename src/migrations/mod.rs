@@ -15,6 +15,9 @@ pub struct Migrator;
 impl Migrator {
     /// Run all pending migrations.
     pub async fn run(pool: &PgPool) -> Result<()> {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('memory-platform:migrations',0))")
+            .execute(&mut *tx).await?;
         // Create the _migrations table if it doesn't exist
         sqlx::query(
             r#"
@@ -24,13 +27,13 @@ impl Migrator {
             );
             "#,
         )
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .context("Failed to create _migrations table")?;
 
         // Get already-applied migrations
         let applied: Vec<String> = sqlx::query_scalar("SELECT version FROM _migrations")
-            .fetch_all(pool)
+            .fetch_all(&mut *tx)
             .await
             .context("Failed to fetch applied migrations")?;
 
@@ -120,6 +123,14 @@ impl Migrator {
                 "020_contradictions_unique_pair",
                 include_str!("../../migrations/020_contradictions_unique_pair.sql"),
             ),
+            (
+                "021_content_nodes",
+                include_str!("../../migrations/021_content_nodes.sql"),
+            ),
+            (
+                "022_hierarchy_source_lifecycle",
+                include_str!("../../migrations/022_hierarchy_source_lifecycle.sql"),
+            ),
         ];
 
         // Apply pending migrations in order
@@ -129,19 +140,20 @@ impl Migrator {
             }
 
             sqlx::raw_sql(sql)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await
                 .with_context(|| format!("Failed to execute migration: {}", version))?;
 
             sqlx::query("INSERT INTO _migrations (version) VALUES ($1)")
                 .bind(version)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await
                 .with_context(|| format!("Failed to record migration: {}", version))?;
 
             tracing::info!("Applied migration: {version}");
         }
 
+        tx.commit().await?;
         Ok(())
     }
 }

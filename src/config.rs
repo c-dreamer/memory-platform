@@ -505,10 +505,7 @@ mod tests {
         assert_eq!(cfg.chunk_size, 512);
         assert_eq!(cfg.chunk_overlap, 64);
         assert_eq!(cfg.max_chunks_per_doc, 100);
-        assert_eq!(
-            cfg.nvidia_embedding_model,
-            "nvidia/nemotron-3-embed-1b"
-        );
+        assert_eq!(cfg.nvidia_embedding_model, "nvidia/nemotron-3-embed-1b");
         assert_eq!(cfg.rust_log, "info");
         assert_eq!(cfg.embedding_cache_size, 1000);
         assert!(!cfg.local_only);
@@ -520,7 +517,9 @@ mod tests {
 
     #[test]
     fn from_env_uses_defaults_when_no_vars_set() {
-        with_env_vars(&[], || {
+        // CI and interactive agent shells commonly set RUST_LOG. This test
+        // verifies config defaults, so pin that ambient variable explicitly.
+        with_env_vars(&[("RUST_LOG", "info")], || {
             let cfg = Config::from_env().expect("from_env should succeed with no vars");
             let default = Config::default();
             assert_eq!(cfg.database_url, default.database_url);
