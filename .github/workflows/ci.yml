@@ -38,6 +38,21 @@ jobs:
         shell: bash
         run: ./scripts/check_secrets.sh
 
+      - name: PowerShell syntax check
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($file in Get-ChildItem -Recurse -Filter *.ps1 -Path scripts) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors) | Out-Null
+            foreach ($e in $errors) { Write-Host "$($file.FullName):$($e.Extent.StartLineNumber): $($e.Message)"; $failed = $true }
+          }
+          foreach ($file in Get-ChildItem -Filter *.xml.template -Path taskscheduler) {
+            try { [xml](Get-Content $file.FullName -Raw) | Out-Null } catch { Write-Host "$($file.FullName): $_"; $failed = $true }
+          }
+          if ($failed) { exit 1 }
+
       - name: Build (all targets)
         run: cargo build --all-targets --verbose
 
