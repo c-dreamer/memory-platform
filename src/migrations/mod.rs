@@ -167,14 +167,18 @@ mod tests {
             .await
             .expect("Failed to connect to database");
 
-        // Ensure the _migrations table exists
         Migrator::run(&pool).await.expect("Migration run failed");
+        let count = || async {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM _migrations")
+                .fetch_one(&pool)
+                .await
+                .expect("Query failed")
+        };
+        let applied = count().await;
+        assert!(applied > 0, "every applied migration must be recorded");
 
-        // Verify the table exists
-        let result = sqlx::query_scalar::<_, i32>("SELECT 1 FROM _migrations LIMIT 1")
-            .fetch_optional(&pool)
-            .await
-            .expect("Query failed");
-        assert!(result.is_none()); // Table exists but is empty
+        // A second run must be a no-op, not a re-apply or an error.
+        Migrator::run(&pool).await.expect("Re-run failed");
+        assert_eq!(count().await, applied);
     }
 }
