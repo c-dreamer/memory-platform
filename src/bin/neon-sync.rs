@@ -1263,7 +1263,11 @@ async fn rebuild_derived(local: &PgPool, neon: &PgPool) -> Result<()> {
             .execute(&mut *tx)
             .await?;
     }
-    sqlx::raw_sql("UPDATE public.documents SET content=content; UPDATE public.memories SET content=content; UPDATE public.experiences SET goal=goal;").execute(&mut *tx).await?;
+    // Touch content only to fire the FTS triggers. sync_replay makes
+    // maintain_updated_at keep each row's source timestamp; otherwise every
+    // target row's updated_at moved and its audit fingerprint stopped matching
+    // the local row, re-queueing the whole corpus.
+    sqlx::raw_sql("SET LOCAL memory.sync_replay='on'; UPDATE public.documents SET content=content; UPDATE public.memories SET content=content; UPDATE public.experiences SET goal=goal;").execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }
