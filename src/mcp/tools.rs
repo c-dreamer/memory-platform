@@ -423,18 +423,14 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
 
     info!("memory_search: query='{query}', limit={limit}");
 
-    let search_mode = if state.embedding_service.is_some() {
+    let embedding = try_embed(state, &query, false, "memory_search").await;
+    let search_mode = if embedding.is_some() {
         "hybrid"
     } else {
-        warn!("No embedding service — using keyword-only search");
+        warn!("No embedding — using keyword-only search");
         "keyword"
     };
-
-    // Generate embedding if embedding service is available
-    let embedding = match &state.embedding_service {
-        Some(svc) => svc.embed(&query).await?.as_vec().to_vec(),
-        None => vec![],
-    };
+    let embedding = embedding.unwrap_or_default();
 
     // Search across all four tables in parallel
     let (memories, documents, experiences, trading) = match tokio::try_join!(
@@ -526,14 +522,9 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
 
     info!("memory_store: type={content_type}, importance={importance}, tags={tags:?}");
 
-    // Generate embedding if available
-    let embedding = match &state.embedding_service {
-        Some(svc) => {
-            let emb = svc.embed_passage(&content).await?;
-            Some(emb.as_vec().to_vec())
-        }
-        None => None,
-    };
+    // Generate embedding if available. On failure the row is still stored
+    // with a NULL embedding; `repair_null_embeddings` backfills it later.
+    let embedding = try_embed(state, &content, true, "memory_store").await;
     let embedding_slice = embedding.as_deref();
 
     // Near-duplicate detection: an incoming memory whose embedding is >=0.95
@@ -546,7 +537,7 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
     // then superseded via the same UPDATE pattern contradiction_resolve uses,
     // so vector_search/bm25_search's existing `superseded_by IS NULL` filter
     // excludes it automatically — no dead-end signal, no caller action
-    // required. Skipped without an embedding service: no signal to compare on.
+    // required. Skipped without an embedding: no signal to compare on.
     let superseded_id = if let Some(emb) = embedding_slice {
         let similar = state
             .db
@@ -644,6 +635,7 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
         "tags": memory.tags,
         "created_at": memory.created_at,
         "superseded_id": superseded_id,
+        "embedding_pending": embedding.is_none(),
     });
 
     Ok(serde_json::to_string(&result)?)
@@ -659,9 +651,8 @@ async fn tool_memory_context(state: &AppState, args: Value) -> Result<String> {
 
     info!("memory_context: query='{query}'");
 
-    let context = match &state.embedding_service {
-        Some(svc) => {
-            let embedding = svc.embed(&query).await?.as_vec().to_vec();
+    let context = match try_embed(state, &query, false, "memory_context").await {
+        Some(embedding) => {
             state
                 .db
                 .get_context_for_query(&query, &embedding, 10)
@@ -691,9 +682,8 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
 
     info!("memory_initialize: goal='{goal}'");
 
-    let context = match &state.embedding_service {
-        Some(svc) => {
-            let embedding = svc.embed(&goal).await?.as_vec().to_vec();
+    let context = match try_embed(state, &goal, false, "memory_initialize").await {
+        Some(embedding) => {
             state
                 .db
                 .get_context_for_query(&goal, &embedding, 10)
@@ -820,14 +810,11 @@ async fn tool_experience_find(state: &AppState, args: Value) -> Result<String> {
     let experiences = match &state.experience_service {
         Some(svc) => svc.find_relevant(&goal, limit).await?,
         None => {
-            // Fallback: search experiences table directly
-            let embedding = match &state.embedding_service {
-                Some(svc) => svc.embed(&goal).await?.as_vec().to_vec(),
-                None => vec![],
-            };
+            // Fallback: keyword search on the experiences table directly.
+            // Keyword mode never reads the embedding, so none is generated.
             let results = state
                 .search
-                .hybrid_search("experiences", &goal, &embedding, "keyword", limit as i64)
+                .hybrid_search("experiences", &goal, &[], "keyword", limit as i64)
                 .await
                 .context("Failed to search experiences")?;
 
@@ -1847,6 +1834,27 @@ async fn record_batch_access(
     }
 }
 
+/// Embed `text` as a query (`passage = false`) or a stored passage, or
+/// `None` when there is no embedding service *or* the call fails at runtime
+/// (offline, provider 5xx/429, llama-server down). The startup probe only
+/// decides whether a service exists; a later outage must degrade the tool
+/// (keyword search, NULL embedding for backfill) rather than fail it.
+async fn try_embed(state: &AppState, text: &str, passage: bool, tool: &str) -> Option<Vec<f32>> {
+    let svc = state.embedding_service.as_ref()?;
+    let result = if passage {
+        svc.embed_passage(text).await
+    } else {
+        svc.embed(text).await
+    };
+    match result {
+        Ok(embedding) => Some(embedding.into_inner()),
+        Err(e) => {
+            warn!("{tool}: embedding failed, continuing without a vector: {e:#}");
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Argument helpers
 // ---------------------------------------------------------------------------
@@ -1962,6 +1970,109 @@ mod tests {
             procedure_service: None,
             pending_writes: Arc::new(crate::queue::PendingWriteQueue::new_empty()),
         }
+    }
+
+    /// An embedder that passed the startup probe and then went down: every
+    /// call errors, as offline / NVIDIA 5xx/429 / llama-server down would.
+    struct FailingEmbedder;
+
+    impl crate::services::embedding::EmbeddingService for FailingEmbedder {
+        fn embed(
+            &self,
+            _text: &str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::models::embedding::Embedding>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Err(anyhow::anyhow!("embedding provider returned 503")) })
+        }
+    }
+
+    fn failing_embedder_state() -> AppState {
+        AppState {
+            embedding_service: Some(Arc::new(FailingEmbedder)),
+            ..test_state()
+        }
+    }
+
+    #[tokio::test]
+    async fn try_embed_degrades_to_none_on_runtime_failure() {
+        let state = failing_embedder_state();
+        assert!(try_embed(&state, "q", false, "test").await.is_none());
+        assert!(try_embed(&state, "p", true, "test").await.is_none());
+    }
+
+    /// Fresh, migrated `agentd_*` database on the throwaway local Postgres
+    /// named by `DATABASE_URL`; returns the state and the DB name to drop.
+    async fn live_failing_embedder_state() -> (AppState, sqlx::PgPool, String) {
+        let admin_url = env::var("DATABASE_URL").expect("DATABASE_URL (throwaway local Postgres)");
+        let admin = sqlx::PgPool::connect(&admin_url).await.unwrap();
+        let name = format!("agentd_embedfail_{}", Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let options = admin_url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .unwrap()
+            .database(&name);
+        let pool = sqlx::PgPool::connect_with(options).await.unwrap();
+        crate::migrations::Migrator::run(&pool).await.unwrap();
+        let db = Arc::new(PostgresDb::with_pool(pool));
+        let state = AppState {
+            db: Arc::clone(&db),
+            search: Arc::new(SearchEngine::new(db, Arc::new(Config::default()))),
+            ..failing_embedder_state()
+        };
+        (state, admin, name)
+    }
+
+    async fn drop_live_db(state: AppState, admin: sqlx::PgPool, name: String) {
+        state.db.pool.close().await;
+        drop(state);
+        sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a throwaway local Postgres with pgvector in DATABASE_URL"]
+    async fn store_and_search_succeed_when_embedder_fails_at_runtime() {
+        let (state, admin, name) = live_failing_embedder_state().await;
+
+        let stored = call_tool(
+            &state,
+            "memory_store",
+            json!({"content": "zebra crossing outage drill"}),
+        )
+        .await;
+        let searched = call_tool(&state, "memory_search", json!({"query": "zebra"})).await;
+        let context = call_tool(&state, "memory_context", json!({"query": "zebra"})).await;
+        let null_embeddings: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM memories WHERE embedding IS NULL")
+                .fetch_one(&state.db.pool)
+                .await
+                .unwrap();
+        drop_live_db(state, admin, name).await;
+
+        let stored: Value = serde_json::from_str(&stored.expect("store must not fail")).unwrap();
+        assert_eq!(stored["embedding_pending"], json!(true));
+        assert_eq!(
+            null_embeddings, 1,
+            "row stored with NULL embedding for backfill"
+        );
+        let searched: Value =
+            serde_json::from_str(&searched.expect("search must not fail")).unwrap();
+        let hits = searched["memories"].as_array().unwrap();
+        assert!(
+            hits.iter().any(|m| m["id"] == stored["id"]),
+            "keyword fallback finds the stored memory: {searched}"
+        );
+        context.expect("memory_context must not fail");
     }
 
     #[test]

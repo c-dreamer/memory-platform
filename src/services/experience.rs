@@ -105,11 +105,19 @@ impl ExperienceService {
     ) -> Result<Experience, anyhow::Error> {
         let db = PostgresDb::with_pool(self.pool.clone());
 
-        let embedding = if let Some(service) = &self.embedding_service {
-            let text = compose_experience_text(&data);
-            Some(service.embed_passage(&text).await?.into_inner())
-        } else {
-            None
+        // A runtime embedding failure stores the row with a NULL embedding
+        // for `repair_null_embeddings` to backfill, rather than losing it.
+        let embedding = match &self.embedding_service {
+            Some(service) => match service.embed_passage(&compose_experience_text(&data)).await {
+                Ok(embedding) => Some(embedding.into_inner()),
+                Err(e) => {
+                    tracing::warn!(
+                        "record_interaction: embedding failed, storing without a vector: {e:#}"
+                    );
+                    None
+                }
+            },
+            None => None,
         };
 
         db.store_experience(&data, embedding.as_deref())
