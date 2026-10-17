@@ -48,6 +48,23 @@ const NEGATION_PAIRS: &[(&str, &str)] = &[
     ("expensive", "cheap"),
 ];
 
+/// Whole-word match of any negation pair across the two texts. Substring
+/// matching flagged nearly every similar pair ("no" in "know", "up" in
+/// "update", "win" in "windows", "low" in "allow").
+fn has_opposing_signal(existing: &str, new: &str) -> bool {
+    fn words(text: &str) -> std::collections::HashSet<String> {
+        text.to_lowercase()
+            .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+    let (existing, new) = (words(existing), words(new));
+    NEGATION_PAIRS.iter().any(|&(a, b)| {
+        (existing.contains(a) && new.contains(b)) || (existing.contains(b) && new.contains(a))
+    })
+}
+
 /// Detects contradictions between semantically similar memories.
 ///
 /// Uses vector similarity search to find memories with high cosine similarity,
@@ -330,7 +347,6 @@ impl ContradictionDetector {
             .context("Failed to search for similar memories")?;
 
         let mut candidates = Vec::new();
-        let new_lower = memory.content.to_lowercase();
 
         for mem in &similar {
             if mem.id == memory.id {
@@ -340,18 +356,7 @@ impl ContradictionDetector {
                 continue;
             }
 
-            let existing_lower = mem.content.as_deref().unwrap_or("").to_lowercase();
-            let mut signals = 0;
-
-            for &(a, b) in NEGATION_PAIRS {
-                if (existing_lower.contains(a) && new_lower.contains(b))
-                    || (existing_lower.contains(b) && new_lower.contains(a))
-                {
-                    signals += 1;
-                }
-            }
-
-            if signals >= 1 {
+            if has_opposing_signal(mem.content.as_deref().unwrap_or(""), &memory.content) {
                 candidates.push(ContradictionCandidate {
                     memory_id_a: memory.id,
                     memory_id_b: mem.id,
@@ -533,5 +538,25 @@ mod tests {
         let a = validity(None, None, 500);
         let b = validity(None, None, 100);
         assert_eq!(pick_winner(id_a, id_b, &a, &b), id_a);
+    }
+
+    #[test]
+    fn opposing_signal_needs_whole_words() {
+        assert!(!has_opposing_signal(
+            "I know the windows update will allow it",
+            "Now follow the down-level install"
+        ));
+        assert!(has_opposing_signal(
+            "Price will go up",
+            "Price will go down"
+        ));
+        assert!(has_opposing_signal(
+            "You should restart",
+            "You shouldn't restart"
+        ));
+        assert!(has_opposing_signal(
+            "Always use the VPN.",
+            "Never use the VPN."
+        ));
     }
 }
