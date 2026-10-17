@@ -74,6 +74,35 @@ pub struct SearchResult {
     pub score: f64,
 }
 
+/// Reciprocal Rank Fusion of vector and keyword hits, with the defaults
+/// `SearchEngine` uses (RRF_K=20, weights 0.6/0.4). The old merge put every
+/// vector hit first, so keyword hits only appeared when fewer than `limit`
+/// vectors matched, and a row in both lists got no boost. `score` becomes
+/// the fused score.
+fn rrf_merge(
+    vector: Vec<SearchResult>,
+    keyword: Vec<SearchResult>,
+    limit: usize,
+) -> Vec<SearchResult> {
+    const K: f64 = 20.0;
+    let mut fused: Vec<SearchResult> = Vec::new();
+    for (list, weight) in [(vector, 0.6), (keyword, 0.4)] {
+        for (rank, mut r) in list.into_iter().enumerate() {
+            let score = weight / (K + rank as f64 + 1.0);
+            match fused.iter_mut().find(|f| f.id == r.id) {
+                Some(existing) => existing.score += score,
+                None => {
+                    r.score = score;
+                    fused.push(r);
+                }
+            }
+        }
+    }
+    fused.sort_by(|a, b| b.score.total_cmp(&a.score));
+    fused.truncate(limit);
+    fused
+}
+
 /// Optional filters for `vector_search`/`bm25_search`: tag membership and a
 /// `created_at` range. Tag filtering only takes effect on tables that
 /// actually have a `tags` column (`memories`, `experiences`) — it's silently
@@ -1142,7 +1171,8 @@ impl PostgresDb {
         self.bm25_search(table, query, limit, None).await
     }
 
-    /// Legacy hybrid search — simple union of vector + fulltext results.
+    /// Hybrid search used by memory_context/memory_initialize: vector and
+    /// full-text results fused by RRF (see `rrf_merge`).
     pub async fn hybrid_search(
         &self,
         table: &str,
@@ -1162,18 +1192,7 @@ impl PostgresDb {
             )
             .await?;
         let ft_results = self.fulltext_search(table, query, limit).await?;
-
-        let mut seen = std::collections::HashSet::new();
-        let mut merged = Vec::with_capacity(vec_results.len() + ft_results.len());
-
-        for r in vec_results.into_iter().chain(ft_results) {
-            if seen.insert(r.id) {
-                merged.push(r);
-            }
-        }
-
-        merged.truncate(limit as usize);
-        Ok(merged)
+        Ok(rrf_merge(vec_results, ft_results, limit as usize))
     }
 
     /// Byte-cap a string without landing mid-character. `content_a`/`content_b`
@@ -1775,5 +1794,22 @@ mod tests {
         for (a, b) in &pairs {
             assert_ne!(a, b);
         }
+    }
+
+    #[test]
+    fn rrf_merge_interleaves_and_boosts_shared_hits() {
+        let r = |n: u128| SearchResult {
+            id: Uuid::from_u128(n),
+            content: None,
+            source_info: String::new(),
+            score: 0.0,
+        };
+        // Vector: 1,2,3. Keyword: 4,3. Limit 3.
+        let merged = rrf_merge(vec![r(1), r(2), r(3)], vec![r(4), r(3)], 3);
+        let ids: Vec<u128> = merged.iter().map(|m| m.id.as_u128()).collect();
+        // 3 is in both lists and outranks 2; keyword-only 4 is not starved out.
+        assert_eq!(ids, vec![3, 1, 2]);
+        let merged = rrf_merge(vec![r(1), r(2)], vec![r(4)], 3);
+        assert!(merged.iter().any(|m| m.id.as_u128() == 4));
     }
 }
