@@ -16,7 +16,7 @@ BEGIN
       AND a.attname = 'embedding'
       AND a.attnum > 0;
 
-    IF vector_typmod IS DISTINCT FROM 2052 THEN
+    IF vector_typmod IS DISTINCT FROM 2048 THEN
         IF EXISTS (SELECT 1 FROM code_changes WHERE embedding IS NOT NULL) THEN
             RAISE EXCEPTION 'code_changes contains non-null embeddings with an unsupported dimension';
         END IF;

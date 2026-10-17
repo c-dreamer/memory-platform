@@ -15,7 +15,7 @@ BEGIN
        AND a.attname = 'embedding'
        AND a.attnum > 0;
 
-    IF vector_typmod IS NULL OR vector_typmod <> 2052 THEN
+    IF vector_typmod IS NULL OR vector_typmod <> 2048 THEN
         DROP TABLE IF EXISTS public.embeddings;
         CREATE TABLE public.embeddings (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

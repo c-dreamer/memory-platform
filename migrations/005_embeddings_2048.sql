@@ -15,7 +15,7 @@ BEGIN
       AND a.attname = 'embedding'
       AND a.attnum > 0;
 
-    IF vector_typmod IS DISTINCT FROM 2052 THEN
+    IF vector_typmod IS DISTINCT FROM 2048 THEN
         DROP TABLE IF EXISTS embeddings;
         CREATE TABLE embeddings (
             id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
