@@ -249,9 +249,15 @@ impl ContradictionDetector {
             // invalid_at is set only if not already set: an earlier auto-resolve
             // or manual resolve may have already pinned the real invalidation
             // instant, and a later resolution of the same pair shouldn't move it.
+            // The loser stopped holding when the winner became true, not when
+            // someone resolved the pair; if the kept fact is the older one, the
+            // loser never held, so its interval closes where it opened.
             sqlx::query(
-                "UPDATE memories SET superseded_by = $1, superseded_at = now(), \
-                 invalid_at = COALESCE(invalid_at, now()) WHERE id = $2",
+                "UPDATE memories m SET superseded_by = $1, superseded_at = now(), \
+                 invalid_at = COALESCE(m.invalid_at, GREATEST( \
+                     (SELECT COALESCE(w.valid_at, w.created_at) FROM memories w WHERE w.id = $1), \
+                     COALESCE(m.valid_at, m.created_at))) \
+                 WHERE m.id = $2",
             )
             .bind(keep_id)
             .bind(superseded_id)
