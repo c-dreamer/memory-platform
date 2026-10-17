@@ -193,7 +193,7 @@ const TABLES: &[TableSpec] = &[
     },
 ];
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct OutboxItem {
     table: String,
     key: String,
@@ -617,36 +617,74 @@ async fn push_event_batch(local: &PgPool, neon: &PgPool, lease: &TargetLease) ->
     Ok(to_push.len())
 }
 
+/// Applies one remote event to the local source table with capture disabled.
+/// `delete` removes the local row and `archive` takes it out of the active
+/// tier — the same local effect the originating device's capture trigger
+/// turned into an outbox `delete` (target `archive_and_delete_many`), so audit
+/// can no longer see the row as missing from the target and re-push it.
 async fn apply_remote_event(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     table: &str,
+    record_key: &str,
+    operation: &str,
     payload: &Value,
 ) -> Result<()> {
     let spec = TABLES
         .iter()
         .find(|spec| spec.name == table)
         .ok_or_else(|| anyhow!("remote event references unsupported table {table}"))?;
-    if payload.is_null() || payload == &Value::Object(Default::default()) {
-        return Ok(());
-    }
     let table = quote_ident(spec.name);
     let key_col = quote_ident(spec.key);
-    let columns = sqlx::query("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 AND is_generated='NEVER' AND column_name NOT IN ('fts','embedding') ORDER BY ordinal_position")
-        .bind(spec.name).fetch_all(&mut **tx).await?;
-    let updates: Vec<String> = columns
-        .into_iter()
-        .map(|row| row.get::<String, _>(0))
-        .filter(|column| column != spec.key)
-        .map(|column| {
-            let col = quote_ident(&column);
-            format!("{col}=EXCLUDED.{col}")
-        })
-        .collect();
-    let sql = format!("INSERT INTO public.{table} SELECT (jsonb_populate_record(NULL::public.{table}, $1)).* ON CONFLICT ({key_col}) DO UPDATE SET {}", updates.join(","));
     sqlx::query("SET LOCAL memory.sync_replay='on'")
         .execute(&mut **tx)
         .await?;
-    sqlx::query(&sql).bind(payload).execute(&mut **tx).await?;
+    if operation == "delete" {
+        sqlx::query(&format!(
+            "DELETE FROM public.{table} WHERE {key_col}::text=$1"
+        ))
+        .bind(record_key)
+        .execute(&mut **tx)
+        .await?;
+    } else if !(payload.is_null() || payload == &Value::Object(Default::default())) {
+        let columns: Vec<String> = sqlx::query("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 AND is_generated='NEVER' AND column_name NOT IN ('fts','embedding') ORDER BY ordinal_position")
+            .bind(spec.name).fetch_all(&mut **tx).await?
+            .into_iter()
+            .map(|row| row.get::<String, _>(0))
+            .filter(|column| column != spec.key)
+            .map(|column| quote_ident(&column))
+            .collect();
+        if operation == "archive" {
+            // The archive payload omits content/goal/summary, so overlay it on
+            // the existing local row instead of replacing the row. No local
+            // row means nothing to take out of the active tier.
+            let picked: Vec<String> = columns.iter().map(|col| format!("r.{col}")).collect();
+            let sql = format!("UPDATE public.{table} t SET ({}) = (SELECT {} FROM jsonb_populate_record(t, $1) r) WHERE t.{key_col}::text=$2", columns.join(","), picked.join(","));
+            sqlx::query(&sql)
+                .bind(payload)
+                .bind(record_key)
+                .execute(&mut **tx)
+                .await?;
+        } else {
+            let updates: Vec<String> = columns
+                .iter()
+                .map(|col| format!("{col}=EXCLUDED.{col}"))
+                .collect();
+            let sql = format!("INSERT INTO public.{table} SELECT (jsonb_populate_record(NULL::public.{table}, $1)).* ON CONFLICT ({key_col}) DO UPDATE SET {}", updates.join(","));
+            sqlx::query(&sql).bind(payload).execute(&mut **tx).await?;
+        }
+    }
+    if operation != "upsert" {
+        // Re-assert the delete on the target projection (key only, idempotent):
+        // this device may already have pushed an older upsert of the row after
+        // the originator's delete, and a pending local upsert could otherwise
+        // never be materialized (source_rows reads active rows only). Audit
+        // re-adds a row if a newer write raced this delete. No event is emitted.
+        sqlx::query("INSERT INTO sync_meta.outbox(table_name,record_key,generation,operation,changed_at) VALUES($1,$2,1,'delete',now()) ON CONFLICT(table_name,record_key) DO UPDATE SET generation=sync_meta.outbox.generation+1,operation='delete',changed_at=now(),attempts=0,last_error=NULL")
+            .bind(spec.name)
+            .bind(record_key)
+            .execute(&mut **tx)
+            .await?;
+    }
     Ok(())
 }
 
@@ -662,6 +700,12 @@ async fn pull_events(local: &PgPool, neon: &PgPool) -> Result<usize> {
     let cursor_seq: i64 = sqlx::query_scalar(
         "SELECT COALESCE((cursor_value->>'neon_seq')::bigint, 0) FROM sync_meta.cursors WHERE cursor_name='neon_pull'"
     ).fetch_optional(local).await?.unwrap_or(0);
+    // Events pulled before the clock below became a Lamport clock never
+    // advanced it. Catch up so a local write is never ordered before a remote
+    // event this device had already applied, which the LWW check relies on.
+    sqlx::query("SELECT setval('sync_meta.logical_clock', GREATEST((SELECT last_value FROM sync_meta.logical_clock), (SELECT max(logical_time) FROM sync_meta.events)))")
+        .execute(local)
+        .await?;
     let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
         "SELECT event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at,neon_seq \
          FROM sync_meta.events WHERE neon_seq > $1 ORDER BY neon_seq LIMIT $2"
@@ -689,11 +733,25 @@ async fn pull_events(local: &PgPool, neon: &PgPool) -> Result<usize> {
             .execute(&mut *tx)
             .await?;
         if inserted == 1 {
-            let operation: String = row.try_get(5)?;
-            if operation == "upsert" {
+            let device_id: String = row.try_get(1)?;
+            let table: String = row.try_get(3)?;
+            let record_key: String = row.try_get(4)?;
+            // Last writer wins by (logical_time, device_id): an event already
+            // recorded here for the same row with a later clock — a local
+            // write or a previously pulled one — has applied newer state.
+            let superseded: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sync_meta.events WHERE table_name=$1 AND record_key=$2 AND (logical_time,device_id) > ($3,$4))")
+                .bind(&table)
+                .bind(&record_key)
+                .bind(logical_time)
+                .bind(&device_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            if !superseded {
                 apply_remote_event(
                     &mut tx,
-                    &row.try_get::<String, _>(3)?,
+                    &table,
+                    &record_key,
+                    &row.try_get::<String, _>(5)?,
                     &row.try_get::<Value, _>(6)?,
                 )
                 .await?;
@@ -922,6 +980,8 @@ async fn run_queue(
     let mut batch_size = DEFAULT_BATCH_ROWS;
     let mut committed_batches = 0usize;
     let mut consecutive_successes = 0usize;
+    let include = env_list("MEMORY_SYNC_INCLUDE");
+    let exclude = env_list("MEMORY_SYNC_EXCLUDE");
     while started.elapsed() < RUN_BUDGET {
         // Interleave one event batch per projection round: a large event
         // backlog must neither starve projection writes nor be left behind
@@ -970,9 +1030,20 @@ async fn run_queue(
             }
             let cols = columns(neon, *spec).await?;
             let keys: Vec<String> = upserts.iter().map(|i| i.key.clone()).collect();
-            let rows = source_rows(local, *spec, &keys).await?;
             let by_key: HashMap<&str, &OutboxItem> =
                 upserts.iter().map(|i| (i.key.as_str(), i)).collect();
+            // Same category scope as push_event_batch: an excluded row's
+            // content never reaches the target; its outbox entry is dropped.
+            let (rows, excluded): (Vec<SourceRow>, Vec<SourceRow>) =
+                source_rows(local, *spec, &keys)
+                    .await?
+                    .into_iter()
+                    .partition(|r| category_allowed(spec.name, &r.data, &include, &exclude));
+            let excluded: Vec<OutboxItem> = excluded
+                .iter()
+                .filter_map(|r| by_key.get(r.key.as_str()).map(|i| (*i).clone()))
+                .collect();
+            acknowledge(local, &excluded).await?;
             // A retry must split the already-materialized payload. Merely reducing
             // `batch_size` here would otherwise retry the same oversized batch.
             let mut pending_batches = batches(rows, batch_size);
@@ -1504,6 +1575,20 @@ mod tests {
             })
             .collect();
         assert_eq!(batches(rows, 25).len(), 2);
+    }
+    #[test]
+    fn category_scope_matches_projection_rows() {
+        // run_queue filters to_jsonb(row) - 'fts' - 'embedding', which keeps
+        // vault_section, with the same predicate as the event stream.
+        let private = serde_json::json!({"vault_section": "private", "content": "x"});
+        let public = serde_json::json!({"vault_section": "public", "content": "y"});
+        let exclude = vec!["private".to_string()];
+        assert!(!category_allowed("documents", &private, &[], &exclude));
+        assert!(category_allowed("documents", &public, &[], &exclude));
+        assert!(category_allowed("memories", &private, &[], &exclude));
+        assert!(category_allowed("documents", &private, &[], &[]));
+        let include = vec!["public".to_string()];
+        assert!(!category_allowed("documents", &private, &include, &[]));
     }
     #[test]
     fn table_order_has_no_derived_cache() {
