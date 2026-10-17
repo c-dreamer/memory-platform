@@ -122,8 +122,7 @@ pub async fn ingest_logs(
     // Store as experience
     let tags: Vec<String> = vec!["opencode-log".to_string(), "analysis".to_string()];
     engine
-        .insert_experience(
-            None,
+        .upsert_source_experience(
             "OpenCode Log Analysis",
             Some(&analysis),
             Some(&format!(
@@ -135,11 +134,10 @@ pub async fn ingest_logs(
             )),
             None,
             &tags,
-            None,
-            Some("opencode"),
+            "opencode",
         )
         .await
-        .context("Failed to insert log experience")?;
+        .context("Failed to upsert log experience")?;
     report.experiences_created += 1;
 
     report

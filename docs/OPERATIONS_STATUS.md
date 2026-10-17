@@ -39,9 +39,30 @@ stateless and does not own the outbox or archive lifecycle.
 - The previous model `nvidia/llama-nemotron-embed-1b-v2` reached end-of-life on
   2026-08-25 and now returns `410 Gone`. When it did, the dimension probe failed
   closed to keyword-only search; it did not corrupt or mix vectors.
-- Because the replacement is also 2048-dimensional, there is no schema change
-  and no re-embedding migration. Vectors produced by the prior model remain
-  valid under the same `nvidia-2048-v1` generation.
+- Because the replacement is also 2048-dimensional, there is no schema change.
+  A one-off re-embed **is** required, for two independent reasons:
+  - vectors produced by the retired model live in a different vector space and
+    do not compare meaningfully with `nemotron-3-embed-1b` query vectors;
+  - before `e48983f` every NVIDIA call sent `input_type=query` and truncated
+    input to 512 characters, so even stored vectors made by the new model are
+    query-type embeddings of the first ~512 characters of each chunk.
+  Every NVIDIA vector written before `e48983f` is affected. The model tag in the
+  `embeddings` cache cannot tell them apart, so re-embed all of them.
+- Re-embed procedure (operator-run on each device's local database; needs the
+  NVIDIA key from the protected env file, never automatic):
+  1. Take a local snapshot first (`memory-snapshot`).
+  2. Clear source vectors and the NVIDIA cache rows in one transaction:
+     `UPDATE <table> SET embedding = NULL WHERE embedding IS NOT NULL` for
+     `documents`, `memories`, `experiences`, `sessions`, `summaries`,
+     `code_changes`, `trading_results`, then
+     `DELETE FROM embeddings WHERE model LIKE 'nvidia/%'`.
+     Vector search is degraded until step 3 finishes.
+  3. `cargo run --release --bin repair_embeddings -- run` (or
+     `scripts/run_embedding_repair_detached.sh` for a long, resumable run);
+     it fails unless `verify` passes.
+  4. `./sync-to-neon.sh run` until queue depth is zero, then
+     `./sync-to-neon.sh rebuild-derived` so the target cache is rebuilt from
+     the new source vectors.
 - Verify after a model change: `status` must report
   `embedding_service: true` and `search_mode: semantic`.
 

@@ -48,6 +48,19 @@ pub async fn ingest_event(
         }
         Err(e) => {
             tracing::error!("Failed to ingest event: {}", e);
+            // Only an unreachable database is worth retrying. A rejected
+            // write (e.g. a session_id/agent_id with no matching row) fails
+            // the same way on every replay, so report it and drop the row
+            // instead of answering "queued" and wedging the drain behind it.
+            let queue_id = match queue_id {
+                Some(id) if !is_retryable(&e) => {
+                    if let Err(e) = state.pending_writes.remove(id).await {
+                        tracing::warn!("failed to clear rejected queue row {id}: {e:#}");
+                    }
+                    None
+                }
+                other => other,
+            };
             match queue_id {
                 // Durably captured; a background drain task will retry it.
                 Some(id) => Json(EventResponse {
@@ -65,6 +78,22 @@ pub async fn ingest_event(
             }
         }
     }
+}
+
+/// Whether a failed write could succeed on a later retry: the database was
+/// unreachable, rather than reachable and rejecting the write.
+fn is_retryable(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<sqlx::Error>(),
+            Some(
+                sqlx::Error::PoolTimedOut
+                    | sqlx::Error::PoolClosed
+                    | sqlx::Error::Io(_)
+                    | sqlx::Error::Tls(_)
+            )
+        )
+    })
 }
 
 /// Embed + store one event as a memory. Shared by the request path above and
@@ -155,14 +184,37 @@ pub async fn drain_pending(state: &Arc<AppState>) -> anyhow::Result<()> {
             Ok(_) => {
                 state.pending_writes.remove(queued.id).await?;
             }
-            Err(e) => {
+            Err(e) if is_retryable(&e) => {
                 tracing::warn!(
                     "pending-writes drain stopping early, event {} still failing: {e:#}",
                     queued.id
                 );
                 break;
             }
+            Err(e) => {
+                // Permanently rejected: retrying can't succeed and would block
+                // every later queued event behind this one.
+                tracing::error!(
+                    "dropping queued event {} rejected by the database: {e:#}",
+                    queued.id
+                );
+                state.pending_writes.remove(queued.id).await?;
+            }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_retryable;
+
+    #[test]
+    fn only_connectivity_failures_are_retryable() {
+        assert!(is_retryable(
+            &anyhow::Error::new(sqlx::Error::PoolTimedOut).context("store")
+        ));
+        assert!(!is_retryable(&anyhow::Error::new(sqlx::Error::RowNotFound)));
+        assert!(!is_retryable(&anyhow::anyhow!("bad payload")));
+    }
 }

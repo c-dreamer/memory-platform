@@ -93,7 +93,7 @@ async fn test_mcp_tools_list() {
     }
 }
 
-/// Test that MCP server returns a helpful error for unknown tools.
+/// Unknown tools are a JSON-RPC -32602 protocol error (MCP tools spec).
 #[tokio::test]
 async fn test_mcp_unknown_tool() {
     let state = minimal_state();
@@ -106,29 +106,52 @@ async fn test_mcp_unknown_tool() {
         "params": { "name": "does_not_exist", "arguments": {} }
     });
 
-    let response = server.handle_request(request).await;
-    assert!(
-        response.is_ok(),
-        "Unknown tool should still return 200 JSON-RPC"
-    );
-    let resp = response.unwrap();
-    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
-    assert!(text.contains("Unknown tool"), "Should mention unknown tool");
+    let resp = server.handle_request(request).await.unwrap();
+    assert_eq!(resp["id"], 1);
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(resp["error"]["message"], "Unknown tool: does_not_exist");
 }
 
-/// Test that MCP server rejects requests without jsonrpc or id.
+/// Malformed requests get a JSON-RPC -32600 error response, not an Err.
 #[tokio::test]
 async fn test_mcp_malformed_requests() {
     let state = minimal_state();
     let server = McpServer::new(state);
 
-    // Missing jsonrpc
+    // Missing jsonrpc: the (valid) id is echoed.
     let r1 = json!({ "id": 1, "method": "initialize" });
-    assert!(server.handle_request(r1).await.is_err());
+    let resp = server.handle_request(r1).await.unwrap();
+    assert_eq!(resp["error"]["code"], -32600);
+    assert_eq!(resp["id"], 1);
 
     // A request without an id is a valid notification and receives no response.
     let r2 = json!({ "jsonrpc": "2.0", "method": "initialize" });
     assert!(server.handle_request(r2).await.is_ok());
+
+    // Batches are not supported in the advertised protocol versions.
+    let r3 = json!([{ "jsonrpc": "2.0", "id": 2, "method": "ping" }]);
+    let resp = server.handle_request(r3).await.unwrap();
+    assert_eq!(resp["error"]["code"], -32600);
+    assert!(resp["id"].is_null());
+}
+
+/// initialize echoes a supported requested version, else answers its latest.
+#[tokio::test]
+async fn test_mcp_initialize_version_negotiation() {
+    let server = McpServer::new(minimal_state());
+    for (requested, expected) in [
+        ("2024-11-05", "2024-11-05"),
+        ("2025-06-18", "2025-06-18"),
+        ("2025-03-26", "2025-06-18"),
+    ] {
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": requested, "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" } }
+        });
+        let resp = server.handle_request(request).await.unwrap();
+        assert_eq!(resp["result"]["protocolVersion"], expected, "{requested}");
+    }
 }
 
 /// Test MCP server listen loop via public API.

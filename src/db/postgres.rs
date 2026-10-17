@@ -74,6 +74,35 @@ pub struct SearchResult {
     pub score: f64,
 }
 
+/// Reciprocal Rank Fusion of vector and keyword hits, with the defaults
+/// `SearchEngine` uses (RRF_K=20, weights 0.6/0.4). The old merge put every
+/// vector hit first, so keyword hits only appeared when fewer than `limit`
+/// vectors matched, and a row in both lists got no boost. `score` becomes
+/// the fused score.
+fn rrf_merge(
+    vector: Vec<SearchResult>,
+    keyword: Vec<SearchResult>,
+    limit: usize,
+) -> Vec<SearchResult> {
+    const K: f64 = 20.0;
+    let mut fused: Vec<SearchResult> = Vec::new();
+    for (list, weight) in [(vector, 0.6), (keyword, 0.4)] {
+        for (rank, mut r) in list.into_iter().enumerate() {
+            let score = weight / (K + rank as f64 + 1.0);
+            match fused.iter_mut().find(|f| f.id == r.id) {
+                Some(existing) => existing.score += score,
+                None => {
+                    r.score = score;
+                    fused.push(r);
+                }
+            }
+        }
+    }
+    fused.sort_by(|a, b| b.score.total_cmp(&a.score));
+    fused.truncate(limit);
+    fused
+}
+
 /// Optional filters for `vector_search`/`bm25_search`: tag membership and a
 /// `created_at` range. Tag filtering only takes effect on tables that
 /// actually have a `tags` column (`memories`, `experiences`) — it's silently
@@ -209,7 +238,22 @@ impl PostgresDb {
     /// - `test_before_acquire(false)` + selective `before_acquire` ping (idle>60s) avoids ping on every hot-path acquire
     /// - `acquire_slow_threshold(1s)` early WARN for slow checkouts
     pub async fn connect(config: &Config) -> Result<Self, sqlx::Error> {
-        let pool = PgPoolOptions::new()
+        let pool = Self::pool_options().connect(&config.database_url).await?;
+        Ok(Self::from_config(pool, config))
+    }
+
+    /// Like [`connect`](Self::connect), but opens no connection up front: the
+    /// pool dials PostgreSQL on first use and again on every later acquire
+    /// while it is unreachable, so a caller that starts while the database is
+    /// down recovers by itself once it comes back. Fails only on a malformed
+    /// `DATABASE_URL`.
+    pub fn connect_lazy(config: &Config) -> Result<Self, sqlx::Error> {
+        let pool = Self::pool_options().connect_lazy(&config.database_url)?;
+        Ok(Self::from_config(pool, config))
+    }
+
+    fn pool_options() -> PgPoolOptions {
+        PgPoolOptions::new()
             .min_connections(2)
             .max_connections(10)
             .acquire_timeout(Duration::from_secs(5))
@@ -225,18 +269,19 @@ impl PostgresDb {
                 })
             })
             .acquire_slow_threshold(Duration::from_secs(1))
-            .connect(&config.database_url)
-            .await?;
+    }
+
+    fn from_config(pool: PgPool, config: &Config) -> Self {
         let active_embedding_model = match config.embedding_model.as_str() {
             "nvidia" => config.nvidia_embedding_model.clone(),
             "llama-cpp" => config.llama_cpp_model_name.clone(),
             _ => "unknown".to_string(),
         };
-        Ok(Self {
+        Self {
             pool,
             active_embedding_model,
             active_embedding_backend: config.embedding_model.clone(),
-        })
+        }
     }
 
     /// Whether the currently active embedding backend's vectors belong in a
@@ -1049,12 +1094,17 @@ impl PostgresDb {
             .unwrap_or((String::new(), 2));
 
         if has_fts {
-            // Try tsvector first
+            // OR the query's lexemes rather than AND them: plainto_tsquery
+            // requires every word, so a natural-language question matched
+            // nothing and fell through to whole-string trigram similarity,
+            // which rarely clears its 0.3 threshold. ts_rank still ranks rows
+            // matching more of the words first.
+            let tsquery = "to_tsquery('english', replace(plainto_tsquery('english', $1)::text, ' & ', ' | '))";
             let ts_sql = format!(
                 "SELECT id, COALESCE({text_col}, '') AS content, COALESCE({extra_col_sql}, '') AS source_info, \
-                        ts_rank(fts, plainto_tsquery('english', $1), 32)::float8 AS score \
+                        ts_rank(fts, {tsquery}, 32)::float8 AS score \
                  FROM {table} \
-                 WHERE fts @@ plainto_tsquery('english', $1) \
+                 WHERE fts @@ {tsquery} \
                  {superseded_filter}{expiration_filter}{filter_clause} \
                  ORDER BY score DESC \
                  LIMIT ${limit_param}"
@@ -1121,7 +1171,8 @@ impl PostgresDb {
         self.bm25_search(table, query, limit, None).await
     }
 
-    /// Legacy hybrid search — simple union of vector + fulltext results.
+    /// Hybrid search used by memory_context/memory_initialize: vector and
+    /// full-text results fused by RRF (see `rrf_merge`).
     pub async fn hybrid_search(
         &self,
         table: &str,
@@ -1141,18 +1192,7 @@ impl PostgresDb {
             )
             .await?;
         let ft_results = self.fulltext_search(table, query, limit).await?;
-
-        let mut seen = std::collections::HashSet::new();
-        let mut merged = Vec::with_capacity(vec_results.len() + ft_results.len());
-
-        for r in vec_results.into_iter().chain(ft_results) {
-            if seen.insert(r.id) {
-                merged.push(r);
-            }
-        }
-
-        merged.truncate(limit as usize);
-        Ok(merged)
+        Ok(rrf_merge(vec_results, ft_results, limit as usize))
     }
 
     /// Byte-cap a string without landing mid-character. `content_a`/`content_b`
@@ -1754,5 +1794,22 @@ mod tests {
         for (a, b) in &pairs {
             assert_ne!(a, b);
         }
+    }
+
+    #[test]
+    fn rrf_merge_interleaves_and_boosts_shared_hits() {
+        let r = |n: u128| SearchResult {
+            id: Uuid::from_u128(n),
+            content: None,
+            source_info: String::new(),
+            score: 0.0,
+        };
+        // Vector: 1,2,3. Keyword: 4,3. Limit 3.
+        let merged = rrf_merge(vec![r(1), r(2), r(3)], vec![r(4), r(3)], 3);
+        let ids: Vec<u128> = merged.iter().map(|m| m.id.as_u128()).collect();
+        // 3 is in both lists and outranks 2; keyword-only 4 is not starved out.
+        assert_eq!(ids, vec![3, 1, 2]);
+        let merged = rrf_merge(vec![r(1), r(2)], vec![r(4)], 3);
+        assert!(merged.iter().any(|m| m.id.as_u128() == 4));
     }
 }

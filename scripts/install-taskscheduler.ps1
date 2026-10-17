@@ -53,11 +53,13 @@ function ConvertTo-XmlText([string]$Value) {
 . (Join-Path $PSScriptRoot 'lib\env-file.ps1')
 $EnvFile = if ($env:MEMORY_ENV_FILE) { $env:MEMORY_ENV_FILE } else { Join-Path $env:USERPROFILE '.config\memory-platform\memory.env' }
 $localOnly = $false
+$llamaEmbed = $false
 if (Test-Path $EnvFile) {
   $raw = $null
   foreach ($line in Get-Content $EnvFile) {
     $parsed = ConvertFrom-EnvLine $line
     if ($parsed -and $parsed.Key -eq 'MEMORY_LOCAL_ONLY') { $raw = $parsed.Value }
+    if ($parsed -and $parsed.Key -eq 'EMBEDDING_MODEL') { $llamaEmbed = ($parsed.Value -eq 'llama-cpp') }
   }
   if ($raw -and $raw.ToLowerInvariant() -match '^(1|true|yes)$') { $localOnly = $true }
 }
@@ -71,6 +73,22 @@ $jobs = @(
   @{ Name = 'MemoryPlatformArchiveVerify';  Runner = 'scripts\verify-memory-archive.sh';  Args = @();               Neon = $false }
   @{ Name = 'MemoryPlatformDashboard';      Runner = 'scripts\start-memory-dashboard.sh'; Args = @();               Neon = $false }
 )
+# llama-server runs directly under PowerShell, not via a bash runner; only
+# installed when this device embeds locally (EMBEDDING_MODEL=llama-cpp).
+$llamaTask = 'MemoryPlatformLlamaEmbed'
+if ($llamaEmbed) {
+  $template = Join-Path $Root "taskscheduler\$llamaTask.xml.template"
+  $ps1Args = "-NoProfile -ExecutionPolicy Bypass -File `"$Root\scripts\start-llama-embed.ps1`""
+  $xml = (Get-Content $template -Raw) `
+    -replace '__POWERSHELL__', (ConvertTo-XmlText $pwshCmd) `
+    -replace '__PS1_ARGS__', (ConvertTo-XmlText $ps1Args) `
+    -replace '__USER__', (ConvertTo-XmlText $userId)
+  Register-ScheduledTask -TaskName $llamaTask -Xml $xml -Force | Out-Null
+  Write-Host "Installed $llamaTask"
+} else {
+  Unregister-ScheduledTask -TaskName $llamaTask -Confirm:$false -ErrorAction SilentlyContinue
+}
+
 if ($IncludeFullRecovery) {
   $jobs += @{ Name = 'MemoryPlatformFullRecovery'; Runner = 'scripts\run-full-neon-recovery.sh'; Args = @(); Neon = $true }
 }

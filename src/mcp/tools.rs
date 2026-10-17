@@ -6,7 +6,7 @@
 //! a `serde_json::Value` arguments map, returning a JSON string result.
 //! The `call_tool` dispatcher routes by tool name.
 
-use std::{env, path::PathBuf, process::Stdio};
+use std::{env, path::PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -36,7 +36,8 @@ pub fn list_tools() -> Value {
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter by tags (memories/experiences only; ignored for documents/trading_results)", "default": null },
                     "tag_match_mode": { "type": "string", "description": "'any' (default) or 'all' — how `tags` must match", "default": "any" },
                     "start_date": { "type": "string", "description": "ISO-8601 lower bound on created_at (inclusive)", "default": null },
-                    "end_date": { "type": "string", "description": "ISO-8601 upper bound on created_at (inclusive)", "default": null }
+                    "end_date": { "type": "string", "description": "ISO-8601 upper bound on created_at (inclusive)", "default": null },
+                    "session_id": { "type": "string", "description": "Optional session UUID; records each memory/document hit as 'searched' in that session", "default": null }
                 },
                 "required": ["query"]
             }
@@ -65,7 +66,8 @@ pub fn list_tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Context query" }
+                    "query": { "type": "string", "description": "Context query" },
+                    "session_id": { "type": "string", "description": "Optional session UUID; records each loaded memory/document in that session", "default": null }
                 },
                 "required": ["query"]
             }
@@ -76,7 +78,8 @@ pub fn list_tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "goal": { "type": "string", "description": "Session goal or task description" }
+                    "goal": { "type": "string", "description": "Session goal or task description" },
+                    "session_id": { "type": "string", "description": "Optional session UUID; records each loaded memory/document in that session", "default": null }
                 },
                 "required": ["goal"]
             }
@@ -95,12 +98,12 @@ pub fn list_tools() -> Value {
         },
         {
             "name": "procedure_run",
-            "description": "Execute a named procedure. Looks up by name first, falls back to search. Returns execution result.",
+            "description": "Look up a procedure by exact name (case-insensitive) and return its stored steps for the calling agent to carry out. Nothing is executed server-side; the lookup is recorded as a use of the procedure. Errors if no procedure has that name.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "Procedure name to execute" },
-                    "params": { "type": "object", "description": "Optional parameters", "default": {} }
+                    "name": { "type": "string", "description": "Exact procedure name" },
+                    "params": { "type": "object", "description": "Optional parameters, echoed back unchanged for the agent to apply to the steps", "default": {} }
                 },
                 "required": ["name"]
             }
@@ -134,7 +137,8 @@ pub fn list_tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": "UUID of memory or document to recall" }
+                    "id": { "type": "string", "description": "UUID of memory or document to recall" },
+                    "session_id": { "type": "string", "description": "Optional session UUID; records the recalled memory/document as loaded in that session", "default": null }
                 },
                 "required": ["id"]
             }
@@ -309,7 +313,7 @@ pub fn list_tools() -> Value {
 pub async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result<String> {
     debug!("Dispatching tool: {name}");
 
-    match name {
+    let output = match name {
         "memory_search" => tool_memory_search(state, arguments).await,
         "memory_store" => tool_memory_store(state, arguments).await,
         "memory_context" => tool_memory_context(state, arguments).await,
@@ -336,6 +340,46 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result
         "memory_relate" => tool_memory_relate(state, arguments).await,
         "memory_graph" => tool_memory_graph(state, arguments).await,
         _ => Err(anyhow::anyhow!("Unknown tool: {name}")),
+    };
+    output.map(strip_vectors_from_output)
+}
+
+/// Remove every `embedding` vector from a tool's JSON output.
+///
+/// Model structs (`Memory`, `Session`, `Experience`, `Document`,
+/// `TradingResult`) serialize their 2048-float vector, which `recall`, `list`,
+/// `core_memory`, `session_lineage`, `experience_find`, `memory_context` etc.
+/// would otherwise hand to the client: ~26 KB of numbers per row that no MCP
+/// client can use. Stripped here rather than with `#[serde(skip_serializing)]`
+/// because `memory-snapshot` export serializes the same structs and must keep
+/// the vectors.
+fn strip_vectors_from_output(output: String) -> String {
+    if !output.contains("\"embedding\"") {
+        return output;
+    }
+    match serde_json::from_str::<Value>(&output) {
+        Ok(mut value) => {
+            strip_embedding_vectors(&mut value);
+            value.to_string()
+        }
+        Err(_) => output,
+    }
+}
+
+/// Recursively drop `embedding` keys holding a vector (array) or `null`.
+pub(crate) fn strip_embedding_vectors(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if map
+                .get("embedding")
+                .is_some_and(|v| v.is_array() || v.is_null())
+            {
+                map.remove("embedding");
+            }
+            map.values_mut().for_each(strip_embedding_vectors);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_embedding_vectors),
+        _ => {}
     }
 }
 
@@ -383,18 +427,14 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
 
     info!("memory_search: query='{query}', limit={limit}");
 
-    let search_mode = if state.embedding_service.is_some() {
+    let embedding = try_embed(state, &query, false, "memory_search").await;
+    let search_mode = if embedding.is_some() {
         "hybrid"
     } else {
-        warn!("No embedding service — using keyword-only search");
+        warn!("No embedding — using keyword-only search");
         "keyword"
     };
-
-    // Generate embedding if embedding service is available
-    let embedding = match &state.embedding_service {
-        Some(svc) => svc.embed(&query).await?.as_vec().to_vec(),
-        None => vec![],
-    };
+    let embedding = embedding.unwrap_or_default();
 
     // Search across all four tables in parallel
     let (memories, documents, experiences, trading) = match tokio::try_join!(
@@ -434,7 +474,7 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
         Ok(results) => results,
         Err(e) => {
             tracing::error!("Search failed: {:?}", e);
-            return Ok(json!({"error": format!("Search failed: {}", e)}).to_string());
+            return Err(anyhow::Error::new(e).context("Search failed"));
         }
     };
 
@@ -460,17 +500,11 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
     let content = get_string(&args, "content")?;
     let mut tags = get_string_array(&args, "tags").unwrap_or_default();
     let content_type = get_string(&args, "content_type").unwrap_or_else(|_| "note".to_string());
-    let critical = args
+    let mut critical = args
         .get("critical")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let mut importance = get_f64(&args, "importance").unwrap_or(0.5).clamp(0.0, 1.0);
-    if critical {
-        importance = importance.max(0.9);
-        if !tags.iter().any(|tag| tag == "critical") {
-            tags.push("critical".into());
-        }
-    }
     let session_id = args
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -492,14 +526,9 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
 
     info!("memory_store: type={content_type}, importance={importance}, tags={tags:?}");
 
-    // Generate embedding if available
-    let embedding = match &state.embedding_service {
-        Some(svc) => {
-            let emb = svc.embed_passage(&content).await?;
-            Some(emb.as_vec().to_vec())
-        }
-        None => None,
-    };
+    // Generate embedding if available. On failure the row is still stored
+    // with a NULL embedding; `repair_null_embeddings` backfills it later.
+    let embedding = try_embed(state, &content, true, "memory_store").await;
     let embedding_slice = embedding.as_deref();
 
     // Near-duplicate detection: an incoming memory whose embedding is >=0.95
@@ -512,7 +541,7 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
     // then superseded via the same UPDATE pattern contradiction_resolve uses,
     // so vector_search/bm25_search's existing `superseded_by IS NULL` filter
     // excludes it automatically — no dead-end signal, no caller action
-    // required. Skipped without an embedding service: no signal to compare on.
+    // required. Skipped without an embedding: no signal to compare on.
     let superseded_id = if let Some(emb) = embedding_slice {
         let similar = state
             .db
@@ -530,6 +559,28 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
     } else {
         None
     };
+
+    // A restatement must not silently unpin a critical fact: superseding the
+    // old row drops it from core_memory and its decay exemption, so the new
+    // row inherits critical status from the row it replaces.
+    if let Some(old_id) = superseded_id {
+        let old_critical: bool = sqlx::query_scalar(
+            "SELECT COALESCE('critical' = ANY(tags) OR metadata @> '{\"critical\":true}'::jsonb, false) \
+             FROM memories WHERE id = $1",
+        )
+        .bind(old_id)
+        .fetch_optional(&state.db.pool)
+        .await
+        .context("Failed to read near-duplicate memory")?
+        .unwrap_or(false);
+        critical |= old_critical;
+    }
+    if critical {
+        importance = importance.max(0.9);
+        if !tags.iter().any(|tag| tag == "critical") {
+            tags.push("critical".into());
+        }
+    }
 
     let memory = match state
         .db
@@ -550,7 +601,7 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
         Ok(m) => m,
         Err(e) => {
             tracing::error!("Failed to store memory: {:?}", e);
-            return Ok(json!({"error": format!("Failed to store memory: {}", e)}).to_string());
+            return Err(anyhow::Error::new(e).context("Failed to store memory"));
         }
     };
 
@@ -566,8 +617,14 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
 
     if let Some(old_id) = superseded_id {
         sqlx::query(
-            "UPDATE memories SET superseded_by = $1, superseded_at = now(), \
-             invalid_at = COALESCE(invalid_at, now()) WHERE id = $2",
+            // Same rule as ContradictionDetector::resolve: the old row stops
+            // holding when the restatement becomes valid (its valid_at, else
+            // created_at), never before its own start.
+            "UPDATE memories m SET superseded_by = $1, superseded_at = now(), \
+             invalid_at = COALESCE(m.invalid_at, GREATEST( \
+                 (SELECT COALESCE(w.valid_at, w.created_at) FROM memories w WHERE w.id = $1), \
+                 COALESCE(m.valid_at, m.created_at))) \
+             WHERE m.id = $2",
         )
         .bind(memory.id)
         .bind(old_id)
@@ -588,6 +645,7 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
         "tags": memory.tags,
         "created_at": memory.created_at,
         "superseded_id": superseded_id,
+        "embedding_pending": embedding.is_none(),
     });
 
     Ok(serde_json::to_string(&result)?)
@@ -603,9 +661,8 @@ async fn tool_memory_context(state: &AppState, args: Value) -> Result<String> {
 
     info!("memory_context: query='{query}'");
 
-    let context = match &state.embedding_service {
-        Some(svc) => {
-            let embedding = svc.embed(&query).await?.as_vec().to_vec();
+    let context = match try_embed(state, &query, false, "memory_context").await {
+        Some(embedding) => {
             state
                 .db
                 .get_context_for_query(&query, &embedding, 10)
@@ -635,9 +692,8 @@ async fn tool_memory_initialize(state: &AppState, args: Value) -> Result<String>
 
     info!("memory_initialize: goal='{goal}'");
 
-    let context = match &state.embedding_service {
-        Some(svc) => {
-            let embedding = svc.embed(&goal).await?.as_vec().to_vec();
+    let context = match try_embed(state, &goal, false, "memory_initialize").await {
+        Some(embedding) => {
             state
                 .db
                 .get_context_for_query(&goal, &embedding, 10)
@@ -764,14 +820,11 @@ async fn tool_experience_find(state: &AppState, args: Value) -> Result<String> {
     let experiences = match &state.experience_service {
         Some(svc) => svc.find_relevant(&goal, limit).await?,
         None => {
-            // Fallback: search experiences table directly
-            let embedding = match &state.embedding_service {
-                Some(svc) => svc.embed(&goal).await?.as_vec().to_vec(),
-                None => vec![],
-            };
+            // Fallback: keyword search on the experiences table directly.
+            // Keyword mode never reads the embedding, so none is generated.
             let results = state
                 .search
-                .hybrid_search("experiences", &goal, &embedding, "keyword", limit as i64)
+                .hybrid_search("experiences", &goal, &[], "keyword", limit as i64)
                 .await
                 .context("Failed to search experiences")?;
 
@@ -796,49 +849,46 @@ async fn tool_experience_find(state: &AppState, args: Value) -> Result<String> {
     Ok(serde_json::to_string(&result)?)
 }
 
-/// 6. procedure_run — execute a named procedure.
+/// 6. procedure_run — return a named procedure's steps for the agent to run.
+/// Deliberately not an executor: steps are free-form stored text, and
+/// running them server-side would be arbitrary command execution.
 async fn tool_procedure_run(state: &AppState, args: Value) -> Result<String> {
     let name = get_string(&args, "name")?;
-    let _params = args.get("params").cloned().unwrap_or(json!({}));
+    let params = args.get("params").cloned().unwrap_or(json!({}));
 
     info!("procedure_run: name='{name}'");
 
-    // Try exact name lookup first, then search
-    let procedure = match &state.procedure_service {
-        Some(svc) => {
-            let candidates = svc.find_candidates(&name).await?;
-            candidates
-                .into_iter()
-                .find(|p| p.name.eq_ignore_ascii_case(&name))
-        }
-        None => {
-            let results = state
-                .db
-                .search_procedures(&name, 5)
-                .await
-                .context("Failed to search procedures")?;
-            results
-                .into_iter()
-                .find(|p| p.name.eq_ignore_ascii_case(&name))
-        }
-    };
+    // Exact, case-insensitive name match. Not search_procedures + filter: that
+    // keeps only the 5 most-used `ILIKE %name%` hits, so busier procedures
+    // whose names merely contain `name` could hide the exact one.
+    let procedure = sqlx::query_as::<_, Procedure>(
+        "SELECT id, name, description, steps, trigger_pattern, source_experience_id, tags, \
+                success_rate, times_used, confidence, created_at, updated_at \
+         FROM procedures WHERE lower(name) = lower($1) \
+         ORDER BY (name = $1) DESC LIMIT 1",
+    )
+    .bind(&name)
+    .fetch_optional(&state.db.pool)
+    .await
+    .context("Failed to look up procedure")?
+    .ok_or_else(|| anyhow::anyhow!("Procedure not found: {name}"))?;
 
-    let procedure = procedure.ok_or_else(|| anyhow::anyhow!("Procedure not found: {name}"))?;
-
-    // Record execution
+    // Record the use. It also counts as a success in success_rate, as it
+    // always has: the server never learns how the agent's run went.
     state
         .db
         .record_procedure_execution(procedure.id, true)
         .await
         .context("Failed to record procedure execution")?;
 
-    let steps_count = procedure.steps.as_array().map(|s| s.len()).unwrap_or(0);
-
     let result = json!({
-        "success": true,
+        "procedure_id": procedure.id,
         "procedure": procedure.name,
-        "steps_completed": steps_count,
-        "output": format!("Executed procedure '{}' successfully", procedure.name),
+        "description": procedure.description,
+        "steps": procedure.steps,
+        "params": params,
+        "executed": false,
+        "note": "Steps are returned for the calling agent to carry out; the server executes nothing.",
     });
 
     Ok(serde_json::to_string(&result)?)
@@ -1223,8 +1273,16 @@ async fn tool_status(state: &AppState, _args: Value) -> Result<String> {
     info!("status");
 
     let healthy = state.db.health().await;
-    let stats = state.db.get_stats().await;
-    let embedding_dimensions = state.db.embedding_dimensions().await.unwrap_or_default();
+    // Unreachable DB: skip the remaining queries, each would only wait out
+    // the pool's acquire timeout and come back empty anyway.
+    let (stats, embedding_dimensions) = if healthy {
+        (
+            state.db.get_stats().await,
+            state.db.embedding_dimensions().await.unwrap_or_default(),
+        )
+    } else {
+        Default::default()
+    };
 
     let retrieval_mode = if !healthy {
         "degraded"
@@ -1252,6 +1310,25 @@ async fn tool_status(state: &AppState, _args: Value) -> Result<String> {
 /// Read-only cross-client health contract.  This deliberately tolerates older
 /// databases so operators can diagnose a missing migration without mutation.
 async fn tool_memory_health(state: &AppState) -> Result<String> {
+    if !state.db.health().await {
+        return Ok(json!({
+            "status": "degraded",
+            "database": {
+                "available": false,
+                "message": "PostgreSQL database is unavailable; DB-backed tools will fail until it is reachable, and the server reconnects automatically without a restart",
+            },
+            "runtime": {
+                "build_version": env!("CARGO_PKG_VERSION"),
+                "build_revision": std::env::var("MEMORY_BUILD_REVISION").ok(),
+            },
+            "retrieval": {
+                "mode": "degraded",
+                "configured_dimension": state.config.embedding_dim,
+                "embedding_service": state.embedding_service.is_some(),
+            },
+        })
+        .to_string());
+    }
     let identity = sqlx::query("SELECT current_database(), COALESCE(inet_server_addr()::text, 'local'), COALESCE(inet_server_port(), 0)")
         .fetch_one(&state.db.pool)
         .await
@@ -1273,14 +1350,14 @@ async fn tool_memory_health(state: &AppState) -> Result<String> {
     .ok()
     .flatten();
     let dimensions = state.db.embedding_dimensions().await.unwrap_or_default();
-    let retrieval_mode = if !state.db.health().await {
-        "degraded"
-    } else if state.embedding_service.is_some() {
+    let retrieval_mode = if state.embedding_service.is_some() {
         "semantic"
     } else {
         "keyword-only"
     };
     Ok(json!({
+        "status": "ok",
+        "database": { "available": true },
         "runtime": {
             "database": identity.get::<String, _>(0),
             "host": identity.get::<String, _>(1),
@@ -1300,12 +1377,7 @@ async fn tool_memory_health(state: &AppState) -> Result<String> {
 }
 
 fn dashboard_state_dir() -> PathBuf {
-    env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/state")
-        })
-        .join("memory-platform")
+    crate::config::state_dir()
 }
 
 async fn tool_dashboard_status(state: &AppState) -> Result<String> {
@@ -1350,28 +1422,7 @@ async fn tool_dashboard_control(args: Value) -> Result<String> {
 }
 
 async fn run_dashboard_scheduler(action: &str) -> Result<()> {
-    let mut command = if cfg!(target_os = "macos") {
-        let output = tokio::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .await?;
-        let uid = String::from_utf8(output.stdout)?.trim().to_string();
-        let label = format!("gui/{uid}/com.memory-platform.neon-sync");
-        let mut command = tokio::process::Command::new("launchctl");
-        if action == "stop" {
-            command.args(["kill", "SIGTERM", &label]);
-        } else {
-            command.args(["kickstart", "-k", &label]);
-        }
-        command
-    } else {
-        let mut command = tokio::process::Command::new("systemctl");
-        command.args(["--user", action, "memory-platform-maintenance.service"]);
-        command
-    };
-    command.stdout(Stdio::null()).stderr(Stdio::null());
-    anyhow::ensure!(command.status().await?.success(), "scheduler action failed");
-    Ok(())
+    crate::scheduler::run(action).await
 }
 
 /// Read-only cold-archive and durable-sync health for MCP clients.
@@ -1622,14 +1673,16 @@ async fn tool_memory_graph(state: &AppState, args: Value) -> Result<String> {
 
     info!("memory_graph: {entity_type}:{entity_id}, max_hops={max_hops}");
 
-    // ponytail: no visited-path tracking — recursion is still bounded by
-    // max_hops regardless of cycles in the edge set (each step requires
-    // depth < max_hops, so it always terminates); a cyclic neighborhood just
-    // produces extra intermediate rows that GROUP BY collapses below.
+    // UNION, not UNION ALL: every edge is followed in both directions, so
+    // with UNION ALL each hop walks back to the previous node and the
+    // intermediate row count grows as degree^max_hops (a 200-leaf hub at
+    // max_hops=4 made 80k rows). UNION drops a repeated (type, id, depth)
+    // row, which keeps the walk to at most nodes x (max_hops + 1) rows.
+    // The start entity is excluded below because a back-edge leads to it.
     let rows: Vec<(String, Uuid, i64)> = sqlx::query_as(
         "WITH RECURSIVE traversal(entity_type, entity_id, depth) AS ( \
              SELECT $1::text, $2::uuid, 0::bigint \
-             UNION ALL \
+             UNION \
              SELECT \
                  CASE WHEN r.source_type = t.entity_type AND r.source_id = t.entity_id \
                       THEN r.target_type ELSE r.source_type END, \
@@ -1645,7 +1698,7 @@ async fn tool_memory_graph(state: &AppState, args: Value) -> Result<String> {
          ) \
          SELECT entity_type, entity_id, MIN(depth) AS depth \
          FROM traversal \
-         WHERE depth > 0 \
+         WHERE NOT (entity_type = $1 AND entity_id = $2) \
          GROUP BY entity_type, entity_id \
          ORDER BY depth, entity_type, entity_id",
     )
@@ -1664,8 +1717,11 @@ async fn tool_memory_graph(state: &AppState, args: Value) -> Result<String> {
         .collect();
     let previews = fetch_memory_previews(&state.db, &memory_ids).await?;
 
+    // A memory with no live preview is forgotten, superseded or deleted;
+    // `forget` promises it no longer appears here, so drop it.
     let nodes: Vec<Value> = rows
         .into_iter()
+        .filter(|(node_type, node_id, _)| node_type != "memory" || previews.contains_key(node_id))
         .map(|(node_type, node_id, depth)| {
             let mut node = json!({
                 "entity_type": node_type,
@@ -1698,23 +1754,17 @@ async fn fetch_memory_previews(
         return Ok(std::collections::HashMap::new());
     }
 
-    let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("${i}")).collect();
-    let sql = format!(
-        "SELECT id, content FROM memories WHERE id IN ({}) \
+    // One array bind, not one `$n` per id: Postgres caps a statement at
+    // 65535 bind parameters, which a large graph neighbourhood can exceed.
+    let rows = sqlx::query(
+        "SELECT id, content FROM memories WHERE id = ANY($1) \
          AND (expiration_date IS NULL OR expiration_date >= CURRENT_DATE) \
          AND superseded_by IS NULL",
-        placeholders.join(",")
-    );
-
-    let mut query_builder = sqlx::query(&sql);
-    for id in ids {
-        query_builder = query_builder.bind(*id);
-    }
-
-    let rows = query_builder
-        .fetch_all(&db.pool)
-        .await
-        .context("Failed to fetch memory previews")?;
+    )
+    .bind(ids)
+    .fetch_all(&db.pool)
+    .await
+    .context("Failed to fetch memory previews")?;
 
     Ok(rows
         .into_iter()
@@ -1766,6 +1816,27 @@ async fn record_batch_access(
         .bind(&scores)
         .execute(pool)
         .await;
+    }
+}
+
+/// Embed `text` as a query (`passage = false`) or a stored passage, or
+/// `None` when there is no embedding service *or* the call fails at runtime
+/// (offline, provider 5xx/429, llama-server down). The startup probe only
+/// decides whether a service exists; a later outage must degrade the tool
+/// (keyword search, NULL embedding for backfill) rather than fail it.
+async fn try_embed(state: &AppState, text: &str, passage: bool, tool: &str) -> Option<Vec<f32>> {
+    let svc = state.embedding_service.as_ref()?;
+    let result = if passage {
+        svc.embed_passage(text).await
+    } else {
+        svc.embed(text).await
+    };
+    match result {
+        Ok(embedding) => Some(embedding.into_inner()),
+        Err(e) => {
+            warn!("{tool}: embedding failed, continuing without a vector: {e:#}");
+            None
+        }
     }
 }
 
@@ -1886,6 +1957,265 @@ mod tests {
         }
     }
 
+    /// An embedder that passed the startup probe and then went down: every
+    /// call errors, as offline / NVIDIA 5xx/429 / llama-server down would.
+    struct FailingEmbedder;
+
+    impl crate::services::embedding::EmbeddingService for FailingEmbedder {
+        fn embed(
+            &self,
+            _text: &str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::models::embedding::Embedding>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Err(anyhow::anyhow!("embedding provider returned 503")) })
+        }
+    }
+
+    fn failing_embedder_state() -> AppState {
+        AppState {
+            embedding_service: Some(Arc::new(FailingEmbedder)),
+            ..test_state()
+        }
+    }
+
+    #[tokio::test]
+    async fn try_embed_degrades_to_none_on_runtime_failure() {
+        let state = failing_embedder_state();
+        assert!(try_embed(&state, "q", false, "test").await.is_none());
+        assert!(try_embed(&state, "p", true, "test").await.is_none());
+    }
+
+    /// Fresh, migrated `{prefix}_*` database on the throwaway local Postgres
+    /// named by `DATABASE_URL`; returns the state and the DB name to drop.
+    async fn live_failing_embedder_state(prefix: &str) -> (AppState, sqlx::PgPool, String) {
+        let admin_url = env::var("DATABASE_URL").expect("DATABASE_URL (throwaway local Postgres)");
+        let admin = sqlx::PgPool::connect(&admin_url).await.unwrap();
+        let name = format!("{prefix}_{}", Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let options = admin_url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .unwrap()
+            .database(&name);
+        let pool = sqlx::PgPool::connect_with(options).await.unwrap();
+        crate::migrations::Migrator::run(&pool).await.unwrap();
+        let db = Arc::new(PostgresDb::with_pool(pool));
+        let state = AppState {
+            db: Arc::clone(&db),
+            search: Arc::new(SearchEngine::new(db, Arc::new(Config::default()))),
+            ..failing_embedder_state()
+        };
+        (state, admin, name)
+    }
+
+    async fn drop_live_db(state: AppState, admin: sqlx::PgPool, name: String) {
+        state.db.pool.close().await;
+        drop(state);
+        sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a throwaway local Postgres with pgvector in DATABASE_URL"]
+    async fn store_and_search_succeed_when_embedder_fails_at_runtime() {
+        let (state, admin, name) = live_failing_embedder_state("agentd_embedfail").await;
+
+        let stored = call_tool(
+            &state,
+            "memory_store",
+            json!({"content": "zebra crossing outage drill"}),
+        )
+        .await;
+        let searched = call_tool(&state, "memory_search", json!({"query": "zebra"})).await;
+        let context = call_tool(&state, "memory_context", json!({"query": "zebra"})).await;
+        let null_embeddings: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM memories WHERE embedding IS NULL")
+                .fetch_one(&state.db.pool)
+                .await
+                .unwrap();
+        drop_live_db(state, admin, name).await;
+
+        let stored: Value = serde_json::from_str(&stored.expect("store must not fail")).unwrap();
+        assert_eq!(stored["embedding_pending"], json!(true));
+        assert_eq!(
+            null_embeddings, 1,
+            "row stored with NULL embedding for backfill"
+        );
+        let searched: Value =
+            serde_json::from_str(&searched.expect("search must not fail")).unwrap();
+        let hits = searched["memories"].as_array().unwrap();
+        assert!(
+            hits.iter().any(|m| m["id"] == stored["id"]),
+            "keyword fallback finds the stored memory: {searched}"
+        );
+        context.expect("memory_context must not fail");
+    }
+
+    async fn store(state: &AppState, content: &str) -> String {
+        let out = call_tool(state, "memory_store", json!({ "content": content }))
+            .await
+            .unwrap();
+        serde_json::from_str::<Value>(&out).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn relate(state: &AppState, source: &str, target: &str) {
+        call_tool(
+            state,
+            "memory_relate",
+            json!({"source_type": "memory", "source_id": source,
+                   "target_type": "memory", "target_id": target,
+                   "relation_type": "references"}),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a throwaway local Postgres with pgvector in DATABASE_URL"]
+    async fn memory_graph_bounded_and_excludes_start_and_forgotten() {
+        let (state, admin, name) = live_failing_embedder_state("agenth_graph").await;
+
+        // Hub with 60 leaves: at max_hops=5 the old UNION ALL walk made
+        // ~60^3 intermediate rows and returned the hub as its own neighbour.
+        let hub = store(&state, "graph hub").await;
+        let mut leaves = Vec::new();
+        for i in 0..60 {
+            let leaf = store(&state, &format!("graph leaf number {i}")).await;
+            relate(&state, &hub, &leaf).await;
+            leaves.push(leaf);
+        }
+        call_tool(&state, "forget", json!({ "id": leaves[0] }))
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let out = call_tool(
+            &state,
+            "memory_graph",
+            json!({"entity_type": "memory", "entity_id": hub, "max_hops": 5}),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        drop_live_db(state, admin, name).await;
+
+        let out: Value = serde_json::from_str(&out.unwrap()).unwrap();
+        let ids: Vec<&str> = out["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["entity_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(out["count"], json!(59), "{out}");
+        assert!(!ids.contains(&hub.as_str()), "start node returned: {out}");
+        assert!(
+            !ids.contains(&leaves[0].as_str()),
+            "forgotten memory returned"
+        );
+        assert!(out["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["depth"] == 1));
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a throwaway local Postgres with pgvector in DATABASE_URL"]
+    async fn procedure_run_finds_exact_name_and_returns_steps_unexecuted() {
+        let (state, admin, name) = live_failing_embedder_state("agenth_proc").await;
+
+        let steps = json!(["cargo build", "cargo test"]);
+        let exact = state
+            .db
+            .create_procedure("deploy", Some("ship it"), &steps, None, None, &[])
+            .await
+            .unwrap();
+        // Six busier procedures whose names contain "deploy": the old
+        // 5-candidate ILIKE search never reached the exact match.
+        for i in 0..6 {
+            let p = state
+                .db
+                .create_procedure(&format!("deploy-{i}"), None, &json!([]), None, None, &[])
+                .await
+                .unwrap();
+            for _ in 0..3 {
+                state
+                    .db
+                    .record_procedure_execution(p.id, true)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let out = call_tool(
+            &state,
+            "procedure_run",
+            json!({"name": "DEPLOY", "params": {"env": "prod"}}),
+        )
+        .await;
+        let missing = call_tool(&state, "procedure_run", json!({"name": "nope"})).await;
+        drop_live_db(state, admin, name).await;
+
+        let out: Value = serde_json::from_str(&out.expect("exact match found")).unwrap();
+        assert_eq!(out["procedure_id"], json!(exact.id));
+        assert_eq!(out["steps"], steps);
+        assert_eq!(out["params"], json!({"env": "prod"}));
+        assert_eq!(out["executed"], json!(false));
+        assert!(missing
+            .unwrap_err()
+            .to_string()
+            .contains("Procedure not found"));
+    }
+
+    #[test]
+    fn procedure_run_description_does_not_claim_execution() {
+        let tools = list_tools();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "procedure_run")
+            .unwrap();
+        let desc = tool["description"].as_str().unwrap();
+        assert!(desc.contains("Nothing is executed server-side"), "{desc}");
+        assert!(!desc.starts_with("Execute"), "{desc}");
+    }
+
+    #[test]
+    fn list_tools_declares_session_id_where_handlers_read_it() {
+        let tools = list_tools();
+        for name in [
+            "memory_search",
+            "memory_store",
+            "memory_context",
+            "memory_initialize",
+            "recall",
+        ] {
+            let tool = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap();
+            assert!(
+                tool["inputSchema"]["properties"]["session_id"].is_object(),
+                "{name} reads session_id but its schema omits it"
+            );
+        }
+    }
+
     #[test]
     fn list_tools_returns_25_tools() {
         let tools = list_tools();
@@ -1940,6 +2270,43 @@ mod tests {
 
         for name in &expected {
             assert!(names.contains(name), "Missing tool: {name}");
+        }
+    }
+
+    #[test]
+    fn tool_output_strips_embedding_vectors() {
+        let now = chrono::Utc::now();
+        let memory = Memory {
+            id: Uuid::new_v4(),
+            agent_id: None,
+            session_id: None,
+            content: "keep me".into(),
+            content_type: "note".into(),
+            embedding: Some(crate::models::Embedding::new(vec![0.123_456; 2048])),
+            fts: None,
+            importance: 0.5,
+            tags: vec![],
+            metadata: json!({}),
+            last_accessed_at: None,
+            access_count: 0,
+            decay_score: 1.0,
+            created_at: now,
+            updated_at: now,
+            expiration_date: None,
+        };
+        // Same shapes `recall` (bare struct) and `list` (wrapped rows) emit.
+        let bare = serde_json::to_string(&memory).unwrap();
+        let wrapped =
+            serde_json::to_string(&json!({"table": "memories", "rows": [&memory], "count": 1}))
+                .unwrap();
+        assert!(bare.contains("0.123456"), "precondition: vector serialized");
+
+        for raw in [bare, wrapped] {
+            let out = strip_vectors_from_output(raw);
+            assert!(!out.contains("\"embedding\""), "{out}");
+            assert!(!out.contains("0.123456"), "vector leaked");
+            assert!(out.contains("keep me"));
+            assert!(out.len() < 1_000, "result still {} bytes", out.len());
         }
     }
 

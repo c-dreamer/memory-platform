@@ -12,6 +12,7 @@ pub mod mcp;
 pub mod migrations;
 pub mod models;
 pub mod queue;
+pub mod scheduler;
 pub mod search;
 pub mod services;
 

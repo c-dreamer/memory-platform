@@ -30,6 +30,13 @@ use tokio::sync::Mutex;
 const EMBEDDING_REQUEST_TIMEOUT_SECS: u64 = 300;
 const EMBEDDING_REQUEST_RETRIES: usize = 4;
 
+/// Qwen3-Embedding is asymmetric the instruction way: queries carry a task
+/// instruction, stored documents carry none (Qwen3-Embedding model card).
+/// Without it retrieval quality drops; passages are sent unprefixed, so
+/// vectors already stored under llama-cpp stay valid.
+const LLAMACPP_QUERY_PREFIX: &str =
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:";
+
 /// Embedding service trait.
 pub trait EmbeddingService: Send + Sync {
     /// Generate embedding for a single text string, as a search query.
@@ -427,7 +434,25 @@ impl LlamaCppEmbedding {
 
 impl EmbeddingService for LlamaCppEmbedding {
     fn embed(&self, text: &str) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>> {
+        self.embed_as(text, LLAMACPP_QUERY_PREFIX)
+    }
+
+    fn embed_passage(
+        &self,
+        text: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>> {
+        self.embed_as(text, "")
+    }
+}
+
+impl LlamaCppEmbedding {
+    fn embed_as(
+        &self,
+        text: &str,
+        prefix: &'static str,
+    ) -> Pin<Box<dyn Future<Output = Result<Embedding>> + Send + '_>> {
         let text = text.to_string();
+        let cache_key = format!("{prefix}\u{0}{text}");
         let client = self.client.clone();
         let api_url = self.api_url.clone();
         let model = self.model.clone();
@@ -440,12 +465,15 @@ impl EmbeddingService for LlamaCppEmbedding {
 
             {
                 let mut cache = cache.lock().await;
-                if let Some(cached) = cache.get(&text) {
+                if let Some(cached) = cache.get(&cache_key) {
                     return Ok(cached.clone());
                 }
             }
 
-            let chunks = split_for_embedding(&text, 4000);
+            let chunks: Vec<String> = split_for_embedding(&text, 4000)
+                .into_iter()
+                .map(|chunk| format!("{prefix}{chunk}"))
+                .collect();
             let embedding = if chunks.len() == 1 {
                 Self::embed_llamacpp_chunk(
                     &client,
@@ -495,7 +523,7 @@ impl EmbeddingService for LlamaCppEmbedding {
 
             {
                 let mut cache = cache.lock().await;
-                cache.put(text, embedding.clone());
+                cache.put(cache_key, embedding.clone());
             }
 
             Ok(embedding)
@@ -655,5 +683,55 @@ mod tests {
         let err = LlamaCppEmbedding::parse_llamacpp_response(response, DEFAULT_EMBEDDING_DIM)
             .expect_err("response narrower than expected_dimension must be rejected");
         assert!(err.to_string().contains("need at least"));
+    }
+
+    /// Full HTTP round trip against a loopback stand-in for `llama-server`
+    /// returning Qwen3-Embedding-4B's native 2560 dims: queries carry the
+    /// instruction, passages don't, and both come back as unit 2048-vectors.
+    #[tokio::test]
+    async fn test_llamacpp_round_trip_query_vs_passage() {
+        use axum::{routing::post, Json, Router};
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let recorder = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/v1/embeddings",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    let input = body["input"].as_str().unwrap_or_default().to_string();
+                    recorder.lock().unwrap().push(input);
+                    let values: Vec<f64> = (0..2560).map(|i| (i % 7) as f64 + 1.0).collect();
+                    Json(serde_json::json!({"data": [{"embedding": values}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let service = LlamaCppEmbedding::new(
+            format!("http://{addr}/v1/embeddings"),
+            "qwen3-embedding-4b".into(),
+            10,
+            DEFAULT_EMBEDDING_DIM,
+        );
+        let query = service.embed("windows port").await.unwrap();
+        let passage = service.embed_passage("windows port").await.unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                format!("{LLAMACPP_QUERY_PREFIX}windows port"),
+                "windows port".to_string()
+            ],
+            "same text as query and passage must be two distinct requests"
+        );
+        for embedding in [query, passage] {
+            let values = embedding.into_inner();
+            assert_eq!(values.len(), DEFAULT_EMBEDDING_DIM);
+            let norm = values.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-4, "norm was {norm}");
+        }
     }
 }

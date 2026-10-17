@@ -108,6 +108,103 @@ async fn auth_rejects_missing_api_key() {
 }
 
 // ---------------------------------------------------------------------------
+// /mcp (transport-http): auth, Content-Type and Origin checks. DB-free: `ping`
+// never touches storage.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "transport-http")]
+async fn mcp_post(api_key: &str, headers: &[(&str, &str)]) -> (StatusCode, String) {
+    let mut config = Config::default();
+    config.api_key = api_key.to_string();
+    let state = state_with_config(config);
+    let mut req = Request::builder().method("POST").uri("/mcp");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}).to_string();
+    let response = api::router()
+        .with_state(state)
+        .oneshot(req.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(feature = "transport-http")]
+const JSON: (&str, &str) = ("content-type", "application/json");
+
+#[cfg(feature = "transport-http")]
+#[tokio::test]
+async fn mcp_accepts_valid_request() {
+    // No key configured (loopback dev mode), no Origin (non-browser client).
+    let (status, body) = mcp_post("", &[JSON]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"result\""), "{body}");
+
+    // Key configured and supplied, loopback browser Origin, charset param.
+    let (status, body) = mcp_post(
+        "k",
+        &[
+            ("content-type", "application/json; charset=utf-8"),
+            ("x-api-key", "k"),
+            ("origin", "http://localhost:8000"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for origin in [
+        "http://127.0.0.1",
+        "http://127.0.0.1:8000",
+        "http://[::1]:8000",
+    ] {
+        let (status, _) = mcp_post("", &[JSON, ("origin", origin)]).await;
+        assert_eq!(status, StatusCode::OK, "{origin}");
+    }
+}
+
+#[cfg(feature = "transport-http")]
+#[tokio::test]
+async fn mcp_rejects_non_json_content_type() {
+    for ct in [
+        "text/plain",
+        "application/x-www-form-urlencoded",
+        "multipart/form-data",
+    ] {
+        let (status, _) = mcp_post("", &[("content-type", ct)]).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{ct}");
+    }
+    let (status, _) = mcp_post("", &[]).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "missing");
+}
+
+#[cfg(feature = "transport-http")]
+#[tokio::test]
+async fn mcp_rejects_foreign_origin() {
+    for origin in [
+        "http://evil.example",
+        "http://127.0.0.1.evil.example:8000",
+        "https://localhost",
+        "null",
+    ] {
+        let (status, _) = mcp_post("", &[JSON, ("origin", origin)]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{origin}");
+    }
+}
+
+#[cfg(feature = "transport-http")]
+#[tokio::test]
+async fn mcp_rejects_missing_or_wrong_key_when_configured() {
+    let (status, _) = mcp_post("k", &[JSON]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = mcp_post("k", &[JSON, ("x-api-key", "wrong")]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
 // Tests requiring a live database — ignored by default.
 // Set DATABASE_URL (or the integration test env) to run them:
 //   DATABASE_URL=postgresql://... cargo test --test integration -- --include-ignored
@@ -160,8 +257,12 @@ async fn db_migration_runs_cleanly() {
 
 /// Build a minimal AppState with all services disabled.
 fn minimal_state() -> Arc<AppState> {
+    state_with_config(Config::default())
+}
+
+fn state_with_config(config: Config) -> Arc<AppState> {
     Arc::new(AppState {
-        config: Config::default(),
+        config,
         db: Arc::new(PostgresDb::new_empty()),
         search: Arc::new(SearchEngine::new_empty()),
         neo4j_client: None,

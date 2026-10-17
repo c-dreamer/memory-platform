@@ -34,6 +34,16 @@ pub struct VaultSyncSummary {
 }
 
 /// Scan a directory recursively for `.md` files, sorted by modification time.
+/// Dot-prefixed components below `root` (`.obsidian`, `.trash`) are hidden;
+/// the root's own path is not checked, so a vault under `~/.local/...` or
+/// given as `./vault` is still scanned.
+fn is_hidden_within(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+}
+
 fn scan_vault(root: &Path, max_files: usize) -> Result<Vec<VaultFile>> {
     let mut files: Vec<VaultFile> = Vec::new();
 
@@ -48,10 +58,7 @@ fn scan_vault(root: &Path, max_files: usize) -> Result<Vec<VaultFile>> {
             continue;
         }
 
-        if path
-            .components()
-            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
-        {
+        if is_hidden_within(root, path) {
             continue;
         }
 
@@ -322,3 +329,19 @@ trait Pipe: Sized {
 }
 
 impl<T> Pipe for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::is_hidden_within;
+    use std::path::Path;
+
+    #[test]
+    fn hidden_check_ignores_vault_root_components() {
+        let root = Path::new("/home/u/.local/vault");
+        assert!(!is_hidden_within(root, &root.join("notes/a.md")));
+        assert!(is_hidden_within(root, &root.join(".obsidian/a.md")));
+        assert!(is_hidden_within(root, &root.join("notes/.trash/a.md")));
+        let rel = Path::new("./vault");
+        assert!(!is_hidden_within(rel, &rel.join("a.md")));
+    }
+}

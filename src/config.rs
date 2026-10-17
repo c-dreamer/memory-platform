@@ -111,14 +111,28 @@ pub struct Config {
     pub local_only: bool,
 }
 
+/// `postgres://user:secret@host/db` -> `postgres://user:***@host/db`.
+pub fn redact_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        return url.to_string();
+    };
+    let Some(at) = url[scheme_end..].rfind('@').map(|i| i + scheme_end) else {
+        return url.to_string();
+    };
+    match url[scheme_end..at].find(':') {
+        Some(colon) => format!("{}:***{}", &url[..scheme_end + colon], &url[at..]),
+        None => url.to_string(),
+    }
+}
+
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
-            .field("database_url", &self.database_url)
-            .field("redis_url", &self.redis_url)
+            .field("database_url", &redact_url(&self.database_url))
+            .field("redis_url", &redact_url(&self.redis_url))
             .field("neo4j_uri", &self.neo4j_uri)
             .field("neo4j_user", &self.neo4j_user)
-            .field("neo4j_password", &self.neo4j_password)
+            .field("neo4j_password", &"***redacted***")
             .field("api_key", &"***redacted***")
             .field("api_port", &self.api_port)
             .field("embedding_model", &self.embedding_model)
@@ -280,6 +294,29 @@ pub fn local_only_enabled() -> bool {
     }
 }
 
+/// Per-device state directory holding the `neon-maintenance.paused` /
+/// `neon-maintenance.retry` flags shared with `scripts/run-memory-maintenance.sh`.
+///
+/// Mirrors that script's `${XDG_STATE_HOME:-$HOME/.local/state}/memory-platform`
+/// (empty counts as unset, like `:-`). On Windows the script runs under Git Bash,
+/// which derives `HOME` from `USERPROFILE`, so a natively launched binary without
+/// `HOME` falls back to `USERPROFILE` to read the same flags.
+pub fn state_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    env_var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                env_var("HOME")
+                    .or_else(|| env_var("USERPROFILE"))
+                    .unwrap_or_else(|| ".".into()),
+            )
+            .join(".local")
+            .join("state")
+        })
+        .join("memory-platform")
+}
+
 /// Which embedding backend `EMBEDDING_MODEL` selects, read directly from the
 /// environment (like `local_only_enabled`) for callers that only hold a bare
 /// `PgPool`, not a full `Config`.
@@ -420,6 +457,22 @@ fn parse_bool(key: &'static str, default: bool) -> Result<bool, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redact_url_hides_only_the_password() {
+        assert_eq!(
+            redact_url("postgresql://memory:s3cr@t@db.example:5432/memory"),
+            "postgresql://memory:***@db.example:5432/memory"
+        );
+        assert_eq!(
+            redact_url("postgres://memory@host/db"),
+            "postgres://memory@host/db"
+        );
+        assert_eq!(
+            super::redact_url("postgres://host/db"),
+            "postgres://host/db"
+        );
+    }
+
     use super::*;
     use std::fs;
     use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -471,6 +524,74 @@ mod tests {
         if let Err(panic) = result {
             resume_unwind(panic);
         }
+    }
+
+    #[test]
+    fn state_dir_prefers_xdg_state_home() {
+        with_env_vars(
+            &[
+                ("XDG_STATE_HOME", "/xdg"),
+                ("LOCALAPPDATA", "/lad"),
+                ("HOME", "/home/u"),
+            ],
+            || {
+                assert_eq!(state_dir(), PathBuf::from("/xdg").join("memory-platform"));
+            },
+        );
+    }
+
+    #[test]
+    fn state_dir_ignores_localappdata_to_match_bash_runner() {
+        // run-memory-maintenance.sh (the only reader of the pause/retry flags)
+        // never consults LOCALAPPDATA, even under Git Bash on Windows.
+        with_env_vars(
+            &[
+                ("XDG_STATE_HOME", ""),
+                ("LOCALAPPDATA", "/lad"),
+                ("HOME", "/home/u"),
+            ],
+            || {
+                assert_eq!(
+                    state_dir(),
+                    PathBuf::from("/home/u/.local/state/memory-platform")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn state_dir_home_only() {
+        with_env_vars(
+            &[
+                ("XDG_STATE_HOME", ""),
+                ("LOCALAPPDATA", ""),
+                ("USERPROFILE", ""),
+                ("HOME", "/home/u"),
+            ],
+            || {
+                assert_eq!(
+                    state_dir(),
+                    PathBuf::from("/home/u/.local/state/memory-platform")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn state_dir_falls_back_to_userprofile_without_home() {
+        with_env_vars(
+            &[
+                ("XDG_STATE_HOME", ""),
+                ("HOME", ""),
+                ("USERPROFILE", "/users/u"),
+            ],
+            || {
+                assert_eq!(
+                    state_dir(),
+                    PathBuf::from("/users/u/.local/state/memory-platform")
+                );
+            },
+        );
     }
 
     fn unique_temp_dir() -> PathBuf {

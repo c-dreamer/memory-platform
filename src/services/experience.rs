@@ -72,17 +72,31 @@ impl ExperienceService {
         query: &str,
         limit: usize,
     ) -> Result<Vec<Experience>, anyhow::Error> {
-        // Use a zero embedding for keyword-only search when no embedder is wired.
-        // The SearchEngine's hybrid mode will still run BM25 which is sufficient
-        // for experience retrieval by goal text.
-        let dummy_embedding = Vec::new();
+        // Hybrid (vector + BM25) when the embedder answers; keyword-only when
+        // there is none or it fails at runtime, so an outage only degrades
+        // ranking instead of failing the lookup.
+        let embedding = match &self.embedding_service {
+            Some(service) => match service.embed(query).await {
+                Ok(embedding) => Some(embedding.into_inner()),
+                Err(e) => {
+                    tracing::warn!("find_relevant: embedding failed, keyword-only: {e:#}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let mode = if embedding.is_some() {
+            "hybrid"
+        } else {
+            "keyword"
+        };
         let results = self
             .search
             .hybrid_search(
                 "experiences",
                 query,
-                &dummy_embedding,
-                "keyword",
+                embedding.as_deref().unwrap_or_default(),
+                mode,
                 limit as i64,
             )
             .await
@@ -92,8 +106,11 @@ impl ExperienceService {
             return Ok(Vec::new());
         }
 
+        // `WHERE id IN (...)` returns rows in arbitrary order; restore the
+        // search ranking.
         let ids: Vec<Uuid> = results.iter().map(|r| r.id).collect();
-        let experiences = self.fetch_experiences_by_ids(&ids).await?;
+        let mut experiences = self.fetch_experiences_by_ids(&ids).await?;
+        experiences.sort_by_key(|e| ids.iter().position(|id| *id == e.id));
 
         Ok(experiences)
     }
@@ -105,11 +122,19 @@ impl ExperienceService {
     ) -> Result<Experience, anyhow::Error> {
         let db = PostgresDb::with_pool(self.pool.clone());
 
-        let embedding = if let Some(service) = &self.embedding_service {
-            let text = compose_experience_text(&data);
-            Some(service.embed_passage(&text).await?.into_inner())
-        } else {
-            None
+        // A runtime embedding failure stores the row with a NULL embedding
+        // for `repair_null_embeddings` to backfill, rather than losing it.
+        let embedding = match &self.embedding_service {
+            Some(service) => match service.embed_passage(&compose_experience_text(&data)).await {
+                Ok(embedding) => Some(embedding.into_inner()),
+                Err(e) => {
+                    tracing::warn!(
+                        "record_interaction: embedding failed, storing without a vector: {e:#}"
+                    );
+                    None
+                }
+            },
+            None => None,
         };
 
         db.store_experience(&data, embedding.as_deref())

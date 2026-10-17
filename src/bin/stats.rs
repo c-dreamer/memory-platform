@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use clap::Parser;
+use memory_platform::config::redact_url;
 use memory_platform::db::postgres::PostgresDb;
 use memory_platform::Config;
 use serde_json::json;
@@ -21,9 +22,20 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
-    /// Compare two database URLs and print a side-by-side summary
+    /// Compare two databases side by side. Each value is the NAME of an
+    /// environment variable holding the URL (e.g. `LOCAL_URL NEON_URL`), so
+    /// passwords never appear in argv; a literal URL is still accepted.
     #[arg(long = "compare", num_args = 2, value_names = ["LEFT", "RIGHT"])]
     compare: Vec<String>,
+}
+
+/// An env var name resolves to its value; anything containing `://` is
+/// taken as a literal URL for backward compatibility.
+fn resolve_url(arg: &str) -> Result<String> {
+    if arg.contains("://") {
+        return Ok(arg.to_string());
+    }
+    std::env::var(arg).map_err(|_| anyhow::anyhow!("environment variable {arg} is not set"))
 }
 
 #[tokio::main]
@@ -31,8 +43,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.compare.len() == 2 {
-        let left = summarize(&cli.compare[0]).await?;
-        let right = summarize(&cli.compare[1]).await?;
+        let left = summarize(&resolve_url(&cli.compare[0])?).await?;
+        let right = summarize(&resolve_url(&cli.compare[1])?).await?;
 
         if cli.json {
             println!(
@@ -78,7 +90,7 @@ async fn summarize(db_url: &str) -> Result<serde_json::Value> {
     let counts = db.get_stats().await;
     let size_mb = size_bytes as f64 / 1024.0 / 1024.0;
     Ok(json!({
-        "database_url": db_url,
+        "database_url": redact_url(db_url),
         "size_bytes": size_bytes,
         "size_mb": size_mb,
         "counts": counts,
@@ -136,5 +148,16 @@ fn print_delta(left: &serde_json::Value, right: &serde_json::Value) {
             let rv = r.get(key).and_then(|v| v.as_i64()).unwrap_or_default();
             println!("  {key}: {}", rv - lv);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_url_reads_env_names_and_passes_urls_through() {
+        assert_eq!(resolve_url("postgres://h/db").unwrap(), "postgres://h/db");
+        assert!(resolve_url("MEMORY_PLATFORM_TEST_UNSET_VAR").is_err());
     }
 }

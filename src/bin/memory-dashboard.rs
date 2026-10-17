@@ -1,6 +1,6 @@
 //! Local-only operational dashboard for the memory platform.
 
-use std::{collections::BTreeMap, env, net::SocketAddr, path::PathBuf, process::Stdio, sync::Arc};
+use std::{collections::BTreeMap, env, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use memory_platform::config::local_only_enabled;
+use memory_platform::config::{local_only_enabled, state_dir};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -101,15 +101,6 @@ fn root() -> Result<PathBuf> {
                 .context("cannot derive memory platform root")
         })
         .context("MEMORY_PLATFORM_ROOT is required")
-}
-
-fn state_dir() -> PathBuf {
-    env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/state")
-        })
-        .join("memory-platform")
 }
 
 fn authorized(
@@ -302,18 +293,8 @@ async fn status(
         None => Vec::new(),
     };
     let containers = probe_containers().await;
-    let automation_paths = if cfg!(target_os = "macos") {
-        vec![
-            "~/Library/LaunchAgents/com.memory-platform.neon-sync.plist".into(),
-            "~/Library/LaunchAgents/com.memory-platform.neon-retry.plist".into(),
-            "~/Library/LaunchAgents/com.memory-platform.dashboard.plist".into(),
-        ]
-    } else {
-        vec![
-            "~/.config/systemd/user/memory-platform-dashboard.service".into(),
-            "~/.config/systemd/user/memory-platform-maintenance.service".into(),
-        ]
-    };
+    let scheduler = memory_platform::scheduler::Scheduler::detect();
+    let automation_paths = scheduler.automation_paths();
     let next_action = if pause.exists() {
         "Sync is paused. Resume only when you want background work to continue.".into()
     } else if !neon_reachable {
@@ -335,11 +316,7 @@ async fn status(
         last_success,
         paused: pause.exists(),
         retry_pending: retry.exists(),
-        scheduler: if cfg!(target_os = "macos") {
-            "launchd"
-        } else {
-            "systemd user service"
-        },
+        scheduler: scheduler.label(),
         neon_reachable,
         containers,
         automation_paths,
@@ -449,33 +426,7 @@ async fn control(
 }
 
 async fn scheduler(_root: &PathBuf, action: &str) -> Result<()> {
-    let mut command = if cfg!(target_os = "macos") {
-        let uid = Command::new("id").arg("-u").output().await?.stdout;
-        let uid = String::from_utf8(uid)?.trim().to_string();
-        let mut c = Command::new("launchctl");
-        if action == "stop" {
-            c.args([
-                "kill",
-                "SIGTERM",
-                &format!("gui/{uid}/com.memory-platform.neon-sync"),
-            ]);
-        } else {
-            c.args([
-                "kickstart",
-                "-k",
-                &format!("gui/{uid}/com.memory-platform.neon-sync"),
-            ]);
-        }
-        c
-    } else {
-        let mut c = Command::new("systemctl");
-        c.args(["--user", action, "memory-platform-maintenance.service"]);
-        c
-    };
-    command.stdout(Stdio::null()).stderr(Stdio::null());
-    let status = command.status().await?;
-    anyhow::ensure!(status.success(), "scheduler action failed");
-    Ok(())
+    memory_platform::scheduler::run(action).await
 }
 
 fn internal(error: impl std::fmt::Display) -> (StatusCode, String) {

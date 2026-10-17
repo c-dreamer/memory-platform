@@ -65,8 +65,20 @@ async fn main() -> anyhow::Result<()> {
     );
     tracing::info!("Pending-writes queue ready");
 
+    // Redis and Neo4j are optional, so their connects are bounded: an absent
+    // Redis made ConnectionManager retry for minutes and the daemon never
+    // reached listen (Windows skips both services, decision #11).
+    const OPTIONAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    let timed_out = || anyhow::anyhow!("no answer within {OPTIONAL_CONNECT_TIMEOUT:?}");
+
     // Connect to Redis (optional — warn on failure)
-    let redis_cache = match RedisCache::connect(&config.redis_url).await {
+    let redis_cache = match tokio::time::timeout(
+        OPTIONAL_CONNECT_TIMEOUT,
+        RedisCache::connect(&config.redis_url),
+    )
+    .await
+    .unwrap_or_else(|_| Err(timed_out()))
+    {
         Ok(cache) => {
             tracing::info!("Redis connected");
             Some(Arc::new(cache))
@@ -78,12 +90,16 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Connect to Neo4j (optional — warn on failure)
-    let neo4j_client = match GraphClient::connect(
-        &config.neo4j_uri,
-        &config.neo4j_user,
-        &config.neo4j_password,
+    let neo4j_client = match tokio::time::timeout(
+        OPTIONAL_CONNECT_TIMEOUT,
+        GraphClient::connect(
+            &config.neo4j_uri,
+            &config.neo4j_user,
+            &config.neo4j_password,
+        ),
     )
     .await
+    .unwrap_or_else(|_| Err(timed_out()))
     {
         Ok(client) => {
             tracing::info!("Neo4j connected");

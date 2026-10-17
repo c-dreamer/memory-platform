@@ -70,6 +70,12 @@ pub fn list_resource_templates() -> Value {
 
 /// Read one resource by URI, dispatching on its prefix.
 pub async fn read_resource(state: &AppState, uri: &str) -> Result<Value> {
+    let mut value = read_resource_inner(state, uri).await?;
+    super::tools::strip_embedding_vectors(&mut value);
+    Ok(value)
+}
+
+async fn read_resource_inner(state: &AppState, uri: &str) -> Result<Value> {
     if uri == "memory://stats" {
         return stats(state).await;
     }

@@ -4,15 +4,13 @@ A Rust-based memory and knowledge management platform with hybrid search, embedd
 
 ## Features
 
-<<<<<<< HEAD
-- **MCP Server** — JSON-RPC 2.0 stdio server (`src/mcp/`) exposing 22 tools plus a read-only `memory://` resources surface, for Claude Code, Codex, OpenCode, and other MCP clients
+- **MCP Server** — JSON-RPC 2.0 stdio server (`src/mcp/`) exposing 25 tools plus a read-only `memory://` resources surface, for Claude Code, Codex, OpenCode, and other MCP clients
 - **Hybrid Search** — Combines vector (pgvector), BM25, and full-text search with Reciprocal Rank Fusion (RRF)
-- **Embedding Service** — NVIDIA NIM embeddings (`nvidia/nemotron-3-embed-1b`, 2048-dim) with LRU caching and a fail-closed dimension guard
+- **Embedding Service** — NVIDIA NIM embeddings (`nvidia/nemotron-3-embed-1b`, 2048-dim) or fully offline via a local llama.cpp server (Qwen3-Embedding-4B, truncated to 2048), with LRU caching and a fail-closed dimension guard
 - **Vault Ingestion** — Walks Obsidian vault directories, parses frontmatter, chunks by markdown headers, embeds, and upserts
 - **Contradiction Detection** — Finds semantically similar memories with opposing signals using negation word pairs
 - **Experience Tracking** — Records interactions, updates confidence scores, and applies Ebbinghaus-inspired decay
 - **Procedure System** — Detects, executes, and records reusable procedures
-- **Context Service** — Builds enriched context packages from recent memories, sessions, experiences, and procedures
 - **Memory Decay** — Ebbinghaus half-life formula (recency + frequency + importance) applied at query time with configurable weights
 - **Durable Event Queue** — Local SQLite WAL-mode pending-writes queue ahead of Postgres so a momentary outage never silently drops an event
 
@@ -82,18 +80,29 @@ DATABASE_URL=postgresql://... cargo test --test integration -- --include-ignored
 
 ### Bootstrap
 
-For a full local recovery after cloning the repo:
+After cloning the repo:
 
 ```bash
-./scripts/bootstrap.sh
+./scripts/bootstrap.sh              # build, secret scan, backup check; never touches the local DB
+./scripts/bootstrap.sh --rehydrate  # also restore an EMPTY local store from Neon
 ```
 
 This will:
 
 1. Build the release binaries used by the memory MCP and ingest workflow.
-2. Rehydrate the local Postgres store from Neon.
-3. Re-ingest the live vault, OpenCode sessions, Codex sessions, config, and logs.
-4. Verify backup coverage, including the Numerai model backup under `gdrive:backups/numerai/models`.
+2. Only with `--rehydrate`: run `scripts/rehydrate_local.sh`, which restores the local Postgres
+   store from a Neon dump in a single transaction, reinstalls the local capture triggers with
+   `neon-sync migrate`, then re-ingests the live vault, OpenCode sessions, Codex sessions,
+   config, and logs.
+3. Verify backup coverage, including the Numerai model backup under `gdrive:backups/numerai/models`.
+
+The local database is this device's offline write cache and can hold rows Neon does not
+(unsynced `sync_meta.outbox` entries, archived records). Rehydrate therefore refuses to run when
+the local database has any rows or queued outbox entries; push with `./sync-to-neon.sh run`
+first, or pass `--confirm-overwrite-local` to discard local data deliberately. It needs
+`MEMORY_DEVICE_ID` and `SYNC_TARGET_URL` (or `NEON_DIRECT`/`NEON_SYNC_URL`) for the trigger
+reinstall, and uses the host `pg_dump` (major version >= Neon's), falling back to the
+`pgvector/pgvector:pg17` container only when no `pg_dump` is installed.
 
 ### Persistent MCP
 
@@ -131,8 +140,7 @@ All configuration is via environment variables (see `.env.example`):
 | `NEO4J_URI` | `bolt://memory-neo4j:7687` | Neo4j bolt URI (optional at runtime) |
 | `API_KEY` | (empty = dev mode) | API key for auth |
 | `API_PORT` | `8000` | HTTP server port |
-<<<<<<< HEAD
-| `EMBEDDING_MODEL` | `local` | Embedding backend. `nvidia` is the working backend (`.env.example` sets it). `local` pairs with `MEMORY_LOCAL_ONLY` and has no working backend yet, so it fails fast rather than silently reaching NVIDIA |
+| `EMBEDDING_MODEL` | `local` | Embedding backend: `nvidia` (NVIDIA NIM, `.env.example`'s default) or `llama-cpp` (local `llama-server`, offline; see `LLAMA_CPP_URL`). The built-in default `local` has no backend and fails fast rather than silently reaching NVIDIA |
 | `NVIDIA_EMBEDDING_MODEL` | `nvidia/nemotron-3-embed-1b` | NVIDIA embedding model (2048-dim). Supersedes the EOL `llama-nemotron-embed-1b-v2` |
 | `VAULT_PATH` | `/vault` | Path to Obsidian vault |
 | `MEMORY_LOCAL_ONLY` | (empty = off) | When set truthy, refuses to start unless `EMBEDDING_MODEL=llama-cpp` and no cloud credential (NVIDIA/OpenAI/Obsidian API key) is set; also blocks `neon-sync`/`memory-dashboard` from dialing Neon |
@@ -145,8 +153,8 @@ See `.env.example` for the full list (search, decay, chunking, archive-encryptio
 Use the stats CLI to inspect a single database or compare two URLs:
 
 ```bash
-cargo run --quiet --bin stats -- --db-url "$DATABASE_URL"
-cargo run --quiet --bin stats -- --compare "$LOCAL_URL" "$NEON_URL"
+cargo run --quiet --bin stats   # reads DATABASE_URL from the environment
+cargo run --quiet --bin stats -- --compare LOCAL_URL NEON_URL   # env var names, not URLs
 ```
 
 The compare mode prints both database URLs, their sizes in MB, and the delta for the core tables.

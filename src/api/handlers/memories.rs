@@ -81,7 +81,16 @@ pub async fn store_memory(
                     Some(
                         found
                             .iter()
-                            .map(|c| c.memory_id_b.to_string())
+                            // store_contradiction canonicalizes the pair by uuid
+                            // order, so the new memory can be on either side.
+                            .map(|c| {
+                                if c.memory_id_a == memory.id {
+                                    c.memory_id_b
+                                } else {
+                                    c.memory_id_a
+                                }
+                                .to_string()
+                            })
                             .collect::<Vec<_>>(),
                     ),
                 ),

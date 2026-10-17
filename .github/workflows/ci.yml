@@ -38,6 +38,21 @@ jobs:
         shell: bash
         run: ./scripts/check_secrets.sh
 
+      - name: PowerShell syntax check
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($file in Get-ChildItem -Recurse -Filter *.ps1 -Path scripts) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors) | Out-Null
+            foreach ($e in $errors) { Write-Host "$($file.FullName):$($e.Extent.StartLineNumber): $($e.Message)"; $failed = $true }
+          }
+          foreach ($file in Get-ChildItem -Filter *.xml.template -Path taskscheduler) {
+            try { [xml](Get-Content $file.FullName -Raw) | Out-Null } catch { Write-Host "$($file.FullName): $_"; $failed = $true }
+          }
+          if ($failed) { exit 1 }
+
       - name: Build (all targets)
         run: cargo build --all-targets --verbose
 
@@ -50,3 +65,69 @@ jobs:
 
       - name: Format check
         run: cargo fmt --check
+
+  # Database-backed tests (#[ignore]d in the main job) against the runner's own
+  # PostgreSQL plus pgvector. No services: block, so this works on Windows,
+  # where GitHub-hosted runners have no Docker. The Windows leg builds pgvector
+  # with nmake, per pgvector's own Windows install instructions.
+  db-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+    env:
+      PGVECTOR_VERSION: v0.8.7
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Start PostgreSQL + pgvector (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          major="$(ls /usr/lib/postgresql | sort -V | tail -1)"
+          sudo apt-get install -y -q "postgresql-${major}-pgvector"
+          sudo systemctl start postgresql
+          sudo -u postgres psql -q -c "ALTER USER postgres PASSWORD 'ci-throwaway'"
+          sudo -u postgres createdb memory_ci
+          echo "DATABASE_URL=postgresql://postgres:ci-throwaway@127.0.0.1:5432/memory_ci" >> "$GITHUB_ENV"
+
+      - name: Start PostgreSQL + pgvector (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pgRoot = if ($env:PGROOT) { $env:PGROOT } else {
+            (Get-ChildItem 'C:\Program Files\PostgreSQL' | Sort-Object { [int]$_.Name } | Select-Object -Last 1).FullName
+          }
+          Write-Host "PostgreSQL at $pgRoot"
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $src = Join-Path $env:RUNNER_TEMP 'pgvector'
+          git clone --quiet --depth 1 --branch $env:PGVECTOR_VERSION https://github.com/pgvector/pgvector.git $src
+          cmd /c "call `"$vcvars`" && cd /d `"$src`" && set `"PGROOT=$pgRoot`" && nmake /nologo /F Makefile.win && nmake /nologo /F Makefile.win install"
+          if ($LASTEXITCODE -ne 0) { throw "pgvector build failed ($LASTEXITCODE)" }
+          $svc = Get-Service -Name 'postgresql*' | Select-Object -First 1
+          Set-Service -Name $svc.Name -StartupType Manual
+          Start-Service -Name $svc.Name
+          $user = if ($env:PGUSER) { $env:PGUSER } else { 'postgres' }
+          $env:PGPASSWORD = if ($env:PGPASSWORD) { $env:PGPASSWORD } else { 'root' }
+          & "$pgRoot\bin\psql.exe" -h 127.0.0.1 -U $user -q -c "ALTER USER $user PASSWORD 'ci-throwaway'"
+          $env:PGPASSWORD = 'ci-throwaway'
+          & "$pgRoot\bin\createdb.exe" -h 127.0.0.1 -U $user memory_ci
+          if ($LASTEXITCODE -ne 0) { throw "createdb failed" }
+          "DATABASE_URL=postgresql://${user}:ci-throwaway@127.0.0.1:5432/memory_ci" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Run database-backed tests
+        shell: bash
+        run: cargo test -- --ignored
