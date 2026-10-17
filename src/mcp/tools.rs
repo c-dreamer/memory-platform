@@ -36,7 +36,8 @@ pub fn list_tools() -> Value {
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter by tags (memories/experiences only; ignored for documents/trading_results)", "default": null },
                     "tag_match_mode": { "type": "string", "description": "'any' (default) or 'all' — how `tags` must match", "default": "any" },
                     "start_date": { "type": "string", "description": "ISO-8601 lower bound on created_at (inclusive)", "default": null },
-                    "end_date": { "type": "string", "description": "ISO-8601 upper bound on created_at (inclusive)", "default": null }
+                    "end_date": { "type": "string", "description": "ISO-8601 upper bound on created_at (inclusive)", "default": null },
+                    "session_id": { "type": "string", "description": "Optional session UUID; records each memory/document hit as 'searched' in that session", "default": null }
                 },
                 "required": ["query"]
             }
@@ -65,7 +66,8 @@ pub fn list_tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Context query" }
+                    "query": { "type": "string", "description": "Context query" },
+                    "session_id": { "type": "string", "description": "Optional session UUID; records each loaded memory/document in that session", "default": null }
                 },
                 "required": ["query"]
             }
@@ -76,7 +78,8 @@ pub fn list_tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "goal": { "type": "string", "description": "Session goal or task description" }
+                    "goal": { "type": "string", "description": "Session goal or task description" },
+                    "session_id": { "type": "string", "description": "Optional session UUID; records each loaded memory/document in that session", "default": null }
                 },
                 "required": ["goal"]
             }
@@ -95,12 +98,12 @@ pub fn list_tools() -> Value {
         },
         {
             "name": "procedure_run",
-            "description": "Execute a named procedure. Looks up by name first, falls back to search. Returns execution result.",
+            "description": "Look up a procedure by exact name (case-insensitive) and return its stored steps for the calling agent to carry out. Nothing is executed server-side; the lookup is recorded as a use of the procedure. Errors if no procedure has that name.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "Procedure name to execute" },
-                    "params": { "type": "object", "description": "Optional parameters", "default": {} }
+                    "name": { "type": "string", "description": "Exact procedure name" },
+                    "params": { "type": "object", "description": "Optional parameters, echoed back unchanged for the agent to apply to the steps", "default": {} }
                 },
                 "required": ["name"]
             }
@@ -134,7 +137,8 @@ pub fn list_tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": "UUID of memory or document to recall" }
+                    "id": { "type": "string", "description": "UUID of memory or document to recall" },
+                    "session_id": { "type": "string", "description": "Optional session UUID; records the recalled memory/document as loaded in that session", "default": null }
                 },
                 "required": ["id"]
             }
@@ -845,49 +849,46 @@ async fn tool_experience_find(state: &AppState, args: Value) -> Result<String> {
     Ok(serde_json::to_string(&result)?)
 }
 
-/// 6. procedure_run — execute a named procedure.
+/// 6. procedure_run — return a named procedure's steps for the agent to run.
+/// Deliberately not an executor: steps are free-form stored text, and
+/// running them server-side would be arbitrary command execution.
 async fn tool_procedure_run(state: &AppState, args: Value) -> Result<String> {
     let name = get_string(&args, "name")?;
-    let _params = args.get("params").cloned().unwrap_or(json!({}));
+    let params = args.get("params").cloned().unwrap_or(json!({}));
 
     info!("procedure_run: name='{name}'");
 
-    // Try exact name lookup first, then search
-    let procedure = match &state.procedure_service {
-        Some(svc) => {
-            let candidates = svc.find_candidates(&name).await?;
-            candidates
-                .into_iter()
-                .find(|p| p.name.eq_ignore_ascii_case(&name))
-        }
-        None => {
-            let results = state
-                .db
-                .search_procedures(&name, 5)
-                .await
-                .context("Failed to search procedures")?;
-            results
-                .into_iter()
-                .find(|p| p.name.eq_ignore_ascii_case(&name))
-        }
-    };
+    // Exact, case-insensitive name match. Not search_procedures + filter: that
+    // keeps only the 5 most-used `ILIKE %name%` hits, so busier procedures
+    // whose names merely contain `name` could hide the exact one.
+    let procedure = sqlx::query_as::<_, Procedure>(
+        "SELECT id, name, description, steps, trigger_pattern, source_experience_id, tags, \
+                success_rate, times_used, confidence, created_at, updated_at \
+         FROM procedures WHERE lower(name) = lower($1) \
+         ORDER BY (name = $1) DESC LIMIT 1",
+    )
+    .bind(&name)
+    .fetch_optional(&state.db.pool)
+    .await
+    .context("Failed to look up procedure")?
+    .ok_or_else(|| anyhow::anyhow!("Procedure not found: {name}"))?;
 
-    let procedure = procedure.ok_or_else(|| anyhow::anyhow!("Procedure not found: {name}"))?;
-
-    // Record execution
+    // Record the use. It also counts as a success in success_rate, as it
+    // always has: the server never learns how the agent's run went.
     state
         .db
         .record_procedure_execution(procedure.id, true)
         .await
         .context("Failed to record procedure execution")?;
 
-    let steps_count = procedure.steps.as_array().map(|s| s.len()).unwrap_or(0);
-
     let result = json!({
-        "success": true,
+        "procedure_id": procedure.id,
         "procedure": procedure.name,
-        "steps_completed": steps_count,
-        "output": format!("Executed procedure '{}' successfully", procedure.name),
+        "description": procedure.description,
+        "steps": procedure.steps,
+        "params": params,
+        "executed": false,
+        "note": "Steps are returned for the calling agent to carry out; the server executes nothing.",
     });
 
     Ok(serde_json::to_string(&result)?)
@@ -1672,14 +1673,16 @@ async fn tool_memory_graph(state: &AppState, args: Value) -> Result<String> {
 
     info!("memory_graph: {entity_type}:{entity_id}, max_hops={max_hops}");
 
-    // ponytail: no visited-path tracking — recursion is still bounded by
-    // max_hops regardless of cycles in the edge set (each step requires
-    // depth < max_hops, so it always terminates); a cyclic neighborhood just
-    // produces extra intermediate rows that GROUP BY collapses below.
+    // UNION, not UNION ALL: every edge is followed in both directions, so
+    // with UNION ALL each hop walks back to the previous node and the
+    // intermediate row count grows as degree^max_hops (a 200-leaf hub at
+    // max_hops=4 made 80k rows). UNION drops a repeated (type, id, depth)
+    // row, which keeps the walk to at most nodes x (max_hops + 1) rows.
+    // The start entity is excluded below because a back-edge leads to it.
     let rows: Vec<(String, Uuid, i64)> = sqlx::query_as(
         "WITH RECURSIVE traversal(entity_type, entity_id, depth) AS ( \
              SELECT $1::text, $2::uuid, 0::bigint \
-             UNION ALL \
+             UNION \
              SELECT \
                  CASE WHEN r.source_type = t.entity_type AND r.source_id = t.entity_id \
                       THEN r.target_type ELSE r.source_type END, \
@@ -1695,7 +1698,7 @@ async fn tool_memory_graph(state: &AppState, args: Value) -> Result<String> {
          ) \
          SELECT entity_type, entity_id, MIN(depth) AS depth \
          FROM traversal \
-         WHERE depth > 0 \
+         WHERE NOT (entity_type = $1 AND entity_id = $2) \
          GROUP BY entity_type, entity_id \
          ORDER BY depth, entity_type, entity_id",
     )
@@ -1714,8 +1717,11 @@ async fn tool_memory_graph(state: &AppState, args: Value) -> Result<String> {
         .collect();
     let previews = fetch_memory_previews(&state.db, &memory_ids).await?;
 
+    // A memory with no live preview is forgotten, superseded or deleted;
+    // `forget` promises it no longer appears here, so drop it.
     let nodes: Vec<Value> = rows
         .into_iter()
+        .filter(|(node_type, node_id, _)| node_type != "memory" || previews.contains_key(node_id))
         .map(|(node_type, node_id, depth)| {
             let mut node = json!({
                 "entity_type": node_type,
@@ -1748,23 +1754,17 @@ async fn fetch_memory_previews(
         return Ok(std::collections::HashMap::new());
     }
 
-    let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("${i}")).collect();
-    let sql = format!(
-        "SELECT id, content FROM memories WHERE id IN ({}) \
+    // One array bind, not one `$n` per id: Postgres caps a statement at
+    // 65535 bind parameters, which a large graph neighbourhood can exceed.
+    let rows = sqlx::query(
+        "SELECT id, content FROM memories WHERE id = ANY($1) \
          AND (expiration_date IS NULL OR expiration_date >= CURRENT_DATE) \
          AND superseded_by IS NULL",
-        placeholders.join(",")
-    );
-
-    let mut query_builder = sqlx::query(&sql);
-    for id in ids {
-        query_builder = query_builder.bind(*id);
-    }
-
-    let rows = query_builder
-        .fetch_all(&db.pool)
-        .await
-        .context("Failed to fetch memory previews")?;
+    )
+    .bind(ids)
+    .fetch_all(&db.pool)
+    .await
+    .context("Failed to fetch memory previews")?;
 
     Ok(rows
         .into_iter()
@@ -1990,12 +1990,12 @@ mod tests {
         assert!(try_embed(&state, "p", true, "test").await.is_none());
     }
 
-    /// Fresh, migrated `agentd_*` database on the throwaway local Postgres
+    /// Fresh, migrated `{prefix}_*` database on the throwaway local Postgres
     /// named by `DATABASE_URL`; returns the state and the DB name to drop.
-    async fn live_failing_embedder_state() -> (AppState, sqlx::PgPool, String) {
+    async fn live_failing_embedder_state(prefix: &str) -> (AppState, sqlx::PgPool, String) {
         let admin_url = env::var("DATABASE_URL").expect("DATABASE_URL (throwaway local Postgres)");
         let admin = sqlx::PgPool::connect(&admin_url).await.unwrap();
-        let name = format!("agentd_embedfail_{}", Uuid::new_v4().simple());
+        let name = format!("{prefix}_{}", Uuid::new_v4().simple());
         sqlx::query(&format!("CREATE DATABASE {name}"))
             .execute(&admin)
             .await
@@ -2027,7 +2027,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a throwaway local Postgres with pgvector in DATABASE_URL"]
     async fn store_and_search_succeed_when_embedder_fails_at_runtime() {
-        let (state, admin, name) = live_failing_embedder_state().await;
+        let (state, admin, name) = live_failing_embedder_state("agentd_embedfail").await;
 
         let stored = call_tool(
             &state,
@@ -2058,6 +2058,162 @@ mod tests {
             "keyword fallback finds the stored memory: {searched}"
         );
         context.expect("memory_context must not fail");
+    }
+
+    async fn store(state: &AppState, content: &str) -> String {
+        let out = call_tool(state, "memory_store", json!({ "content": content }))
+            .await
+            .unwrap();
+        serde_json::from_str::<Value>(&out).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn relate(state: &AppState, source: &str, target: &str) {
+        call_tool(
+            state,
+            "memory_relate",
+            json!({"source_type": "memory", "source_id": source,
+                   "target_type": "memory", "target_id": target,
+                   "relation_type": "references"}),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a throwaway local Postgres with pgvector in DATABASE_URL"]
+    async fn memory_graph_bounded_and_excludes_start_and_forgotten() {
+        let (state, admin, name) = live_failing_embedder_state("agenth_graph").await;
+
+        // Hub with 60 leaves: at max_hops=5 the old UNION ALL walk made
+        // ~60^3 intermediate rows and returned the hub as its own neighbour.
+        let hub = store(&state, "graph hub").await;
+        let mut leaves = Vec::new();
+        for i in 0..60 {
+            let leaf = store(&state, &format!("graph leaf number {i}")).await;
+            relate(&state, &hub, &leaf).await;
+            leaves.push(leaf);
+        }
+        call_tool(&state, "forget", json!({ "id": leaves[0] }))
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let out = call_tool(
+            &state,
+            "memory_graph",
+            json!({"entity_type": "memory", "entity_id": hub, "max_hops": 5}),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        drop_live_db(state, admin, name).await;
+
+        let out: Value = serde_json::from_str(&out.unwrap()).unwrap();
+        let ids: Vec<&str> = out["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["entity_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(out["count"], json!(59), "{out}");
+        assert!(!ids.contains(&hub.as_str()), "start node returned: {out}");
+        assert!(
+            !ids.contains(&leaves[0].as_str()),
+            "forgotten memory returned"
+        );
+        assert!(out["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["depth"] == 1));
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a throwaway local Postgres with pgvector in DATABASE_URL"]
+    async fn procedure_run_finds_exact_name_and_returns_steps_unexecuted() {
+        let (state, admin, name) = live_failing_embedder_state("agenth_proc").await;
+
+        let steps = json!(["cargo build", "cargo test"]);
+        let exact = state
+            .db
+            .create_procedure("deploy", Some("ship it"), &steps, None, None, &[])
+            .await
+            .unwrap();
+        // Six busier procedures whose names contain "deploy": the old
+        // 5-candidate ILIKE search never reached the exact match.
+        for i in 0..6 {
+            let p = state
+                .db
+                .create_procedure(&format!("deploy-{i}"), None, &json!([]), None, None, &[])
+                .await
+                .unwrap();
+            for _ in 0..3 {
+                state
+                    .db
+                    .record_procedure_execution(p.id, true)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let out = call_tool(
+            &state,
+            "procedure_run",
+            json!({"name": "DEPLOY", "params": {"env": "prod"}}),
+        )
+        .await;
+        let missing = call_tool(&state, "procedure_run", json!({"name": "nope"})).await;
+        drop_live_db(state, admin, name).await;
+
+        let out: Value = serde_json::from_str(&out.expect("exact match found")).unwrap();
+        assert_eq!(out["procedure_id"], json!(exact.id));
+        assert_eq!(out["steps"], steps);
+        assert_eq!(out["params"], json!({"env": "prod"}));
+        assert_eq!(out["executed"], json!(false));
+        assert!(missing
+            .unwrap_err()
+            .to_string()
+            .contains("Procedure not found"));
+    }
+
+    #[test]
+    fn procedure_run_description_does_not_claim_execution() {
+        let tools = list_tools();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "procedure_run")
+            .unwrap();
+        let desc = tool["description"].as_str().unwrap();
+        assert!(desc.contains("Nothing is executed server-side"), "{desc}");
+        assert!(!desc.starts_with("Execute"), "{desc}");
+    }
+
+    #[test]
+    fn list_tools_declares_session_id_where_handlers_read_it() {
+        let tools = list_tools();
+        for name in [
+            "memory_search",
+            "memory_store",
+            "memory_context",
+            "memory_initialize",
+            "recall",
+        ] {
+            let tool = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap();
+            assert!(
+                tool["inputSchema"]["properties"]["session_id"].is_object(),
+                "{name} reads session_id but its schema omits it"
+            );
+        }
     }
 
     #[test]

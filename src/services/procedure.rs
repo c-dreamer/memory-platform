@@ -1,6 +1,7 @@
 //! Procedure detection service.
 //!
-//! Detects procedure candidates from similar experiences and executes stored procedures.
+//! Detects procedure candidates from similar experiences and records runs of
+//! stored procedures (it never executes their steps).
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -58,7 +59,7 @@ impl ProcedureService {
         Ok(procedures)
     }
 
-    /// Execute a procedure by ID, recording execution history.
+    /// Record a run of a procedure by ID. Does not execute its steps.
     pub async fn execute(&self, procedure_id: &str) -> Result<ProcedureResult> {
         let start_time = std::time::Instant::now();
         let id = Uuid::parse_str(procedure_id).context("Invalid procedure ID format")?;
@@ -70,8 +71,9 @@ impl ProcedureService {
             .context("Failed to fetch procedure")?
             .ok_or_else(|| anyhow::anyhow!("Procedure not found"))?;
 
-        // Simulate procedure execution by "running" its steps.
-        // In a real implementation, this would interpret and execute the steps.
+        // Nothing is executed: steps are free-form stored text, and running
+        // them server-side would be arbitrary command execution. This only
+        // records the run; the caller carries out the steps.
         let steps_completed = procedure
             .steps
             .as_array()
@@ -86,7 +88,11 @@ impl ProcedureService {
 
         Ok(ProcedureResult {
             success: true,
-            output: format!("Executed procedure '{}' successfully", procedure.name),
+            output: format!(
+                "Recorded a run of procedure '{}' ({steps_completed} steps); \
+                 the server executes nothing, the caller carries out the steps",
+                procedure.name
+            ),
             duration_ms: start_time.elapsed().as_millis() as u64,
             steps_completed,
         })
