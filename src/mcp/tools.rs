@@ -613,8 +613,14 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
 
     if let Some(old_id) = superseded_id {
         sqlx::query(
-            "UPDATE memories SET superseded_by = $1, superseded_at = now(), \
-             invalid_at = COALESCE(invalid_at, now()) WHERE id = $2",
+            // Same rule as ContradictionDetector::resolve: the old row stops
+            // holding when the restatement becomes valid (its valid_at, else
+            // created_at), never before its own start.
+            "UPDATE memories m SET superseded_by = $1, superseded_at = now(), \
+             invalid_at = COALESCE(m.invalid_at, GREATEST( \
+                 (SELECT COALESCE(w.valid_at, w.created_at) FROM memories w WHERE w.id = $1), \
+                 COALESCE(m.valid_at, m.created_at))) \
+             WHERE m.id = $2",
         )
         .bind(memory.id)
         .bind(old_id)
