@@ -3,6 +3,7 @@
 //! Implements the Model Context Protocol over stdin/stdout.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use memory_platform::config::Config;
 use memory_platform::db::postgres::PostgresDb;
@@ -15,6 +16,12 @@ use memory_platform::services::embedding::{
 };
 use memory_platform::services::experience::ExperienceService;
 use memory_platform::services::procedure::ProcedureService;
+
+/// Startup must finish well inside the ~30 s MCP clients allow for
+/// `initialize`, so neither probe may block it for long. A probe that runs
+/// out of time only means degraded (DB) or keyword-only (embedding) mode.
+const STARTUP_DB_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const EMBEDDING_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -30,82 +37,90 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(Config::from_env()?);
     tracing::info!("Loaded config");
 
-    // Connect to PostgreSQL, but keep the MCP server alive in degraded mode if
-    // the database is temporarily unreachable. Codex can still complete the
-    // handshake and use any tools that do not need live storage. A short
-    // bounded retry rides out a transient blip (e.g. the DB service still
-    // starting) without stalling the MCP handshake the way main.rs's much
-    // longer supervised-daemon retry would.
-    let db = match connect_with_short_retry(config.as_ref()).await {
-        Ok(db) => {
-            tracing::info!("Connected to PostgreSQL");
-            let db = Arc::new(db);
-            // Schema changes are an explicit deployment operation.  Starting a
-            // client must remain read-only so a short-lived MCP session cannot
-            // unexpectedly run DDL against the authoritative database.
+    // The pool is lazy: no connection is opened here, so an unreachable
+    // database cannot stall the MCP handshake (the client gives up after
+    // ~30 s). Every later query re-dials, so the server recovers on its own
+    // once PostgreSQL is back; until then DB-backed tools return a clear
+    // "database unavailable" error. Schema changes stay an explicit
+    // deployment operation — a short-lived MCP session never runs DDL.
+    let db = Arc::new(PostgresDb::connect_lazy(config.as_ref())?);
+
+    // Embedding service is optional — tools fall back to keyword search if
+    // unavailable. An empty key cannot authenticate, so treat it as absent
+    // instead of spending the probe's retries on it.
+    let embedding_config = EmbeddingConfig {
+        model: config.embedding_model.clone(),
+        nvidia_api_url: Some(config.nvidia_api_url.clone()),
+        nvidia_api_key: Some(config.nvidia_api_key.clone()).filter(|key| !key.is_empty()),
+        nvidia_embedding_model: config.nvidia_embedding_model.clone(),
+        llama_cpp_url: config.llama_cpp_url.clone(),
+        llama_cpp_model_name: config.llama_cpp_model_name.clone(),
+        expected_dimension: config.embedding_dim,
+        cache_size: config.embedding_cache_size,
+    };
+    let embedding_probe = async {
+        let svc = EmbeddingServiceFactory::new(embedding_config).await?;
+        let probe = tokio::time::timeout(
+            EMBEDDING_PROBE_TIMEOUT,
+            svc.embed("__memory_platform_embedding_probe__"),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("no answer within {EMBEDDING_PROBE_TIMEOUT:?}"))??;
+        anyhow::Ok((svc, probe))
+    };
+    // Both startup probes are bounded and run concurrently, so the worst case
+    // before the server starts listening is the longer of the two timeouts.
+    let (active_dimensions, embedding_probe) = tokio::join!(
+        tokio::time::timeout(STARTUP_DB_PROBE_TIMEOUT, db.embedding_dimensions()),
+        embedding_probe
+    );
+    let active_dimensions = match active_dimensions {
+        Ok(Ok(dimensions)) => {
             tracing::info!(
                 "Connected to PostgreSQL; migration state will be reported by memory_health"
             );
-            db
+            dimensions
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!("PostgreSQL unavailable, starting MCP in degraded mode: {e}");
-            Arc::new(PostgresDb::new_empty())
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!("PostgreSQL did not answer within {STARTUP_DB_PROBE_TIMEOUT:?}, starting MCP in degraded mode");
+            Vec::new()
         }
     };
-
-    let active_dimensions = db.embedding_dimensions().await.unwrap_or_default();
     if active_dimensions.len() > 1 {
         tracing::error!(?active_dimensions, "Mixed active embedding dimensions; vector search will remain disabled until controlled re-embedding");
     }
+
+    let embedding_service: Option<Arc<dyn EmbeddingService>> = match embedding_probe {
+        Ok((svc, probe))
+            if active_dimensions.len() <= 1
+                && (config.embedding_dim == 0 || probe.as_vec().len() == config.embedding_dim) =>
+        {
+            tracing::info!(model = %config.embedding_model, dimension = probe.as_vec().len(), "Embedding probe passed");
+            Some(Arc::new(svc))
+        }
+        Ok((_, probe)) => {
+            tracing::error!(
+                configured = config.embedding_dim,
+                actual = probe.as_vec().len(),
+                "Embedding dimension mismatch; keyword-only mode"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!("Embedding service unavailable (keyword-only fallback): {e:#}");
+            None
+        }
+    };
 
     // Clone pool for services that need PgPool directly
     let pool = db.pool.clone();
 
     // Initialize services
     let search = Arc::new(SearchEngine::new(Arc::clone(&db), Arc::clone(&config)));
-
-    // Embedding service is optional — tools fall back to keyword search if unavailable
-    let embedding_service: Option<Arc<dyn EmbeddingService>> = {
-        let embedding_config = EmbeddingConfig {
-            model: config.embedding_model.clone(),
-            nvidia_api_url: Some(config.nvidia_api_url.clone()),
-            nvidia_api_key: Some(config.nvidia_api_key.clone()),
-            nvidia_embedding_model: config.nvidia_embedding_model.clone(),
-            llama_cpp_url: config.llama_cpp_url.clone(),
-            llama_cpp_model_name: config.llama_cpp_model_name.clone(),
-            expected_dimension: config.embedding_dim,
-            cache_size: config.embedding_cache_size,
-        };
-        match EmbeddingServiceFactory::new(embedding_config).await {
-            Ok(svc) => match svc.embed("__memory_platform_embedding_probe__").await {
-                Ok(probe)
-                    if active_dimensions.len() <= 1
-                        && (config.embedding_dim == 0
-                            || probe.as_vec().len() == config.embedding_dim) =>
-                {
-                    tracing::info!(model = %config.embedding_model, dimension = probe.as_vec().len(), "Embedding probe passed");
-                    Some(Arc::new(svc))
-                }
-                Ok(probe) => {
-                    tracing::error!(
-                        configured = config.embedding_dim,
-                        actual = probe.as_vec().len(),
-                        "Embedding dimension mismatch; keyword-only mode"
-                    );
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Embedding probe failed; keyword-only mode");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!("Embedding service unavailable (keyword-only fallback): {e}");
-                None
-            }
-        }
-    };
 
     let contradiction_detector = Arc::new(ContradictionDetector::new(pool.clone()));
     let experience_service = Arc::new(ExperienceService::new(
@@ -158,32 +173,4 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
-}
-
-/// Retry the PostgreSQL connection a few times with a short fixed backoff,
-/// then give up and let the caller fall back to degraded mode. Unlike
-/// `main.rs`'s `connect_with_retry` (a supervised daemon that can afford to
-/// block for minutes and exit non-zero for a restart), this runs once per
-/// stdio MCP invocation — the client is waiting on the handshake, so the
-/// window stays short and failure degrades gracefully instead of exiting.
-async fn connect_with_short_retry(config: &Config) -> anyhow::Result<PostgresDb> {
-    const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-    const MAX_ATTEMPTS: u32 = 3;
-
-    let mut last_err = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        match PostgresDb::connect(config).await {
-            Ok(db) => return Ok(db),
-            Err(e) => {
-                if attempt < MAX_ATTEMPTS {
-                    tracing::warn!(
-                        "PostgreSQL connect attempt {attempt}/{MAX_ATTEMPTS} failed, retrying in {RETRY_INTERVAL:?}: {e}"
-                    );
-                    tokio::time::sleep(RETRY_INTERVAL).await;
-                }
-                last_err = Some(e);
-            }
-        }
-    }
-    Err(last_err.expect("loop runs at least once").into())
 }

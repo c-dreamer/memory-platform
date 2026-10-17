@@ -434,7 +434,7 @@ async fn tool_memory_search(state: &AppState, args: Value) -> Result<String> {
         Ok(results) => results,
         Err(e) => {
             tracing::error!("Search failed: {:?}", e);
-            return Ok(json!({"error": format!("Search failed: {}", e)}).to_string());
+            return Err(anyhow::Error::new(e).context("Search failed"));
         }
     };
 
@@ -566,7 +566,7 @@ async fn tool_memory_store(state: &AppState, args: Value) -> Result<String> {
         Ok(m) => m,
         Err(e) => {
             tracing::error!("Failed to store memory: {:?}", e);
-            return Ok(json!({"error": format!("Failed to store memory: {}", e)}).to_string());
+            return Err(anyhow::Error::new(e).context("Failed to store memory"));
         }
     };
 
@@ -1239,8 +1239,16 @@ async fn tool_status(state: &AppState, _args: Value) -> Result<String> {
     info!("status");
 
     let healthy = state.db.health().await;
-    let stats = state.db.get_stats().await;
-    let embedding_dimensions = state.db.embedding_dimensions().await.unwrap_or_default();
+    // Unreachable DB: skip the remaining queries, each would only wait out
+    // the pool's acquire timeout and come back empty anyway.
+    let (stats, embedding_dimensions) = if healthy {
+        (
+            state.db.get_stats().await,
+            state.db.embedding_dimensions().await.unwrap_or_default(),
+        )
+    } else {
+        Default::default()
+    };
 
     let retrieval_mode = if !healthy {
         "degraded"
@@ -1268,6 +1276,25 @@ async fn tool_status(state: &AppState, _args: Value) -> Result<String> {
 /// Read-only cross-client health contract.  This deliberately tolerates older
 /// databases so operators can diagnose a missing migration without mutation.
 async fn tool_memory_health(state: &AppState) -> Result<String> {
+    if !state.db.health().await {
+        return Ok(json!({
+            "status": "degraded",
+            "database": {
+                "available": false,
+                "message": "PostgreSQL database is unavailable; DB-backed tools will fail until it is reachable, and the server reconnects automatically without a restart",
+            },
+            "runtime": {
+                "build_version": env!("CARGO_PKG_VERSION"),
+                "build_revision": std::env::var("MEMORY_BUILD_REVISION").ok(),
+            },
+            "retrieval": {
+                "mode": "degraded",
+                "configured_dimension": state.config.embedding_dim,
+                "embedding_service": state.embedding_service.is_some(),
+            },
+        })
+        .to_string());
+    }
     let identity = sqlx::query("SELECT current_database(), COALESCE(inet_server_addr()::text, 'local'), COALESCE(inet_server_port(), 0)")
         .fetch_one(&state.db.pool)
         .await
@@ -1289,14 +1316,14 @@ async fn tool_memory_health(state: &AppState) -> Result<String> {
     .ok()
     .flatten();
     let dimensions = state.db.embedding_dimensions().await.unwrap_or_default();
-    let retrieval_mode = if !state.db.health().await {
-        "degraded"
-    } else if state.embedding_service.is_some() {
+    let retrieval_mode = if state.embedding_service.is_some() {
         "semantic"
     } else {
         "keyword-only"
     };
     Ok(json!({
+        "status": "ok",
+        "database": { "available": true },
         "runtime": {
             "database": identity.get::<String, _>(0),
             "host": identity.get::<String, _>(1),

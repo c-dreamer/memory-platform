@@ -21,6 +21,8 @@ const MAX_LINE_SIZE: usize = 10 * 1024 * 1024;
 /// session.
 #[cfg_attr(not(feature = "transport-http"), allow(dead_code))]
 pub const STDIN_TIMEOUT_SECS: u64 = 900;
+/// Upper bound on the storage health check inside `initialize`.
+const INITIALIZE_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 error codes
@@ -199,7 +201,12 @@ impl McpServer {
 
     /// Handle "initialize" method.
     async fn handle_initialize(&self, id: Value) -> Value {
-        let storage_healthy = self.state.db.health().await;
+        // Bounded: the handshake must not wait out the pool's acquire timeout
+        // while the database is down. A slow answer just reports "degraded".
+        let storage_healthy =
+            tokio::time::timeout(INITIALIZE_HEALTH_TIMEOUT, self.state.db.health())
+                .await
+                .unwrap_or(false);
         json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -261,11 +268,20 @@ impl McpServer {
             })),
             Err(e) => {
                 warn!("Tool call failed: {e:#}");
+                let message = if is_database_unavailable(&e) {
+                    format!(
+                        "PostgreSQL database is unavailable; the memory MCP server is running in \
+                         degraded mode and reconnects automatically once the database is \
+                         reachable ({e:#})"
+                    )
+                } else {
+                    format!("{e:#}")
+                };
                 Ok(json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": {
-                        "content": [{"type": "text", "text": json!({"error": format!("{e:#}")}).to_string()}],
+                        "content": [{"type": "text", "text": json!({"error": message}).to_string()}],
                         "isError": true,
                     },
                 }))
@@ -340,6 +356,22 @@ impl McpServer {
             }
         }
     }
+}
+
+/// Whether a tool failure came from not being able to reach PostgreSQL at all
+/// (as opposed to a query, data, or argument error).
+fn is_database_unavailable(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<sqlx::Error>(),
+            Some(
+                sqlx::Error::PoolTimedOut
+                    | sqlx::Error::PoolClosed
+                    | sqlx::Error::Io(_)
+                    | sqlx::Error::Tls(_)
+            )
+        )
+    })
 }
 
 #[cfg(test)]
@@ -578,6 +610,17 @@ mod tests {
             response["result"]["isError"], true,
             "A failed tool call must be flagged isError so clients don't read it as a success"
         );
+    }
+
+    #[test]
+    fn database_unavailable_is_detected_through_context() {
+        let unreachable = anyhow::Error::new(sqlx::Error::PoolTimedOut).context("Search failed");
+        assert!(is_database_unavailable(&unreachable));
+        let query_error = anyhow::Error::new(sqlx::Error::RowNotFound).context("lookup");
+        assert!(!is_database_unavailable(&query_error));
+        assert!(!is_database_unavailable(&anyhow::anyhow!(
+            "Unknown tool: x"
+        )));
     }
 
     #[tokio::test]

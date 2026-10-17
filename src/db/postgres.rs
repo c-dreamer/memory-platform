@@ -209,7 +209,22 @@ impl PostgresDb {
     /// - `test_before_acquire(false)` + selective `before_acquire` ping (idle>60s) avoids ping on every hot-path acquire
     /// - `acquire_slow_threshold(1s)` early WARN for slow checkouts
     pub async fn connect(config: &Config) -> Result<Self, sqlx::Error> {
-        let pool = PgPoolOptions::new()
+        let pool = Self::pool_options().connect(&config.database_url).await?;
+        Ok(Self::from_config(pool, config))
+    }
+
+    /// Like [`connect`](Self::connect), but opens no connection up front: the
+    /// pool dials PostgreSQL on first use and again on every later acquire
+    /// while it is unreachable, so a caller that starts while the database is
+    /// down recovers by itself once it comes back. Fails only on a malformed
+    /// `DATABASE_URL`.
+    pub fn connect_lazy(config: &Config) -> Result<Self, sqlx::Error> {
+        let pool = Self::pool_options().connect_lazy(&config.database_url)?;
+        Ok(Self::from_config(pool, config))
+    }
+
+    fn pool_options() -> PgPoolOptions {
+        PgPoolOptions::new()
             .min_connections(2)
             .max_connections(10)
             .acquire_timeout(Duration::from_secs(5))
@@ -225,18 +240,19 @@ impl PostgresDb {
                 })
             })
             .acquire_slow_threshold(Duration::from_secs(1))
-            .connect(&config.database_url)
-            .await?;
+    }
+
+    fn from_config(pool: PgPool, config: &Config) -> Self {
         let active_embedding_model = match config.embedding_model.as_str() {
             "nvidia" => config.nvidia_embedding_model.clone(),
             "llama-cpp" => config.llama_cpp_model_name.clone(),
             _ => "unknown".to_string(),
         };
-        Ok(Self {
+        Self {
             pool,
             active_embedding_model,
             active_embedding_backend: config.embedding_model.clone(),
-        })
+        }
     }
 
     /// Whether the currently active embedding backend's vectors belong in a
