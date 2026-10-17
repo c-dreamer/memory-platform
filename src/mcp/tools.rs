@@ -309,7 +309,7 @@ pub fn list_tools() -> Value {
 pub async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result<String> {
     debug!("Dispatching tool: {name}");
 
-    match name {
+    let output = match name {
         "memory_search" => tool_memory_search(state, arguments).await,
         "memory_store" => tool_memory_store(state, arguments).await,
         "memory_context" => tool_memory_context(state, arguments).await,
@@ -336,6 +336,46 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result
         "memory_relate" => tool_memory_relate(state, arguments).await,
         "memory_graph" => tool_memory_graph(state, arguments).await,
         _ => Err(anyhow::anyhow!("Unknown tool: {name}")),
+    };
+    output.map(strip_vectors_from_output)
+}
+
+/// Remove every `embedding` vector from a tool's JSON output.
+///
+/// Model structs (`Memory`, `Session`, `Experience`, `Document`,
+/// `TradingResult`) serialize their 2048-float vector, which `recall`, `list`,
+/// `core_memory`, `session_lineage`, `experience_find`, `memory_context` etc.
+/// would otherwise hand to the client: ~26 KB of numbers per row that no MCP
+/// client can use. Stripped here rather than with `#[serde(skip_serializing)]`
+/// because `memory-snapshot` export serializes the same structs and must keep
+/// the vectors.
+fn strip_vectors_from_output(output: String) -> String {
+    if !output.contains("\"embedding\"") {
+        return output;
+    }
+    match serde_json::from_str::<Value>(&output) {
+        Ok(mut value) => {
+            strip_embedding_vectors(&mut value);
+            value.to_string()
+        }
+        Err(_) => output,
+    }
+}
+
+/// Recursively drop `embedding` keys holding a vector (array) or `null`.
+pub(crate) fn strip_embedding_vectors(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if map
+                .get("embedding")
+                .is_some_and(|v| v.is_array() || v.is_null())
+            {
+                map.remove("embedding");
+            }
+            map.values_mut().for_each(strip_embedding_vectors);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_embedding_vectors),
+        _ => {}
     }
 }
 
@@ -1983,6 +2023,43 @@ mod tests {
 
         for name in &expected {
             assert!(names.contains(name), "Missing tool: {name}");
+        }
+    }
+
+    #[test]
+    fn tool_output_strips_embedding_vectors() {
+        let now = chrono::Utc::now();
+        let memory = Memory {
+            id: Uuid::new_v4(),
+            agent_id: None,
+            session_id: None,
+            content: "keep me".into(),
+            content_type: "note".into(),
+            embedding: Some(crate::models::Embedding::new(vec![0.123_456; 2048])),
+            fts: None,
+            importance: 0.5,
+            tags: vec![],
+            metadata: json!({}),
+            last_accessed_at: None,
+            access_count: 0,
+            decay_score: 1.0,
+            created_at: now,
+            updated_at: now,
+            expiration_date: None,
+        };
+        // Same shapes `recall` (bare struct) and `list` (wrapped rows) emit.
+        let bare = serde_json::to_string(&memory).unwrap();
+        let wrapped =
+            serde_json::to_string(&json!({"table": "memories", "rows": [&memory], "count": 1}))
+                .unwrap();
+        assert!(bare.contains("0.123456"), "precondition: vector serialized");
+
+        for raw in [bare, wrapped] {
+            let out = strip_vectors_from_output(raw);
+            assert!(!out.contains("\"embedding\""), "{out}");
+            assert!(!out.contains("0.123456"), "vector leaked");
+            assert!(out.contains("keep me"));
+            assert!(out.len() < 1_000, "result still {} bytes", out.len());
         }
     }
 
