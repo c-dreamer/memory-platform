@@ -41,13 +41,16 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
     /// Local authoritative PostgreSQL URL. Reads LOCAL_URL then DATABASE_URL.
-    #[arg(long, env = "LOCAL_URL")]
+    /// Discouraged on the command line (argv is visible to other local
+    /// users); set it in the protected per-device environment file.
+    #[arg(long, env = "LOCAL_URL", hide_env_values = true)]
     local_url: Option<String>,
     /// Sync target direct PostgreSQL URL — any Postgres-compatible database
     /// (Neon, Supabase, a self-hosted VPS with pgvector). Reads
-    /// NEON_SYNC_URL via clap's env binding; `urls()` also accepts the
-    /// provider-neutral SYNC_TARGET_URL and the legacy NEON_DIRECT.
-    #[arg(long, env = "NEON_SYNC_URL")]
+    /// SYNC_TARGET_URL, then the legacy NEON_DIRECT, then NEON_SYNC_URL.
+    /// Discouraged on the command line (argv is visible to other local
+    /// users); set it in the protected per-device environment file.
+    #[arg(long)]
     neon_url: Option<String>,
 }
 
@@ -264,21 +267,22 @@ fn vector_from_text(input: &str) -> Result<PgVector> {
 }
 
 fn urls(cli: &Cli) -> Result<(String, String)> {
-    let local = cli
-        .local_url
-        .clone()
-        .or_else(|| env::var("DATABASE_URL").ok())
+    // An empty value (`SYNC_TARGET_URL=` as in .env.example) counts as unset,
+    // matching `${SYNC_TARGET_URL:-${NEON_DIRECT:-...}}` in the shell scripts.
+    let set = |value: Option<String>| value.filter(|v| !v.trim().is_empty());
+    let local = set(cli.local_url.clone())
+        .or_else(|| set(env::var("DATABASE_URL").ok()))
         .ok_or_else(|| anyhow!("LOCAL_URL or DATABASE_URL is required"))?;
     // SYNC_TARGET_URL is the provider-neutral name: this target is any
     // Postgres-compatible database (Neon, Supabase, a self-hosted VPS with
     // pgvector) — the NEON_* names are kept only for existing setups.
-    let target = cli
-        .neon_url
-        .clone()
-        .or_else(|| env::var("SYNC_TARGET_URL").ok())
-        .or_else(|| env::var("NEON_DIRECT").ok())
-        .or_else(|| env::var("NEON_SYNC_URL").ok())
-        .ok_or_else(|| anyhow!("SYNC_TARGET_URL, NEON_SYNC_URL, or NEON_DIRECT is required"))?;
+    let target = set(cli.neon_url.clone())
+        .or_else(|| set(env::var("SYNC_TARGET_URL").ok()))
+        .or_else(|| set(env::var("NEON_DIRECT").ok()))
+        .or_else(|| set(env::var("NEON_SYNC_URL").ok()))
+        .ok_or_else(|| {
+            anyhow!("SYNC_TARGET_URL is required (legacy NEON_DIRECT or NEON_SYNC_URL also work)")
+        })?;
     // Reject known transaction-pooler endpoints: they don't preserve the
     // session state (prepared statements, session-level timeouts) this sync
     // relies on for idempotent replay. Neon's poolers put "-pooler" in the
@@ -503,6 +507,34 @@ async fn release_target_lease(neon: &PgPool, lease: &TargetLease) {
             .execute(neon),
     )
     .await;
+}
+
+/// One push per device at a time. The target lease deliberately lets the same
+/// device re-acquire it (crash recovery without waiting out the lease), so two
+/// overlapping runs on one device — the scheduled job and a manual run — would
+/// otherwise steal it from each other mid-batch. This session advisory lock on
+/// the local database is held by a connection detached from the pool, so it
+/// ends with the process, crashes included, and never needs cleanup.
+async fn try_device_run_lock(local: &PgPool) -> Result<Option<sqlx::PgConnection>> {
+    const DEVICE_RUN_LOCK: i64 = 0x6e65_6f6e_7379_6e63; // "neonsync"
+    let mut conn = local.acquire().await?.detach();
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(DEVICE_RUN_LOCK)
+        .fetch_one(&mut conn)
+        .await
+        .context("taking the local neon-sync run lock")?;
+    Ok(locked.then_some(conn))
+}
+
+/// SQLSTATE class 22 (data exception) or 23 (integrity constraint violation):
+/// the target rejected this row's data, so retrying it unchanged cannot help.
+fn target_rejects_row(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<sqlx::Error>() {
+        Some(sqlx::Error::Database(db)) => db
+            .code()
+            .is_some_and(|code| code.starts_with("22") || code.starts_with("23")),
+        _ => false,
+    }
 }
 
 async fn record_batch_failure(
@@ -972,8 +1004,12 @@ async fn run_queue(
     neon: &PgPool,
     run_id: Uuid,
     lease: &TargetLease,
-) -> Result<(usize, usize, usize)> {
+) -> Result<(usize, usize, usize, usize)> {
     let started = Instant::now();
+    // Rows the target rejected this run: left queued with attempts/last_error,
+    // and excluded from later rounds so they are not re-picked until next run.
+    let mut skipped_tables: Vec<String> = Vec::new();
+    let mut skipped_keys: Vec<String> = Vec::new();
     let mut events = 0;
     let mut applied = 0;
     let mut bytes = 0;
@@ -989,7 +1025,8 @@ async fn run_queue(
         let pushed = push_event_batch(local, neon, lease).await?;
         events += pushed;
         renew_target_lease(neon, lease).await?;
-        let queue_rows = sqlx::query("SELECT table_name,record_key,generation,operation FROM sync_meta.outbox ORDER BY changed_at LIMIT 200")
+        let queue_rows = sqlx::query("SELECT table_name,record_key,generation,operation FROM sync_meta.outbox WHERE (table_name,record_key) NOT IN (SELECT * FROM unnest($1::text[],$2::text[])) ORDER BY changed_at LIMIT 200")
+            .bind(&skipped_tables).bind(&skipped_keys)
             .fetch_all(local).await?;
         if queue_rows.is_empty() {
             if pushed == 0 {
@@ -1048,6 +1085,8 @@ async fn run_queue(
             // `batch_size` here would otherwise retry the same oversized batch.
             let mut pending_batches = batches(rows, batch_size);
             while let Some(batch) = pending_batches.pop() {
+                // Retries and splitting can outlast the per-round renewal.
+                renew_target_lease(neon, lease).await?;
                 let entries: Vec<OutboxItem> = batch
                     .iter()
                     .filter_map(|r| {
@@ -1088,23 +1127,41 @@ async fn run_queue(
                             }
                             break;
                         }
-                        Err(error) if attempt < MAX_RETRIES => {
+                        Err(error) => {
                             record_batch_failure(local, &entries, &error).await;
-                            attempt += 1;
                             consecutive_successes = 0;
-                            batch_size = (batch_size / 2).max(MIN_BATCH_ROWS);
-                            tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
-                            if attempt == MAX_RETRIES {
-                                if batch.len() > MIN_BATCH_ROWS {
-                                    let midpoint = batch.len() / 2;
-                                    pending_batches.push(batch[midpoint..].to_vec());
-                                    pending_batches.push(batch[..midpoint].to_vec());
-                                    break;
+                            // A rejected row fails identically on every retry:
+                            // isolate it at once instead of backing off.
+                            let rejected = target_rejects_row(&error);
+                            if !rejected {
+                                attempt += 1;
+                                batch_size = (batch_size / 2).max(MIN_BATCH_ROWS);
+                                tokio::time::sleep(Duration::from_millis(250 * (1 << attempt)))
+                                    .await;
+                                if attempt < MAX_RETRIES {
+                                    continue;
                                 }
+                            }
+                            if batch.len() > MIN_BATCH_ROWS {
+                                let midpoint = batch.len() / 2;
+                                pending_batches.push(batch[midpoint..].to_vec());
+                                pending_batches.push(batch[..midpoint].to_vec());
+                                break;
+                            }
+                            if !rejected {
                                 return Err(error).context("batch retries exhausted for one row");
                             }
+                            // Never acknowledged: the failure is on the outbox
+                            // row (attempts, last_error) and it retries next run.
+                            eprintln!(
+                                "skipping {}/{} for this run: the target rejected it \
+                                 (reason in `neon-sync status`)",
+                                spec.name, batch[0].key
+                            );
+                            skipped_tables.push(spec.name.to_string());
+                            skipped_keys.push(batch[0].key.clone());
+                            break;
                         }
-                        Err(error) => return Err(error).context("applying Neon batch"),
                     }
                 }
                 if started.elapsed() >= RUN_BUDGET {
@@ -1116,7 +1173,7 @@ async fn run_queue(
             break;
         }
     }
-    Ok((applied, bytes, events))
+    Ok((applied, bytes, events, skipped_keys.len()))
 }
 
 async fn bootstrap_events(local: &PgPool) -> Result<usize> {
@@ -1277,6 +1334,26 @@ async fn status(local: &PgPool, neon: &PgPool) -> Result<()> {
         .fetch_one(local)
         .await?;
     println!("pending queue entries: {pending}");
+    // A row the target keeps rejecting is skipped by each run, never dropped.
+    let failing = sqlx::query("SELECT table_name,record_key,attempts,last_error,count(*) OVER () FROM sync_meta.outbox WHERE last_error IS NOT NULL ORDER BY attempts DESC,changed_at LIMIT 10")
+        .fetch_all(local)
+        .await?;
+    if let Some(first) = failing.first() {
+        println!(
+            "queue entries with a recorded failure: {}",
+            first.get::<i64, _>(4)
+        );
+    }
+    for row in &failing {
+        let error: String = row.get(3);
+        println!(
+            "  failing {}/{} attempts={} last_error={}",
+            row.get::<String, _>(0),
+            row.get::<String, _>(1),
+            row.get::<i32, _>(2),
+            error.chars().take(200).collect::<String>()
+        );
+    }
     let latest_run = sqlx::query(
         "SELECT status,started_at,finished_at,rows_applied,bytes_applied,error_summary FROM sync_meta.runs ORDER BY started_at DESC LIMIT 1",
     )
@@ -1359,7 +1436,19 @@ async fn push_once(local: &PgPool, neon: &PgPool) -> Result<(usize, usize, usize
         .execute(neon)
         .await?;
     let result = async {
-        let (rows, bytes, event_count) = run_queue(local, neon, run, &lease).await?;
+        let (rows, bytes, event_count, skipped) = run_queue(local, neon, run, &lease).await?;
+        if skipped > 0 {
+            let summary = format!(
+                "{skipped} row(s) rejected by the target were skipped and remain queued; \
+                 see `neon-sync status`"
+            );
+            eprintln!("{summary}");
+            sqlx::query("UPDATE sync_meta.runs SET error_summary=$2 WHERE run_id=$1")
+                .bind(run)
+                .bind(summary)
+                .execute(neon)
+                .await?;
+        }
         sqlx::query("INSERT INTO sync_meta.state(state_key,state_value) VALUES('last_success',jsonb_build_object('at',now(),'rows',$1,'bytes',$2)) ON CONFLICT(state_key) DO UPDATE SET state_value=EXCLUDED.state_value,updated_at=now()")
             .bind(rows as i64)
             .bind(bytes as i64)
@@ -1426,6 +1515,9 @@ async fn main() -> Result<()> {
             if !confirm_full_push {
                 bail!("refusing full recovery; pass --confirm-full-push explicitly");
             }
+            let Some(_run_lock) = try_device_run_lock(&local).await? else {
+                bail!("another neon-sync run on this device holds the run lock; retry when it finishes");
+            };
             let mut pages = 0usize;
             loop {
                 let created = bootstrap_events_with_limit(&local, FULL_BASELINE_PAGE_ROWS).await?;
@@ -1438,6 +1530,10 @@ async fn main() -> Result<()> {
                 if created == 0 && remaining == 0 {
                     break;
                 }
+                // Only rows the target rejects remain: another page cannot help.
+                if created == 0 && rows == 0 && events == 0 {
+                    bail!("full recovery stopped: {remaining} queued row(s) are rejected by the target; see `neon-sync status`");
+                }
             }
             println!("full active-corpus recovery complete after {pages} page(s)");
             Ok(())
@@ -1449,6 +1545,10 @@ async fn main() -> Result<()> {
         }
         Command::RebuildDerived => rebuild_derived(&local, &neon).await,
         Command::Run | Command::Push => {
+            let Some(_run_lock) = try_device_run_lock(&local).await? else {
+                println!("another neon-sync run on this device holds the run lock; exiting");
+                return Ok(());
+            };
             let (rows, bytes, event_count) = push_once(&local, &neon).await?;
             println!(
                 "sync complete: {rows} projection rows, {event_count} event(s), {bytes} bytes"
@@ -1604,6 +1704,26 @@ mod tests {
             command: Command::Status,
             local_url: Some("postgres://local/db".into()),
             neon_url: Some(url.into()),
+        }
+    }
+
+    #[test]
+    fn transport_failures_are_not_row_rejections() {
+        // Only a server-reported data/constraint error may skip a row; a
+        // timeout or lost connection must still abort the run.
+        assert!(!target_rejects_row(&anyhow!(
+            "Neon projection write timed out"
+        )));
+        assert!(!target_rejects_row(&anyhow::Error::from(
+            sqlx::Error::PoolTimedOut
+        )));
+    }
+
+    #[test]
+    fn urls_treats_empty_cli_target_as_unset() {
+        let cli = cli_with_target("  ");
+        if let Ok((_, target)) = urls(&cli) {
+            assert!(!target.trim().is_empty());
         }
     }
 
