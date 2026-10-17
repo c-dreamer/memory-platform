@@ -1383,12 +1383,7 @@ async fn tool_memory_health(state: &AppState) -> Result<String> {
 }
 
 fn dashboard_state_dir() -> PathBuf {
-    env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/state")
-        })
-        .join("memory-platform")
+    crate::config::state_dir()
 }
 
 async fn tool_dashboard_status(state: &AppState) -> Result<String> {

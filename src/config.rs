@@ -294,6 +294,29 @@ pub fn local_only_enabled() -> bool {
     }
 }
 
+/// Per-device state directory holding the `neon-maintenance.paused` /
+/// `neon-maintenance.retry` flags shared with `scripts/run-memory-maintenance.sh`.
+///
+/// Mirrors that script's `${XDG_STATE_HOME:-$HOME/.local/state}/memory-platform`
+/// (empty counts as unset, like `:-`). On Windows the script runs under Git Bash,
+/// which derives `HOME` from `USERPROFILE`, so a natively launched binary without
+/// `HOME` falls back to `USERPROFILE` to read the same flags.
+pub fn state_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    env_var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                env_var("HOME")
+                    .or_else(|| env_var("USERPROFILE"))
+                    .unwrap_or_else(|| ".".into()),
+            )
+            .join(".local")
+            .join("state")
+        })
+        .join("memory-platform")
+}
+
 /// Which embedding backend `EMBEDDING_MODEL` selects, read directly from the
 /// environment (like `local_only_enabled`) for callers that only hold a bare
 /// `PgPool`, not a full `Config`.
@@ -501,6 +524,74 @@ mod tests {
         if let Err(panic) = result {
             resume_unwind(panic);
         }
+    }
+
+    #[test]
+    fn state_dir_prefers_xdg_state_home() {
+        with_env_vars(
+            &[
+                ("XDG_STATE_HOME", "/xdg"),
+                ("LOCALAPPDATA", "/lad"),
+                ("HOME", "/home/u"),
+            ],
+            || {
+                assert_eq!(state_dir(), PathBuf::from("/xdg").join("memory-platform"));
+            },
+        );
+    }
+
+    #[test]
+    fn state_dir_ignores_localappdata_to_match_bash_runner() {
+        // run-memory-maintenance.sh (the only reader of the pause/retry flags)
+        // never consults LOCALAPPDATA, even under Git Bash on Windows.
+        with_env_vars(
+            &[
+                ("XDG_STATE_HOME", ""),
+                ("LOCALAPPDATA", "/lad"),
+                ("HOME", "/home/u"),
+            ],
+            || {
+                assert_eq!(
+                    state_dir(),
+                    PathBuf::from("/home/u/.local/state/memory-platform")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn state_dir_home_only() {
+        with_env_vars(
+            &[
+                ("XDG_STATE_HOME", ""),
+                ("LOCALAPPDATA", ""),
+                ("USERPROFILE", ""),
+                ("HOME", "/home/u"),
+            ],
+            || {
+                assert_eq!(
+                    state_dir(),
+                    PathBuf::from("/home/u/.local/state/memory-platform")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn state_dir_falls_back_to_userprofile_without_home() {
+        with_env_vars(
+            &[
+                ("XDG_STATE_HOME", ""),
+                ("HOME", ""),
+                ("USERPROFILE", "/users/u"),
+            ],
+            || {
+                assert_eq!(
+                    state_dir(),
+                    PathBuf::from("/users/u/.local/state/memory-platform")
+                );
+            },
+        );
     }
 
     fn unique_temp_dir() -> PathBuf {
