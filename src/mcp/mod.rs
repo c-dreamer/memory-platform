@@ -23,6 +23,9 @@ const MAX_LINE_SIZE: usize = 10 * 1024 * 1024;
 pub const STDIN_TIMEOUT_SECS: u64 = 900;
 /// Upper bound on the storage health check inside `initialize`.
 const INITIALIZE_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// MCP protocol versions this server speaks, latest first. 2025-03-26 is
+/// deliberately absent: it requires receiving JSON-RPC batches.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2024-11-05"];
 
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 error codes
@@ -120,15 +123,13 @@ impl McpServer {
                 }
             };
 
-            // MCP spec: notifications have no "id" — the server must not send a response
-            let is_notification = request_value.get("id").is_none();
+            // MCP spec: notifications have no "id" — the server must not send a
+            // response. Only a *valid* notification qualifies: a malformed
+            // message without an id (`{}`, a batch array) still gets -32600.
+            let is_notification =
+                request_value.get("id").is_none() && validate_request(&request_value).is_ok();
 
-            let invalid_request = request_value.get("jsonrpc").and_then(Value::as_str)
-                != Some("2.0")
-                || request_value
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .is_none();
+            let id = request_value.get("id").cloned().unwrap_or(Value::Null);
             let response = self.handle_request(request_value).await;
             let response_json = match response {
                 Ok(res) => res,
@@ -136,8 +137,8 @@ impl McpServer {
                     error!("Error handling request: {}", e);
                     json!({
                         "jsonrpc": "2.0",
-                        "id": Value::Null,
-                        "error": {"code": if invalid_request { ERROR_INVALID_REQUEST } else { ERROR_INTERNAL_ERROR }, "message": e.to_string()},
+                        "id": id,
+                        "error": {"code": ERROR_INTERNAL_ERROR, "message": e.to_string()},
                     })
                 }
             };
@@ -154,26 +155,21 @@ impl McpServer {
         Ok(())
     }
 
-    /// Handle a JSON-RPC request and return a response.
-    /// Handle a single JSON-RPC 2.0 request and return a response.
+    /// Handle a single JSON-RPC 2.0 request and return a response. A message
+    /// that is not a valid request (including a batch array) yields a -32600
+    /// error response.
     pub async fn handle_request(&self, request: Value) -> Result<Value> {
+        if let Err(response) = validate_request(&request) {
+            return Ok(response);
+        }
         let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let method = request
-            .get("method")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'method' in request"))?
-            .to_string();
+        let method = request["method"].as_str().unwrap_or_default();
         let params = request.get("params").cloned().unwrap_or(Value::Null);
 
-        // Validate JSON-RPC 2.0
-        if request.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
-            return Err(anyhow::anyhow!("Invalid or missing jsonrpc field"));
-        }
-
-        match method.as_str() {
+        match method {
             "initialize" => {
                 info!("MCP client initialized");
-                Ok(self.handle_initialize(id).await)
+                Ok(self.handle_initialize(id, &params).await)
             }
             "notifications/initialized" => {
                 info!("MCP client initialized (notification)");
@@ -200,7 +196,14 @@ impl McpServer {
     }
 
     /// Handle "initialize" method.
-    async fn handle_initialize(&self, id: Value) -> Value {
+    async fn handle_initialize(&self, id: Value, params: &Value) -> Value {
+        // Version negotiation: echo the client's version when supported,
+        // otherwise answer with our latest and let the client decide.
+        let requested = params.get("protocolVersion").and_then(Value::as_str);
+        let protocol_version = SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .find(|v| Some(**v) == requested)
+            .unwrap_or(&SUPPORTED_PROTOCOL_VERSIONS[0]);
         // Bounded: the handshake must not wait out the pool's acquire timeout
         // while the database is down. A slow answer just reports "degraded".
         let storage_healthy =
@@ -211,7 +214,7 @@ impl McpServer {
             "jsonrpc": "2.0",
             "id": id,
             "result": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": protocol_version,
                 "capabilities": {
                     "tools": {},
                     "resources": {},
@@ -253,6 +256,19 @@ impl McpServer {
             .get("arguments")
             .cloned()
             .unwrap_or(Value::Object(serde_json::Map::new()));
+
+        // MCP tools spec: an unknown tool is a protocol error (-32602), not a
+        // tool execution error with isError.
+        let known = tools::list_tools()
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|t| t["name"] == name));
+        if !known {
+            return Ok(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": ERROR_INVALID_PARAMS, "message": format!("Unknown tool: {name}")},
+            }));
+        }
 
         debug!("Calling tool: {name} with args: {arguments}");
 
@@ -356,6 +372,42 @@ impl McpServer {
             }
         }
     }
+}
+
+/// `Err(-32600 response)` when `msg` is not a valid JSON-RPC 2.0 request or
+/// notification. The id is echoed when it is a valid one, else null.
+///
+/// Every protocol version we advertise lacks batching (2024-11-05 never had
+/// it; 2025-06-18 removed it), so a JSON array is an invalid request too.
+fn validate_request(msg: &Value) -> Result<(), Value> {
+    let invalid = |id: Value, message: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": ERROR_INVALID_REQUEST, "message": message},
+        })
+    };
+    let Some(obj) = msg.as_object() else {
+        let message = if msg.is_array() {
+            "JSON-RPC batching is not supported (removed in MCP 2025-06-18)"
+        } else {
+            "Request must be a JSON object"
+        };
+        return Err(invalid(Value::Null, message));
+    };
+    // MCP: a request id is a string or integer and MUST NOT be null.
+    let id = match obj.get("id") {
+        None => Value::Null,
+        Some(id @ (Value::String(_) | Value::Number(_))) => id.clone(),
+        Some(_) => return Err(invalid(Value::Null, "id must be a string or number")),
+    };
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(invalid(id, "Invalid or missing jsonrpc field"));
+    }
+    if !obj.get("method").is_some_and(Value::is_string) {
+        return Err(invalid(id, "Missing or non-string 'method'"));
+    }
+    Ok(())
 }
 
 /// Whether a tool failure came from not being able to reach PostgreSQL at all
@@ -596,20 +648,120 @@ mod tests {
         });
 
         let response = server.handle_request(request).await.unwrap();
-        let content = &response["result"]["content"][0]["text"];
-        let content_str = content.as_str().unwrap();
-        assert!(
-            content_str.contains("error"),
-            "Should contain error in content"
-        );
-        assert!(
-            content_str.contains("Unknown tool"),
-            "Should mention unknown tool"
+        assert_eq!(response["id"], 1);
+        assert!(response.get("result").is_none());
+        assert_eq!(
+            response["error"]["code"], ERROR_INVALID_PARAMS,
+            "MCP tools spec: an unknown tool is a JSON-RPC -32602 protocol error"
         );
         assert_eq!(
-            response["result"]["isError"], true,
-            "A failed tool call must be flagged isError so clients don't read it as a success"
+            response["error"]["message"],
+            "Unknown tool: nonexistent_tool"
         );
+    }
+
+    #[tokio::test]
+    async fn test_handle_tools_call_known_tool_failure_is_tool_error() {
+        let server = McpServer::new(minimal_state());
+        // A real tool failing (here: missing required argument) stays a tool
+        // execution error with isError, not a protocol error.
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "dashboard_control", "arguments": {}},
+        });
+        let response = server.handle_request(request).await.unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["isError"], true, "{response}");
+    }
+
+    #[tokio::test]
+    async fn test_initialize_negotiates_protocol_version() {
+        let server = McpServer::new(minimal_state());
+        for (requested, expected) in [
+            (json!("2025-06-18"), "2025-06-18"),
+            (json!("2024-11-05"), "2024-11-05"),
+            // Requires batching, which we don't support: answer with our latest.
+            (json!("2025-03-26"), "2025-06-18"),
+            (json!("2099-01-01"), "2025-06-18"),
+            (Value::Null, "2025-06-18"),
+        ] {
+            let response = server
+                .handle_initialize(json!(1), &json!({"protocolVersion": requested}))
+                .await;
+            assert_eq!(
+                response["result"]["protocolVersion"], expected,
+                "requested {requested}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalid_requests_get_invalid_request_error() {
+        let server = McpServer::new(minimal_state());
+        for (request, expected_id) in [
+            (json!({}), Value::Null),
+            (json!({"jsonrpc": "2.0", "method": 5}), Value::Null),
+            (json!({"id": 3, "method": "ping"}), json!(3)),
+            (
+                json!({"jsonrpc": "2.0", "id": null, "method": "ping"}),
+                Value::Null,
+            ),
+            (
+                json!({"jsonrpc": "2.0", "id": {"a": 1}, "method": "ping"}),
+                Value::Null,
+            ),
+            (
+                json!([{"jsonrpc": "2.0", "id": 4, "method": "ping"}]),
+                Value::Null,
+            ),
+            (json!([]), Value::Null),
+            (json!("ping"), Value::Null),
+        ] {
+            let response = server.handle_request(request.clone()).await.unwrap();
+            assert_eq!(
+                response["error"]["code"], ERROR_INVALID_REQUEST,
+                "{request}"
+            );
+            assert_eq!(response["id"], expected_id, "{request}");
+            assert_eq!(response["jsonrpc"], "2.0");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_listen_answers_invalid_and_never_notifications() {
+        use tokio::io::AsyncReadExt;
+        let server = McpServer::new(minimal_state());
+        let input = [
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"2.0","method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","method":"no/such/notification"}"#,
+            r#"{not json"#,
+            r#"{}"#,
+            r#"[{"jsonrpc":"2.0","id":4,"method":"ping"},{"jsonrpc":"2.0","method":"ping"}]"#,
+            r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#,
+        ]
+        .join("\n")
+            + "\n";
+        let (mut out_wr, mut out_rd) = tokio::io::duplex(64 * 1024);
+        server.listen(input.as_bytes(), &mut out_wr).await.unwrap();
+        drop(out_wr);
+        let mut output = String::new();
+        out_rd.read_to_string(&mut output).await.unwrap();
+        let responses: Vec<Value> = output
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let codes: Vec<&Value> = responses.iter().map(|r| &r["error"]["code"]).collect();
+        assert_eq!(responses.len(), 4, "{output}");
+        assert_eq!(*codes[0], ERROR_PARSE_ERROR);
+        assert_eq!(*codes[1], ERROR_INVALID_REQUEST);
+        // A batch gets one error response, not per-element replies.
+        assert_eq!(*codes[2], ERROR_INVALID_REQUEST);
+        assert!(responses[..3].iter().all(|r| r["id"].is_null()));
+        assert_eq!(responses[3]["id"], 7);
+        assert!(responses[3]["result"].is_object());
     }
 
     #[test]
@@ -628,7 +780,7 @@ mod tests {
         let state = minimal_state();
         let server = McpServer::new(state);
 
-        let response = server.handle_initialize(json!(42)).await;
+        let response = server.handle_initialize(json!(42), &json!({})).await;
         assert_eq!(response["id"], 42);
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["result"]["protocolVersion"], "2025-06-18");
