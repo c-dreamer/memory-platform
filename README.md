@@ -4,15 +4,13 @@ A Rust-based memory and knowledge management platform with hybrid search, embedd
 
 ## Features
 
-<<<<<<< HEAD
-- **MCP Server** — JSON-RPC 2.0 stdio server (`src/mcp/`) exposing 22 tools plus a read-only `memory://` resources surface, for Claude Code, Codex, OpenCode, and other MCP clients
+- **MCP Server** — JSON-RPC 2.0 stdio server (`src/mcp/`) exposing 25 tools plus a read-only `memory://` resources surface, for Claude Code, Codex, OpenCode, and other MCP clients
 - **Hybrid Search** — Combines vector (pgvector), BM25, and full-text search with Reciprocal Rank Fusion (RRF)
-- **Embedding Service** — NVIDIA NIM embeddings (`nvidia/nemotron-3-embed-1b`, 2048-dim) with LRU caching and a fail-closed dimension guard
+- **Embedding Service** — NVIDIA NIM embeddings (`nvidia/nemotron-3-embed-1b`, 2048-dim) or fully offline via a local llama.cpp server (Qwen3-Embedding-4B, truncated to 2048), with LRU caching and a fail-closed dimension guard
 - **Vault Ingestion** — Walks Obsidian vault directories, parses frontmatter, chunks by markdown headers, embeds, and upserts
 - **Contradiction Detection** — Finds semantically similar memories with opposing signals using negation word pairs
 - **Experience Tracking** — Records interactions, updates confidence scores, and applies Ebbinghaus-inspired decay
 - **Procedure System** — Detects, executes, and records reusable procedures
-- **Context Service** — Builds enriched context packages from recent memories, sessions, experiences, and procedures
 - **Memory Decay** — Ebbinghaus half-life formula (recency + frequency + importance) applied at query time with configurable weights
 - **Durable Event Queue** — Local SQLite WAL-mode pending-writes queue ahead of Postgres so a momentary outage never silently drops an event
 
@@ -142,8 +140,7 @@ All configuration is via environment variables (see `.env.example`):
 | `NEO4J_URI` | `bolt://memory-neo4j:7687` | Neo4j bolt URI (optional at runtime) |
 | `API_KEY` | (empty = dev mode) | API key for auth |
 | `API_PORT` | `8000` | HTTP server port |
-<<<<<<< HEAD
-| `EMBEDDING_MODEL` | `local` | Embedding backend. `nvidia` is the working backend (`.env.example` sets it). `local` pairs with `MEMORY_LOCAL_ONLY` and has no working backend yet, so it fails fast rather than silently reaching NVIDIA |
+| `EMBEDDING_MODEL` | `local` | Embedding backend: `nvidia` (NVIDIA NIM, `.env.example`'s default) or `llama-cpp` (local `llama-server`, offline; see `LLAMA_CPP_URL`). The built-in default `local` has no backend and fails fast rather than silently reaching NVIDIA |
 | `NVIDIA_EMBEDDING_MODEL` | `nvidia/nemotron-3-embed-1b` | NVIDIA embedding model (2048-dim). Supersedes the EOL `llama-nemotron-embed-1b-v2` |
 | `VAULT_PATH` | `/vault` | Path to Obsidian vault |
 | `MEMORY_LOCAL_ONLY` | (empty = off) | When set truthy, refuses to start unless `EMBEDDING_MODEL=llama-cpp` and no cloud credential (NVIDIA/OpenAI/Obsidian API key) is set; also blocks `neon-sync`/`memory-dashboard` from dialing Neon |
