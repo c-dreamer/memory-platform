@@ -64,6 +64,9 @@ if [[ "${ARCHIVE_ENCRYPT:-0}" == "1" ]]; then
 fi
 
 SHA="$(shasum -a 256 "$BUNDLE_FILE" | awk '{print $1}')"
+BYTES="$(wc -c < "$BUNDLE_FILE" | tr -d '[:space:]')"
+# Records actually in the bundle; rows may have changed since COUNT was taken.
+COUNT="$(wc -l < "$DATA" | tr -d '[:space:]')"
 ARCHIVE_ID=$(gen_uuid)
 MANIFEST="$WORK/manifest.json"
 printf '{"archive_id":"%s","device_id":"%s","section":"%s","records":%s,"sha256":"%s","created_at":"%s","bundle":"%s"}\n' "$ARCHIVE_ID" "$DEVICE_ID" "$SECTION" "$COUNT" "$SHA" "$STAMP" "$BUNDLE_NAME" > "$MANIFEST"
@@ -72,13 +75,26 @@ mkdir "$TARGET"
 cp "$BUNDLE_FILE" "$MANIFEST" "$TARGET/"
 [[ "$(shasum -a 256 "$TARGET/$BUNDLE_NAME" | awk '{print $1}')" == "$SHA" ]] || { echo "Archive checksum verification failed" >&2; exit 1; }
 
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v archive_id="$ARCHIVE_ID" -v section="$SECTION" -v path="$TARGET" -v sha="$SHA" -v count="$COUNT" -v device="$DEVICE_ID" <<'SQL'
+# Mark exactly the rows in the bundle, in one transaction: only documents
+# whose (id, checksum) match an exported record. A note added or edited
+# since the export stays active (the next run archives it) instead of being
+# marked archived without, or with stale, content in the bundle. The
+# bundle's own ndjson (written by \copy above) is read back with \copy.
+MARK_SQL="$WORK/mark-archived.sql"
+cat >"$MARK_SQL" <<'SQL'
+CREATE TEMP TABLE exported(doc jsonb) ON COMMIT DROP;
+\copy exported FROM pstdin
+CREATE TEMP TABLE marked ON COMMIT DROP AS
+SELECT d.id, d.checksum FROM documents d JOIN exported e
+  ON d.id = (e.doc->>'id')::uuid AND d.checksum IS NOT DISTINCT FROM e.doc->>'checksum'
+WHERE d.vault_section = :'section' AND d.storage_tier = 'active';
 INSERT INTO archive_meta.bundles(archive_id,local_path,remote_path,manifest_checksum,byte_count,state,verified_at)
-VALUES (:'archive_id'::uuid, :'path', :'path', :'sha', pg_size_bytes(:'count' || ' bytes'), 'verified', now());
+VALUES (:'archive_id'::uuid, :'path', :'path', :'sha', :'bytes'::bigint, 'verified', now());
 INSERT INTO archive_meta.records(archive_id,table_name,record_key,source_checksum,reason,device_id,state)
 SELECT :'archive_id'::uuid, 'documents', id::text, checksum, 'generated-section', :'device', 'archived'
-FROM documents WHERE vault_section=:'section' AND storage_tier='active';
-UPDATE documents SET storage_tier='archived', archive_id=:'archive_id'::uuid, source_checksum=checksum
-WHERE vault_section=:'section' AND storage_tier='active';
+FROM marked;
+UPDATE documents d SET storage_tier='archived', archive_id=:'archive_id'::uuid, source_checksum=d.checksum
+FROM marked m WHERE d.id = m.id;
 SQL
+psql "$DATABASE_URL" -X -1 -v ON_ERROR_STOP=1 -v archive_id="$ARCHIVE_ID" -v section="$SECTION" -v path="$TARGET" -v sha="$SHA" -v bytes="$BYTES" -v device="$DEVICE_ID" -f "$MARK_SQL" < "$DATA"
 echo "Verified archive $ARCHIVE_ID at $TARGET; records are now excluded from Neon and retained locally for restore."
