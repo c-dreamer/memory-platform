@@ -45,4 +45,4 @@ echo "[rehydrate] ingesting current local source files"
 DATABASE_URL="$LOCAL_URL" cargo run --quiet --bin ingest -- all
 
 echo "[rehydrate] local vs neon summary"
-cargo run --quiet --bin stats -- --compare "$LOCAL_URL" "$NEON_URL"
+LOCAL_URL="$LOCAL_URL" NEON_URL="$NEON_URL" cargo run --quiet --bin stats -- --compare LOCAL_URL NEON_URL

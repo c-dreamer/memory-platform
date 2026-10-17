@@ -111,14 +111,28 @@ pub struct Config {
     pub local_only: bool,
 }
 
+/// `postgres://user:secret@host/db` -> `postgres://user:***@host/db`.
+pub fn redact_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        return url.to_string();
+    };
+    let Some(at) = url[scheme_end..].rfind('@').map(|i| i + scheme_end) else {
+        return url.to_string();
+    };
+    match url[scheme_end..at].find(':') {
+        Some(colon) => format!("{}:***{}", &url[..scheme_end + colon], &url[at..]),
+        None => url.to_string(),
+    }
+}
+
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
-            .field("database_url", &self.database_url)
-            .field("redis_url", &self.redis_url)
+            .field("database_url", &redact_url(&self.database_url))
+            .field("redis_url", &redact_url(&self.redis_url))
             .field("neo4j_uri", &self.neo4j_uri)
             .field("neo4j_user", &self.neo4j_user)
-            .field("neo4j_password", &self.neo4j_password)
+            .field("neo4j_password", &"***redacted***")
             .field("api_key", &"***redacted***")
             .field("api_port", &self.api_port)
             .field("embedding_model", &self.embedding_model)
@@ -420,6 +434,22 @@ fn parse_bool(key: &'static str, default: bool) -> Result<bool, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redact_url_hides_only_the_password() {
+        assert_eq!(
+            redact_url("postgresql://memory:s3cr@t@db.example:5432/memory"),
+            "postgresql://memory:***@db.example:5432/memory"
+        );
+        assert_eq!(
+            redact_url("postgres://memory@host/db"),
+            "postgres://memory@host/db"
+        );
+        assert_eq!(
+            super::redact_url("postgres://host/db"),
+            "postgres://host/db"
+        );
+    }
+
     use super::*;
     use std::fs;
     use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};

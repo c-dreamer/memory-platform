@@ -145,8 +145,8 @@ See `.env.example` for the full list (search, decay, chunking, archive-encryptio
 Use the stats CLI to inspect a single database or compare two URLs:
 
 ```bash
-cargo run --quiet --bin stats -- --db-url "$DATABASE_URL"
-cargo run --quiet --bin stats -- --compare "$LOCAL_URL" "$NEON_URL"
+cargo run --quiet --bin stats   # reads DATABASE_URL from the environment
+cargo run --quiet --bin stats -- --compare LOCAL_URL NEON_URL   # env var names, not URLs
 ```
 
 The compare mode prints both database URLs, their sizes in MB, and the delta for the core tables.
