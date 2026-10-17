@@ -617,7 +617,11 @@ async fn push_event_batch(local: &PgPool, neon: &PgPool, lease: &TargetLease) ->
     Ok(to_push.len())
 }
 
-async fn apply_remote_event(local: &PgPool, table: &str, key: &str, payload: &Value) -> Result<()> {
+async fn apply_remote_event(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    table: &str,
+    payload: &Value,
+) -> Result<()> {
     let spec = TABLES
         .iter()
         .find(|spec| spec.name == table)
@@ -628,7 +632,7 @@ async fn apply_remote_event(local: &PgPool, table: &str, key: &str, payload: &Va
     let table = quote_ident(spec.name);
     let key_col = quote_ident(spec.key);
     let columns = sqlx::query("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 AND is_generated='NEVER' AND column_name NOT IN ('fts','embedding') ORDER BY ordinal_position")
-        .bind(spec.name).fetch_all(local).await?;
+        .bind(spec.name).fetch_all(&mut **tx).await?;
     let updates: Vec<String> = columns
         .into_iter()
         .map(|row| row.get::<String, _>(0))
@@ -639,13 +643,10 @@ async fn apply_remote_event(local: &PgPool, table: &str, key: &str, payload: &Va
         })
         .collect();
     let sql = format!("INSERT INTO public.{table} SELECT (jsonb_populate_record(NULL::public.{table}, $1)).* ON CONFLICT ({key_col}) DO UPDATE SET {}", updates.join(","));
-    let mut tx = local.begin().await?;
     sqlx::query("SET LOCAL memory.sync_replay='on'")
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-    sqlx::query(&sql).bind(payload).execute(&mut *tx).await?;
-    tx.commit().await?;
-    let _ = key;
+    sqlx::query(&sql).bind(payload).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -670,27 +671,39 @@ async fn pull_events(local: &PgPool, neon: &PgPool) -> Result<usize> {
     let mut imported = 0;
     for row in rows {
         let event_id: Uuid = row.try_get(0)?;
+        let logical_time: i64 = row.try_get(2)?;
+        // Recording the event and applying it commit together: recording it
+        // first on its own made any apply error permanent, because the next
+        // pull saw the event as already known and skipped it.
+        let mut tx = local.begin().await?;
         let inserted = sqlx::query("INSERT INTO sync_meta.events(event_id,device_id,logical_time,table_name,record_key,operation,payload,payload_checksum,supersedes,created_at,received_at,pushed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),now()) ON CONFLICT(event_id) DO NOTHING")
-            .bind(event_id).bind(row.try_get::<String,_>(1)?).bind(row.try_get::<i64,_>(2)?)
+            .bind(event_id).bind(row.try_get::<String,_>(1)?).bind(logical_time)
             .bind(row.try_get::<String,_>(3)?).bind(row.try_get::<String,_>(4)?).bind(row.try_get::<String,_>(5)?)
             .bind(row.try_get::<Value,_>(6)?).bind(row.try_get::<String,_>(7)?).bind(row.try_get::<Option<Uuid>,_>(8)?)
-            .bind(row.try_get::<chrono::DateTime<chrono::Utc>,_>(9)?).execute(local).await?.rows_affected();
-        let seq: i64 = row.try_get(10)?;
-        if seq > newest {
-            newest = seq;
-        }
+            .bind(row.try_get::<chrono::DateTime<chrono::Utc>,_>(9)?).execute(&mut *tx).await?.rows_affected();
+        // Lamport clock: every later local write gets a logical_time above
+        // any event this device has seen, so logical_time orders causally
+        // related writes across devices regardless of wall-clock skew.
+        sqlx::query("SELECT setval('sync_meta.logical_clock', GREATEST((SELECT last_value FROM sync_meta.logical_clock), $1))")
+            .bind(logical_time)
+            .execute(&mut *tx)
+            .await?;
         if inserted == 1 {
             let operation: String = row.try_get(5)?;
             if operation == "upsert" {
                 apply_remote_event(
-                    local,
+                    &mut tx,
                     &row.try_get::<String, _>(3)?,
-                    &row.try_get::<String, _>(4)?,
                     &row.try_get::<Value, _>(6)?,
                 )
                 .await?;
             }
             imported += 1;
+        }
+        tx.commit().await?;
+        let seq: i64 = row.try_get(10)?;
+        if seq > newest {
+            newest = seq;
         }
     }
     if newest > cursor_seq {
