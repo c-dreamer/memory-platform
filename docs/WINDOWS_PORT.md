@@ -189,8 +189,10 @@ cache, "started successfully but cannot store anything" is the worst of the avai
 - The dashboard reports OrbStack container state (`s.orbstack_containers` in
   `src/bin/memory-dashboard.rs`). On Windows that panel is either empty or wrong until it learns
   about Podman.
-- `scripts/rehydrate_local.sh:29` shells out to `docker run` and pulls `postgres:18`, which has no
-  pgvector, unlike compose and CI on `pgvector/pgvector:pg17`.
+- `scripts/rehydrate_local.sh` uses the host `pg_dump` when one is on PATH (same or newer major
+  version than Neon's) and only falls back to `docker run pgvector/pgvector:pg17` without one, so
+  install the PostgreSQL client tools here. It is opt-in (`bootstrap.sh --rehydrate`) and refuses
+  a local DB that has data.
 
 ### Compliance and data boundary
 

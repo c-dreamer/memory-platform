@@ -82,18 +82,29 @@ DATABASE_URL=postgresql://... cargo test --test integration -- --include-ignored
 
 ### Bootstrap
 
-For a full local recovery after cloning the repo:
+After cloning the repo:
 
 ```bash
-./scripts/bootstrap.sh
+./scripts/bootstrap.sh              # build, secret scan, backup check; never touches the local DB
+./scripts/bootstrap.sh --rehydrate  # also restore an EMPTY local store from Neon
 ```
 
 This will:
 
 1. Build the release binaries used by the memory MCP and ingest workflow.
-2. Rehydrate the local Postgres store from Neon.
-3. Re-ingest the live vault, OpenCode sessions, Codex sessions, config, and logs.
-4. Verify backup coverage, including the Numerai model backup under `gdrive:backups/numerai/models`.
+2. Only with `--rehydrate`: run `scripts/rehydrate_local.sh`, which restores the local Postgres
+   store from a Neon dump in a single transaction, reinstalls the local capture triggers with
+   `neon-sync migrate`, then re-ingests the live vault, OpenCode sessions, Codex sessions,
+   config, and logs.
+3. Verify backup coverage, including the Numerai model backup under `gdrive:backups/numerai/models`.
+
+The local database is this device's offline write cache and can hold rows Neon does not
+(unsynced `sync_meta.outbox` entries, archived records). Rehydrate therefore refuses to run when
+the local database has any rows or queued outbox entries; push with `./sync-to-neon.sh run`
+first, or pass `--confirm-overwrite-local` to discard local data deliberately. It needs
+`MEMORY_DEVICE_ID` and `SYNC_TARGET_URL` (or `NEON_DIRECT`/`NEON_SYNC_URL`) for the trigger
+reinstall, and uses the host `pg_dump` (major version >= Neon's), falling back to the
+`pgvector/pgvector:pg17` container only when no `pg_dump` is installed.
 
 ### Persistent MCP
 
