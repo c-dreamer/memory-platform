@@ -79,11 +79,40 @@ pub async fn handle_http_request(state: Arc<AppState>, body: String) -> Result<S
 /// Handle a single JSON-RPC request over HTTP and return a JSON-RPC response string.
 ///
 /// Used in the Axum endpoint behind the `transport-http` feature flag.
+///
+/// Same `X-API-Key` rule as every other API route (the `Auth` extractor).
+/// Beyond that, a browser must not be able to drive this endpoint: any web
+/// page can POST a CORS "simple request" (no preflight) to loopback, and a
+/// DNS-rebound host name makes that request same-origin. So the body must be
+/// `Content-Type: application/json` (never a simple request), and a present
+/// `Origin` must be a loopback origin. A missing `Origin` (non-browser client)
+/// is allowed, per the MCP spec's DNS-rebinding guidance.
 #[cfg(feature = "transport-http")]
 pub async fn http_json_rpc_handler(
+    _auth: crate::api::auth::Auth,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     body: String,
 ) -> (axum::http::StatusCode, String) {
+    use axum::http::{header, StatusCode};
+
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        if !origin.to_str().is_ok_and(is_loopback_origin) {
+            return (StatusCode::FORBIDDEN, "Forbidden origin".into());
+        }
+    }
+    let is_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|m| m.trim().eq_ignore_ascii_case("application/json"));
+    if !is_json {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/json".into(),
+        );
+    }
+
     match handle_http_request(state, body).await {
         Ok(response) => {
             if response.is_empty() {
@@ -108,4 +137,15 @@ pub async fn http_json_rpc_handler(
             )
         }
     }
+}
+
+/// `http://127.0.0.1[:port]`, `http://localhost[:port]` or `http://[::1][:port]`.
+#[cfg(feature = "transport-http")]
+fn is_loopback_origin(origin: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(origin) else {
+        return false;
+    };
+    url.scheme() == "http"
+        && url.path() == "/"
+        && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
 }
