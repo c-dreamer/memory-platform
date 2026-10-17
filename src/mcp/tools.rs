@@ -6,7 +6,7 @@
 //! a `serde_json::Value` arguments map, returning a JSON string result.
 //! The `call_tool` dispatcher routes by tool name.
 
-use std::{env, path::PathBuf, process::Stdio};
+use std::{env, path::PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -1415,28 +1415,7 @@ async fn tool_dashboard_control(args: Value) -> Result<String> {
 }
 
 async fn run_dashboard_scheduler(action: &str) -> Result<()> {
-    let mut command = if cfg!(target_os = "macos") {
-        let output = tokio::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .await?;
-        let uid = String::from_utf8(output.stdout)?.trim().to_string();
-        let label = format!("gui/{uid}/com.memory-platform.neon-sync");
-        let mut command = tokio::process::Command::new("launchctl");
-        if action == "stop" {
-            command.args(["kill", "SIGTERM", &label]);
-        } else {
-            command.args(["kickstart", "-k", &label]);
-        }
-        command
-    } else {
-        let mut command = tokio::process::Command::new("systemctl");
-        command.args(["--user", action, "memory-platform-maintenance.service"]);
-        command
-    };
-    command.stdout(Stdio::null()).stderr(Stdio::null());
-    anyhow::ensure!(command.status().await?.success(), "scheduler action failed");
-    Ok(())
+    crate::scheduler::run(action).await
 }
 
 /// Read-only cold-archive and durable-sync health for MCP clients.
