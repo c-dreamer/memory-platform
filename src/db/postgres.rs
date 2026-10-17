@@ -1065,12 +1065,17 @@ impl PostgresDb {
             .unwrap_or((String::new(), 2));
 
         if has_fts {
-            // Try tsvector first
+            // OR the query's lexemes rather than AND them: plainto_tsquery
+            // requires every word, so a natural-language question matched
+            // nothing and fell through to whole-string trigram similarity,
+            // which rarely clears its 0.3 threshold. ts_rank still ranks rows
+            // matching more of the words first.
+            let tsquery = "to_tsquery('english', replace(plainto_tsquery('english', $1)::text, ' & ', ' | '))";
             let ts_sql = format!(
                 "SELECT id, COALESCE({text_col}, '') AS content, COALESCE({extra_col_sql}, '') AS source_info, \
-                        ts_rank(fts, plainto_tsquery('english', $1), 32)::float8 AS score \
+                        ts_rank(fts, {tsquery}, 32)::float8 AS score \
                  FROM {table} \
-                 WHERE fts @@ plainto_tsquery('english', $1) \
+                 WHERE fts @@ {tsquery} \
                  {superseded_filter}{expiration_filter}{filter_clause} \
                  ORDER BY score DESC \
                  LIMIT ${limit_param}"
